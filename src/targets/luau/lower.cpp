@@ -52,7 +52,7 @@ public:
         std::span<const std::size_t> initializers)
         : graph(graph), addressTaken(addressTaken), data(data), entry(entry), arm(arm), convention(convention),
           initializers(initializers), loops(loops), features(detectFeatures(graph, entry, arm, initializers)),
-          flagsAtEntry(features.flags && !features.calls ? liveFlagsAtEntry(graph) : std::set<Address>{}),
+          flagsAtEntry(features.flags ? liveFlagsAtEntry(graph, features.calls) : std::set<Address>{}),
           useRoutineTable(graph.size() > 48) {
         for (const auto& [pc, block] : graph) {
             visitEdges(block, [&](Address target) { ++predecessors[target]; });
@@ -642,21 +642,19 @@ private:
 
     void effects(unsigned depth, const Block& block, Constants& constants) {
         std::set<const Effect*> liveWrites;
-        if (features.flags && !features.calls) {
-            bool live = readsFlags(block);
+        if (features.flags) {
+            bool live = observesExitFlags(block, features.calls);
             visitEdges(block, [&](Address target) { live |= flagsAtEntry.contains(target); });
             for (const auto& effect : block.effects | std::views::reverse) {
-                if (writesFlags(effect)) {
-                    if (live)
-                        liveWrites.insert(&effect);
+                if (live && writesFlags(effect))
+                    liveWrites.insert(&effect);
+                if (overwritesFlags(effect))
                     live = false;
-                }
                 live |= readsFlags(effect);
             }
         }
         for (const auto& effect : block.effects) {
-            const bool setFlags = features.flags &&
-                (features.calls ? writesFlags(effect) : liveWrites.contains(&effect));
+            const bool setFlags = liveWrites.contains(&effect);
             std::visit(Visit{
                 [](const Nop&) {},
                 [&](const Move& move) {
@@ -865,17 +863,24 @@ private:
                         line(depth + 1, "local rhsLo = " + rhs);
                         inputs = "rhsLo, if rhsLo >= 2147483648 then 4294967295 else 0";
                     }
-                    const auto call = std::format("signedMultiply({}, lhsLo, lhsHi, {}{})", mul.size, inputs,
-                        mul.operands == MultiplyOperands::UnsignedHigh || mul.operands == MultiplyOperands::UnsignedWide ? ", true" : "");
-                    if (mul.operands == MultiplyOperands::SignedHigh || mul.operands == MultiplyOperands::UnsignedHigh) {
+                    const bool highResult = mul.operands == MultiplyOperands::SignedHigh || mul.operands == MultiplyOperands::UnsignedHigh;
+                    const bool wideResult = mul.operands == MultiplyOperands::SignedWide || mul.operands == MultiplyOperands::UnsignedWide;
+                    const bool flags = setFlags && mul.flags;
+                    const auto call = highResult || wideResult || flags ?
+                        std::format("signedMultiply({}, lhsLo, lhsHi, {}{})", mul.size, inputs,
+                            mul.operands == MultiplyOperands::UnsignedHigh ||
+                            mul.operands == MultiplyOperands::UnsignedWide ? ", true" : "") :
+                        mul.size == 4 ? std::format("(multiply32(lhsLo, {})), 0", rhs) :
+                        std::format("multiplyLow(lhsLo, lhsHi, {})", inputs);
+                    if (highResult) {
                         line(depth + 1, "local _, _, _, productLo, productHi = " + call);
                         line(depth + 1, dst.pair() + " = productLo, productHi");
-                    } else if (mul.operands == MultiplyOperands::SignedWide || mul.operands == MultiplyOperands::UnsignedWide) {
+                    } else if (wideResult) {
                         line(depth + 1, "local lo, hi, wideOverflow, upperLo, upperHi = " + call);
                         line(depth + 1, dst.pair() + " = lo, hi");
                         line(depth + 1, reg(2).pair() + " = upperLo, upperHi");
                         constants[2].reset();
-                        if (setFlags)
+                        if (flags)
                             line(depth + 1, "overflow = wideOverflow");
                     } else if (mul.accumulator != Zero || mul.subtract) {
                         const auto acc = reg(mul.accumulator);
@@ -886,9 +891,9 @@ private:
                             std::format("({} {} prodHi + math.floor(sum / 4294967296)) % 4294967296", acc.hi, op) : "0";
                         line(depth + 1, std::format("{} = sum % 4294967296, {}", dst.pair(), hi));
                     } else {
-                        line(depth + 1, dst.pair() + (setFlags && mul.flags ? ", overflow" : "") + " = " + call);
+                        line(depth + 1, dst.pair() + (flags ? ", overflow" : "") + " = " + call);
                     }
-                    if (setFlags && mul.flags)
+                    if (flags)
                         line(depth + 1, "carry = overflow");
                     line(depth, "end");
                     constants[mul.dst].reset();

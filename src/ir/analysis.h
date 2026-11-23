@@ -30,10 +30,11 @@ struct Features {
 };
 
 LoopExits recoverLoops(const Graph& graph);
-bool readsFlags(const Block& block);
 bool readsFlags(const Effect& effect);
 bool writesFlags(const Effect& effect);
-std::set<Address> liveFlagsAtEntry(const Graph& graph);
+bool overwritesFlags(const Effect& effect);
+bool observesExitFlags(const Block& block, bool calls);
+std::set<Address> liveFlagsAtEntry(const Graph& graph, bool calls);
 std::optional<std::uint64_t> knownAddress(const EffectiveAddress& address, const Constants& constants);
 std::uint64_t fold(BinaryOp op, std::uint64_t lhs, std::uint64_t rhs);
 Features detectFeatures(const Graph& graph, Address entry, bool arm,

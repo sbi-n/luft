@@ -465,56 +465,47 @@ end
 )luau";
 
 constexpr std::string_view MultiplyOperators = R"(
-local function negateWord(lo: number, hi: number): (number, number)
-    return (-lo) % 4294967296, ((-hi) - (if lo == 0 then 0 else 1)) % 4294967296
+local function multiply32(a: number, b: number): (number, number)
+    local al, ah = a % 65536, math.floor(a / 65536)
+    local bl, bh = b % 65536, math.floor(b / 65536)
+    local lower = al * bl + (al * bh + ah * bl) * 65536
+    return lower % 4294967296, ah * bh + math.floor(lower / 4294967296)
+end
+
+local function multiplyLow(alo: number, ahi: number, blo: number, bhi: number): (number, number)
+    local lo, carry = multiply32(alo, blo)
+    local crossA = multiply32(alo, bhi)
+    local crossB = multiply32(ahi, blo)
+    return lo, (carry + crossA + crossB) % 4294967296
 end
 
 local function signedMultiply(size: number, alo: number, ahi: number, blo: number, bhi: number, unsigned: boolean?):
     (number, number, boolean, number, number)
     local word = 4294967296
     if size == 4 then
-        local al, ah = alo % 65536, math.floor(alo / 65536)
-        local bl, bh = blo % 65536, math.floor(blo / 65536)
-        local lower = al * bl + (al * bh + ah * bl) * 65536
-        local low = lower % word
-        local upper = ah * bh + math.floor(lower / word)
+        local low, upper = multiply32(alo, blo)
         if unsigned then return low, 0, upper ~= 0, upper, 0 end
         upper = (upper - (if alo >= 2147483648 then blo else 0) - (if blo >= 2147483648 then alo else 0)) % word
         return low, 0, upper ~= (if low >= 2147483648 then word - 1 else 0), upper, 0
     end
-    local aNegative, bNegative = not unsigned and ahi >= 2147483648, not unsigned and bhi >= 2147483648
-    if aNegative then
-        alo, ahi = negateWord(alo, ahi)
-    end
-    if bNegative then
-        blo, bhi = negateWord(blo, bhi)
-    end
-    local a = {bit32.band(alo, 65535), bit32.rshift(alo, 16), bit32.band(ahi, 65535), bit32.rshift(ahi, 16)}
-    local b = {bit32.band(blo, 65535), bit32.rshift(blo, 16), bit32.band(bhi, 65535), bit32.rshift(bhi, 16)}
-    local p = {0, 0, 0, 0, 0, 0, 0, 0}
-    for i = 1, 4 do
-        for j = 1, 4 do
-            p[i + j - 1] += a[i] * b[j]
-        end
-    end
-    for i = 1, 7 do
-        p[i + 1] += math.floor(p[i] / 65536)
-        p[i] %= 65536
-    end
-    local lo, hi = p[1] + p[2] * 65536, p[3] + p[4] * 65536
-    local upperLo, upperHi = p[5] + p[6] * 65536, p[7] + p[8] * 65536
-    local negative = aNegative ~= bNegative
-    local overflow = p[5] ~= 0 or p[6] ~= 0 or p[7] ~= 0 or p[8] ~= 0 or
-        hi > 2147483648 or (hi == 2147483648 and (not negative or lo ~= 0))
-    if negative then
-        if lo == 0 and hi == 0 then
-            upperLo, upperHi = negateWord(upperLo, upperHi)
-        else
-            upperLo, upperHi = word - 1 - upperLo, word - 1 - upperHi
-        end
-        lo, hi = negateWord(lo, hi)
-    end
-    return lo, hi, if unsigned then upperLo ~= 0 or upperHi ~= 0 else overflow, upperLo, upperHi
+    local lo, carry = multiply32(alo, blo)
+    local crossALo, crossAHi = multiply32(alo, bhi)
+    local crossBLo, crossBHi = multiply32(ahi, blo)
+    local upperLo, upperHi = multiply32(ahi, bhi)
+    local middle = carry + crossALo + crossBLo
+    local hi = middle % word
+    local upper = upperLo + crossAHi + crossBHi + math.floor(middle / word)
+    upperLo = upper % word
+    upperHi += math.floor(upper / word)
+    if unsigned then return lo, hi, upperLo ~= 0 or upperHi ~= 0, upperLo, upperHi end
+
+    -- Each negative operand subtracts the other operand from the upper word.
+    local negativeA, negativeB = ahi >= 2147483648, bhi >= 2147483648
+    upper = upperLo - (if negativeA then blo else 0) - (if negativeB then alo else 0)
+    upperLo = upper % word
+    upperHi = (upperHi - (if negativeA then bhi else 0) - (if negativeB then ahi else 0) + math.floor(upper / word)) % word
+    local sign = if hi >= 2147483648 then word - 1 else 0
+    return lo, hi, upperLo ~= sign or upperHi ~= sign, upperLo, upperHi
 end
 )";
 
@@ -547,6 +538,7 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     local contents: {buffer?} = {}
     local heap: {[number]: buffer} = {}
     local heapStarts: {number} = {}
+    local heapPages: {number} = {}
     local criticalSections: {[number]: number} = {}
     local pthreadLocks: {[number]: boolean} = {}
     local srwLocks: {[number]: number} = {}
@@ -574,6 +566,7 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         if heapEnabled then
             table.clear(heap)
             table.clear(heapStarts)
+            table.clear(heapPages)
             nextAllocation = heapStart
             lastHeapStart = 0
             classicLocale = 0
@@ -592,12 +585,14 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             if bytes and at >= lastHeapStart and limit <= lastHeapStart + buffer.len(bytes) then
                 return bytes, at - lastHeapStart
             end
-            local first, last = 1, #heapStarts
-            while first <= last do
-                local index = math.floor((first + last) / 2)
-                if heapStarts[index] <= at then first = index + 1 else last = index - 1 end
-            end
-            if last > 0 then
+            local page = math.floor((at - heapStart) / 256) + 1
+            local first = heapPages[page]
+            if first and at < nextAllocation then
+                local last = heapPages[page + 1] or #heapStarts
+                while first < last do
+                    local index = math.floor((first + last + 1) / 2)
+                    if heapStarts[index] <= at then first = index else last = index - 1 end
+                end
                 local start = heapStarts[last]
                 local bytes = heap[start]
                 if bytes and limit <= start + buffer.len(bytes) then
@@ -707,8 +702,13 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         end
         local start = nextAllocation
         heap[start] = bytes
-        heapStarts[#heapStarts + 1] = start
+        local index = #heapStarts + 1
+        heapStarts[index] = start
         nextAllocation += length
+        -- Record the first allocation covering each page, including its alignment padding.
+        for page = math.floor((start - heapStart) / 256) + 1, math.ceil((nextAllocation - heapStart) / 256) do
+            heapPages[page] = heapPages[page] or index
+        end
         return start, 0
     end
     local function allocateCpp(size: number, sizeHi: number, throwing: boolean): (number, number)

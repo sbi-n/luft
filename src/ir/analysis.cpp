@@ -117,9 +117,13 @@ LoopExits recoverLoops(const Graph& graph) {
     return loops;
 }
 
-bool readsFlags(const Block& block) {
+bool observesExitFlags(const Block& block, bool calls) {
     const auto* branch = std::get_if<Branch>(&block.end);
-    return branch && std::holds_alternative<FlagsCondition>(branch->condition);
+    if (branch && std::holds_alternative<FlagsCondition>(branch->condition))
+        return true;
+    const auto* jump = std::get_if<Jump>(&block.end);
+    const bool indirect = jump && !std::holds_alternative<Immediate>(jump->target) && jump->destinations.empty();
+    return indirect || (calls && (std::holds_alternative<Call>(block.end) || std::holds_alternative<Return>(block.end)));
 }
 
 bool writesFlags(const Effect& effect) {
@@ -152,17 +156,27 @@ bool readsFlags(const Effect& effect) {
         (registerBinary && registerBinary->withCarry) || std::holds_alternative<BitTest>(effect);
 }
 
-static bool readsIncomingFlags(const Block& block) {
+bool overwritesFlags(const Effect& effect) {
+    const auto* binary = std::get_if<Binary>(&effect);
+    const auto* memory = std::get_if<MemoryBinary>(&effect);
+    const auto* byte = std::get_if<ByteBinary>(&effect);
+    const auto* exchange = std::get_if<Exchange>(&effect);
+    return (binary && binary->flags) || (memory && memory->flags && !memory->keepCarry) ||
+        (byte && !byte->keepCarry) || (exchange && exchange->add) ||
+        std::holds_alternative<FloatCompare>(effect) || std::holds_alternative<ConditionalCompare>(effect);
+}
+
+static bool readsIncomingFlags(const Block& block, bool calls) {
     for (const auto& effect : block.effects) {
         if (readsFlags(effect))
             return true;
-        if (writesFlags(effect))
+        if (overwritesFlags(effect))
             return false;
     }
-    return readsFlags(block);
+    return observesExitFlags(block, calls);
 }
 
-std::set<Address> liveFlagsAtEntry(const Graph& graph) {
+std::set<Address> liveFlagsAtEntry(const Graph& graph, bool calls) {
     std::set<Address> live;
     std::set<Address> writes;
     std::map<Address, std::vector<Address>> predecessors;
@@ -172,9 +186,9 @@ std::set<Address> liveFlagsAtEntry(const Graph& graph) {
             work.push_back(pc);
     };
     for (const auto& [pc, block] : graph) {
-        if (std::ranges::any_of(block.effects, writesFlags))
+        if (std::ranges::any_of(block.effects, overwritesFlags))
             writes.insert(pc);
-        if (readsIncomingFlags(block) && live.insert(pc).second)
+        if (readsIncomingFlags(block, calls) && live.insert(pc).second)
             work.push_back(pc);
         visitEdges(block, [&](Address target) { predecessors[target].push_back(pc); });
     }
@@ -296,6 +310,8 @@ Features detectFeatures(const Graph& graph, Address entry, bool arm,
             features.stack |= touchesStack(effect, sp);
             features.flags |= std::holds_alternative<Select>(effect) || std::holds_alternative<ConditionalCompare>(effect);
             if (const auto* op = std::get_if<Binary>(&effect))
+                features.flags |= op->withCarry;
+            if (const auto* op = std::get_if<MemoryBinary>(&effect))
                 features.flags |= op->withCarry;
             if (const auto* move = std::get_if<ConditionalMove>(&effect)) {
                 features.flags = true;
