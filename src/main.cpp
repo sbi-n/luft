@@ -71,14 +71,12 @@ int main(int argc, char** argv) {
         "       Luft <x86_64|arm64> <elf> --module --elf [--elf-init] [--elf-library PATH]... --export NAME=SYMBOL|ADDRESS\n"
         "       Luft <x86_64|arm64> <mach-o> --module --macho [--macho-init] [--macho-library PATH]... --export NAME=SYMBOL|ADDRESS\n"
         "       Luft <x86_64|arm64> <pe> --module --pe [--pe-init SYMBOL|ADDRESS] [--pe-init-table START:END] --export NAME=SYMBOL|ADDRESS\n"
-        "       Luft wasm <module.wasm> <--module|--emit>\n"
         "Execute little-endian machine code starting at file offset 0.\n"
         "Print RAX or X0 as 16 hex digits on return.\n"
         "Pass --emit to print standalone Luau source, or --module to print a callable module.\n"
         "Module exports use decimal or hex file offsets and default to entry=0.\n"
         "Arguments are {lo, hi} words passed in the input ABI's integer argument registers.\n"
-        "Mach-O and PE accept symbol names, virtual addresses, or image-relative addresses.\n"
-        "WebAssembly uses spider-cli (LUFT_SPIDER or PATH) and emits an import-to-exports factory.\n";
+        "Mach-O and PE accept symbol names, virtual addresses, or image-relative addresses.\n";
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << usage;
         return 0;
@@ -90,14 +88,8 @@ int main(int argc, char** argv) {
 
     try {
         const std::string_view machine = argv[1];
-        if (machine == "wasm") {
-            if (argc != 4 || (std::string_view(argv[3]) != "--module" && std::string_view(argv[3]) != "--emit"))
-                throw std::runtime_error("WebAssembly requires --module or --emit");
-            binary::emitWasmLuau(argv[2]);
-            return 0;
-        }
         if (machine != "x86_64" && machine != "arm64")
-            throw std::runtime_error("expected x86_64, arm64, or wasm");
+            throw std::runtime_error("expected x86_64 or arm64");
         const auto architecture = machine == "arm64" ? Architecture::Arm64 : Architecture::X86_64;
 
         bool emit = false;

@@ -553,6 +553,7 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     local pageProtection: {[number]: number} = {}
     local heapStart = stackTop + 16
     local nextAllocation = heapStart
+    local lastHeapStart = 0
     local classicLocale = 0
     local useGlobalLocale = true
     local function reset(stack: boolean)
@@ -574,47 +575,24 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             table.clear(heap)
             table.clear(heapStarts)
             nextAllocation = heapStart
+            lastHeapStart = 0
             classicLocale = 0
             useGlobalLocale = true
         end
     end
     local function locate(at: number, size: number, write: boolean): (buffer, number)
+        local limit = at + size
         local stack = stackData
-        if stackInUse and stack and at >= stackBottom and at + size <= stackTop then
+        if stackInUse and stack and at >= stackBottom and limit <= stackTop then
             return stack, at - stackBottom
         end
-        local first, last = 1, #data
-        while first <= last do
-            local index = math.floor((first + last) / 2)
-            local range = data[index]
-            if at < range.first then
-                last = index - 1
-            elseif at >= range.last then
-                first = index + 1
-            elseif at + size <= range.last then
-                if write then
-                    if range.mode == 0 then error("write to read-only guest image", 0) end
-                    if range.mode >= 2 then
-                        for page = math.floor(at / 4096), math.floor((at + size - 1) / 4096) do
-                            if (pageProtection[page] or (if range.mode == 3 then 4 else 2)) ~= 4 then
-                                error("write to protected guest page", 0)
-                            end
-                        end
-                    end
-                end
-                local bytes = contents[index]
-                if bytes then
-                    return bytes, at - range.first
-                end
-                local initialized = buffer.fromstring(range.bytes)
-                contents[index] = initialized
-                return initialized, at - range.first
-            else
-                break
-            end
-        end
         if heapEnabled and at >= heapStart then
-            first, last = 1, #heapStarts
+            -- Look up the live buffer so freeing or resizing also affects cached addresses.
+            local bytes = heap[lastHeapStart]
+            if bytes and at >= lastHeapStart and limit <= lastHeapStart + buffer.len(bytes) then
+                return bytes, at - lastHeapStart
+            end
+            local first, last = 1, #heapStarts
             while first <= last do
                 local index = math.floor((first + last) / 2)
                 if heapStarts[index] <= at then first = index + 1 else last = index - 1 end
@@ -622,8 +600,40 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             if last > 0 then
                 local start = heapStarts[last]
                 local bytes = heap[start]
-                if bytes and at + size <= start + buffer.len(bytes) then
+                if bytes and limit <= start + buffer.len(bytes) then
+                    lastHeapStart = start
                     return bytes, at - start
+                end
+            end
+        else
+            local first, last = 1, #data
+            while first <= last do
+                local index = math.floor((first + last) / 2)
+                local range = data[index]
+                if at < range.first then
+                    last = index - 1
+                elseif at >= range.last then
+                    first = index + 1
+                elseif limit <= range.last then
+                    if write then
+                        if range.mode == 0 then error("write to read-only guest image", 0) end
+                        if range.mode >= 2 then
+                            for page = math.floor(at / 4096), math.floor((limit - 1) / 4096) do
+                                if (pageProtection[page] or (if range.mode == 3 then 4 else 2)) ~= 4 then
+                                    error("write to protected guest page", 0)
+                                end
+                            end
+                        end
+                    end
+                    local bytes = contents[index]
+                    if bytes then
+                        return bytes, at - range.first
+                    end
+                    local initialized = buffer.fromstring(range.bytes)
+                    contents[index] = initialized
+                    return initialized, at - range.first
+                else
+                    break
                 end
             end
         end

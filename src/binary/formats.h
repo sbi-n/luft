@@ -14,5 +14,4 @@ std::string recompileMachO(Architecture architecture, std::span<const std::uint8
 std::string recompilePe(Architecture architecture, std::span<const std::uint8_t> file,
     std::span<const GuestExport> exports, std::span<const GuestExport> initializers = {},
     std::span<const PeInitRange> ranges = {});
-void emitWasmLuau(const char* file);
 }
