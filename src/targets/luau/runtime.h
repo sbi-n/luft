@@ -2,6 +2,8 @@
 
 #include "ir/graph.h"
 
+#include <set>
+
 namespace luau {
 struct RuntimeFeatures {
     bool flags = false;
@@ -19,6 +21,10 @@ struct RuntimeFeatures {
     bool vector = false;
     bool process = false;
     bool x87 = false;
+    // Windows structured exception dispatch and unwinding.
+    bool seh = false;
+    // Indirect jumps that resume landing pads.
+    bool landingPads = false;
 };
 
 struct Data {
@@ -29,6 +35,9 @@ struct Data {
     std::span<const GuestObject> objects;
     // Materialized byte ranges, start to end, kept disjoint and merged.
     std::map<std::size_t, std::size_t> emitted;
+    // Code that exception unwinders transfer control to.
+    std::set<std::size_t> landingPads = {};
+    std::span<const UnwindObject> unwindObjects = {};
 
     const GuestImport* unresolved(std::uint64_t at, unsigned size) const;
     bool writable(std::uint64_t at, unsigned size) const;

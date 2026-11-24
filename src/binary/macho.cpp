@@ -1,5 +1,6 @@
 #include "image.h"
 #include "formats.h"
+#include "unwind.h"
 
 #include <array>
 #include <cstdio>
@@ -28,6 +29,9 @@ struct MachUnit {
     // Thread-local templates and the descriptors that address them.
     std::optional<std::size_t> threadTemplate = {};
     std::vector<std::pair<std::size_t, std::size_t>> threadDescriptors = {};
+    // __TEXT,__eh_frame and __TEXT,__unwind_info as mapped.
+    std::pair<std::size_t, std::size_t> frames = {};
+    std::pair<std::size_t, std::size_t> compact = {};
 };
 
 Symbols definedSymbols(Bytes table, Bytes strings, bool external = false) {
@@ -302,6 +306,7 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
     std::vector<MachUnit::InitSection> initSections;
     std::optional<std::size_t> threadTemplate;
     std::vector<std::pair<std::size_t, std::size_t>> threadDescriptors;
+    std::pair<std::size_t, std::size_t> frames, compact;
     for (const auto segment : segments) {
         const auto permissions = read(segment, 60, 4);
         const bool writable = (permissions & 2) && !(read(segment, 68, 4) & 0x10);
@@ -324,12 +329,19 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
                 threadTemplate = mappedBase + address - *base;
             if (type == 0x13)
                 threadDescriptors.emplace_back(mappedBase + address - *base, length);
+            const auto sectionName = std::string_view(reinterpret_cast<const char*>(section.data()),
+                std::ranges::find(section.first(16), 0) - section.begin());
+            if (sectionName == "__eh_frame")
+                frames = {mappedBase + address - *base, length};
+            else if (sectionName == "__unwind_info")
+                compact = {mappedBase + address - *base, length};
         }
     }
 
     return {*base, mappedBase, firstRegion, image.regions.size() - firstRegion, name, fixups,
         definedSymbols(symbols, strings), definedSymbols(symbols, strings, true),
-        std::move(dependencies), std::move(initSections), entry, threadTemplate, std::move(threadDescriptors)};
+        std::move(dependencies), std::move(initSections), entry, threadTemplate, std::move(threadDescriptors),
+        frames, compact};
 }
 
 void appendInitializers(const Image& image, const MachUnit& unit, std::vector<std::size_t>& initializers) {
@@ -403,6 +415,18 @@ std::string binary::recompileMachO(Architecture architecture, Bytes file,
     }
     if (streams)
         objects.push_back({*streams, 3 * StreamObjectSize + 3 * 8});
+    // libunwind asks dyld for each image's unwind sections, and C++ landing pads are reached only through them.
+    for (const auto& unit : units) {
+        std::size_t end = unit.offset;
+        for (std::size_t i = 0; i < unit.regionCount; ++i)
+            end = std::max(end, image.regions[unit.firstRegion + i].end);
+        program.unwindObjects.push_back({unit.offset, end, unit.offset, 0, unit.frames.first, unit.frames.second,
+            unit.compact.first, unit.compact.second});
+        if (unit.frames.second)
+            frameLandingPads(image.bytes, unit.frames.first, unit.frames.second, program.landingPads);
+        if (unit.compact.second)
+            compactLandingPads(image.bytes, unit.offset, unit.compact.first, unit.compact.second, program.landingPads);
+    }
     const auto& main = units.front();
     std::vector<GuestExport> mapped(exports.begin(), exports.end());
     for (auto& entry : mapped) {

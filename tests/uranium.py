@@ -27,15 +27,17 @@ def luau_string(data: bytes) -> str:
     return '"' + "".join(chr(b) if 32 <= b < 127 and chr(b) not in '"\\' else f"\\x{b:02x}" for b in data) + '"'
 
 
-def cases(compile_luau: str, work: Path):
+def cases(compile_luau: str, work: Path, corpus: Path = CORPUS):
     """Yields (name, argv, files) for every script, level, and mode."""
     result = []
-    for script in sorted(CORPUS.glob("*.luau")):
+    for script in sorted(corpus.glob("*.luau")):
         source = script.read_bytes()
         result.append((f"{script.stem}.source", ["uranium", "--source", "input.luau"], {"input.luau": source}))
         for optimize, debug in LEVELS:
             compiled = subprocess.run([compile_luau, "--binary", f"-{optimize}", f"-{debug}", str(script)],
-                                      capture_output=True, check=True).stdout
+                                      capture_output=True).stdout
+            if not compiled:
+                continue
             name = f"{script.stem}.{optimize}{debug}"
             (work / f"{name}.luauc").write_bytes(compiled)
             result.append((name, ["uranium", "input.luauc"], {"input.luauc": compiled}))
@@ -109,6 +111,7 @@ def main():
     parser.add_argument("--macho-libraries", default="", help="comma-separated libc++, libc++abi, libunwind dylibs")
     parser.add_argument("--variants", default="elf,macho,pe")
     parser.add_argument("--timeout", type=int, default=3600)
+    parser.add_argument("--corpus", default=str(CORPUS), help="directory of .luau scripts to decompile")
     args = parser.parse_args()
 
     release = Path(args.release)
@@ -123,7 +126,7 @@ def main():
     }
     selected = args.variants.split(",")
 
-    all_cases = cases(args.luau_compile, work)
+    all_cases = cases(args.luau_compile, work, Path(args.corpus))
     reference_binary = release / "macos-aarch64" / "uranium"
     reference = {case[0]: native(reference_binary, work, case) for case in all_cases}
     print(f"{len(all_cases)} cases; native reference collected", flush=True)

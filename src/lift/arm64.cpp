@@ -229,6 +229,20 @@ std::optional<Instruction> decodeArmSimd(std::uint32_t word) {
         return Instruction{VectorPermute{vd, vn, vm, bytes}};
     }
 
+    if ((word & 0xdf3e0c00) == 0x5e200800 && ((word >> 22) & 3) == 3) {
+        // Scalar compares of a D register with zero (CMGT, CMGE, CMEQ, CMLE, CMLT).
+        const auto opcode = (word >> 12) & 0x1f;
+        const auto zeroCompare = [&](LaneOp op, bool zeroFirst) {
+            const auto other = zeroFirst ? vn : temp;
+            return withTemp(VectorImmediate{temp, {0, 0, 0, 0}},
+                {VectorLanes{op, 8, vd, other, zeroFirst ? temp : vn, 8}});
+        };
+        if (opcode == 0x09 && !u) return zeroCompare(LaneOp::Equal, false);
+        if (opcode == 0x08) return zeroCompare(u ? LaneOp::GreaterEqualSigned : LaneOp::GreaterSigned, false);
+        if (opcode == 0x09 && u) return zeroCompare(LaneOp::GreaterEqualSigned, true);
+        if (opcode == 0x0a && !u) return zeroCompare(LaneOp::GreaterSigned, true);
+        return std::nullopt;
+    }
     if ((word & 0x9f3e0c00) == 0x0e200800) {
         const auto opcode = (word >> 12) & 0x1f;
         const unsigned size = (word >> 22) & 3;
@@ -332,7 +346,8 @@ std::optional<Instruction> decodeArmSimd(std::uint32_t word) {
             case 0x10: op = u ? LaneOp::Sub : LaneOp::Add; break;
             case 0x06: op = u ? LaneOp::Higher : LaneOp::GreaterSigned; break;
             case 0x07: op = u ? LaneOp::HigherSame : LaneOp::GreaterEqualSigned; break;
-            case 0x11: if (u) op = LaneOp::Equal; break;
+            case 0x11: op = u ? LaneOp::Equal : LaneOp::TestBits; break;
+            case 0x08: op = u ? LaneOp::ShiftUnsigned : LaneOp::ShiftSigned; break;
             case 0x0c: op = u ? LaneOp::MaxUnsigned : LaneOp::MaxSigned; break;
             case 0x0d: op = u ? LaneOp::MinUnsigned : LaneOp::MinSigned; break;
             case 0x0e: if (u) op = LaneOp::AbsoluteDifference; break;
@@ -449,6 +464,8 @@ Instruction decodeArm(Reader& reader) {
 
     if ((word & 0xfffff01f) == 0xd503201f || (word & 0xfffff09f) == 0xd503309f)
         return {}; // Hints (NOP, BTI, PAC) and barriers have no single-threaded effect.
+    if ((word & 0xffffffe0) == 0xd53bd040 && reader.threadPointer) // MRS Xt, TPIDR_EL0: the Linux thread pointer.
+        return {Move{8, rd == 31 ? Zero : rd, Immediate{std::uint64_t(reader.threadPointer)}}};
     if ((word & 0xffe0001f) == 0xd4200000 || (word & 0xffe0001f) == 0xd4400000 || (word >> 16) == 0)
         return {.end = Trap{std::format("guest trap instruction at guest offset {}", pc)}};
     if ((word & 0xfffffc1f) == 0xd65f0000)
@@ -588,6 +605,33 @@ Instruction decodeArm(Reader& reader) {
         return {ByteSwap{size, armReg(rd), Register{armReg(rn)}, true}};
     if ((word & 0xbf20fc00) == 0xb8200000)
         return {AtomicAdd{size, {rn, 0}, Register{armReg(rm)}, armReg(rd)}};
+    // Exclusive loads and stores. The guest runs on one thread, so a store-exclusive always succeeds.
+    if ((word & 0x3fff7c00) == 0x085f7c00 || (word & 0x3fe07c00) == 0x08007c00) {
+        const unsigned width = 1u << (word >> 30);
+        const EffectiveAddress address{rn, 0};
+        if (word & 0x00400000) {
+            if (width < 4)
+                return {Extend{4, armReg(rd), Memory{address}, width * 8, 0, false}};
+            return {Move{width, armReg(rd), Memory{address}}};
+        }
+        Instruction store{Store{width, address, Register{armReg(rd)}}};
+        store.after = {Move{4, armReg(rm), immediate(0)}};
+        return store;
+    }
+    if ((word & 0xbfff0000) == 0x887f0000 || (word & 0xbfe00000) == 0x88200000) {
+        // LDXP/LDAXP and STXP/STLXP.
+        const unsigned width = word & 0x40000000 ? 8 : 4;
+        const unsigned second = (word >> 10) & 31;
+        const bool load = word & 0x00400000;
+        if (load && rd == second)
+            unsupported();
+        Instruction pair{PairTransfer{width, armReg(rd), armReg(second), {rn, 0}, 0, load}};
+        if (!load)
+            pair.after = {Move{4, armReg(rm), immediate(0)}};
+        return pair;
+    }
+    if ((word & 0xfffff0ff) == 0xd503305f)
+        return {}; // CLREX
     const auto ordered = word & 0x3ffffc00;
     const auto unscaledOrder = word & 0x3fe00c00;
     if (ordered == 0x38bfc000 || ordered == 0x08dffc00 || ordered == 0x089ffc00 ||
@@ -646,11 +690,22 @@ Instruction decodeArm(Reader& reader) {
         const auto pages = signExtend(((word >> 5) & 0x7ffff) * 4 + ((word >> 29) & 3), 21);
         const auto page = (pc & ~Address(4095)) + pages * 4096;
         Instruction address{Move{8, armReg(rd), immediate(page)}};
-        if (reader.mapped && rd != 31 && next + 4 <= Address(reader.image.size())) {
+        if (reader.mapped && rd != 31) {
+            // The ADD that completes the address may follow other instructions; stop at a branch or at an
+            // instruction whose destination field names the register.
             auto lookahead = reader;
-            const auto add = lookahead.read(4);
-            if ((add & 0xffc00000) == 0x91000000 && ((add >> 5) & 31) == rd)
-                address.addressTaken = page + ((add >> 10) & 0xfff);
+            for (unsigned i = 0; i < 6 && lookahead.pc + 4 <= Address(reader.image.size()); ++i) {
+                const auto add = std::uint32_t(lookahead.read(4));
+                if ((add & 0xffc00000) == 0x91000000 && ((add >> 5) & 31) == rd) {
+                    address.addressTaken = page + ((add >> 10) & 0xfff);
+                    break;
+                }
+                const bool branch = (add & 0x7c000000) == 0x14000000 || (add & 0xff000010) == 0x54000000 ||
+                    (add & 0x7e000000) == 0x34000000 || (add & 0x7e000000) == 0x36000000 ||
+                    (add & 0xfe000000) == 0xd6000000;
+                if (branch || (add & 31) == rd)
+                    break;
+            }
         }
         return address;
     }

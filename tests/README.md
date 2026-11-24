@@ -14,6 +14,11 @@ python3 tests/run.py --luft path/to/Luft --luau path/to/luau [--levels O0,O2] [-
 
 Windows programs have no native runner; they reuse the x86-64 ELF results.
 
+C++ apps (`apps/*.cpp`, built as C++17) cover exceptions and the standard library. ELF builds link the C++
+runtime statically; arm64 Mach-O builds map standalone libc++, libc++abi, and libunwind from `$LLVM_PREFIX`
+(default `/opt/homebrew/opt/llvm`), since the system copies live in the dyld cache. x86-64 Mach-O has no such
+runtime to map, so it skips C++ apps.
+
 ## uranium end to end (`uranium.py`)
 
 Translates the [uranium](https://github.com/sbi-n/uranium) release builds (Linux ELF, macOS Mach-O, Windows PE)
@@ -25,6 +30,9 @@ python3 tests/uranium.py --release DIR --luft Luft --luau luau --luau-compile lu
     --elf-libraries libstdc++.so.6,libgcc_s.so.1 \
     --macho-libraries libc++.1.dylib,libc++abi.1.dylib,libunwind.1.dylib
 ```
+
+`--corpus DIR` decompiles another directory of scripts instead, such as Luau's `tests/conformance`; the native
+build rejects a few of those scripts, and the translated builds must report the same errors.
 
 The Linux build maps Ubuntu 24.04's x86-64 libstdc++ and libgcc_s; the macOS build maps standalone libc++,
 libc++abi, and libunwind (Homebrew's llvm provides them), since the system copies live in the dyld cache.

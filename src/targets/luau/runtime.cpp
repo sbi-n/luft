@@ -72,12 +72,47 @@ end
 )";
 
 constexpr std::string_view RoutineOperators = R"(
-type GuestRoutine = (number) -> GuestRoutine?
+-- A routine returns nil when its guest function returns, or the next routine to run. When control leaves
+-- for a frame other than the caller's, as exception unwinders and longjmp-like code do, it returns the
+-- address that frame resumes at and sets unwindStack to the stack pointer there. The calls in between
+-- return the address too, until the call whose frame has that stack pointer resumes at it.
+type GuestRoutine = (number) -> any
 
-local function runGuestRoutine(action: GuestRoutine, expectedReturn: number)
-    local nextAction: GuestRoutine? = action
-    while nextAction do
-        nextAction = nextAction(expectedReturn)
+local unwindStack = -1
+-- Routines for code that frames resume at, by guest address.
+local resumeRoutines: {[number]: any} = {}
+
+local function checkUnwound(address: any)
+    if address ~= nil then
+        error(if type(address) == "number" then string.format("guest returned to unknown address 0x%x", address)
+            else "guest resumed a frame outside translated calls", 0)
+    end
+end
+
+-- `frameStack` is the calling frame's stack pointer once the call returns. Calls without one, from emulated
+-- library code, are never resumed.
+local function runGuestRoutine(action: GuestRoutine, expectedReturn: number, frameStack: number?): any
+    local nextAction: any = action
+    while true do
+        local result = nextAction(expectedReturn)
+        if result == nil then
+            return nil
+        elseif type(result) == "number" then
+            if frameStack == nil then
+                return if result == expectedReturn then nil else result
+            elseif unwindStack ~= frameStack then
+                return result
+            elseif result == expectedReturn then
+                return nil
+            end
+            -- The caller resumes inside its own function: it continues with that routine.
+            local resume = resumeRoutines[result]
+            if resume == nil then
+                error(string.format("guest resumed its frame at 0x%x, which has no translated code", result), 0)
+            end
+            return resume
+        end
+        nextAction = result
     end
 end
 )";
@@ -326,7 +361,25 @@ end
 local signedLaneOps = {[4] = true, [5] = true, [8] = true, [9] = true, [13] = true, [15] = true, [18] = true}
 
 local function wideLanes(op: number, alo: number, ahi: number, blo: number, bhi: number): (number, number)
-    if op == 0 or op == 1 then
+    if op == 24 then
+        local set = bit32.band(alo, blo) ~= 0 or bit32.band(ahi, bhi) ~= 0
+        return if set then 4294967295 else 0, if set then 4294967295 else 0
+    elseif op == 25 or op == 26 then
+        local count = bit32.band(blo, 255)
+        if count >= 128 then count -= 256 end
+        if count >= 64 then return 0, 0 end
+        if count >= 0 then
+            if count >= 32 then return 0, bit32.lshift(alo, count - 32) end
+            if count == 0 then return alo, ahi end
+            return bit32.lshift(alo, count), bit32.bor(bit32.lshift(ahi, count), bit32.rshift(alo, 32 - count))
+        end
+        count = -count
+        local fill = if op == 26 and ahi >= 2147483648 then 4294967295 else 0
+        if count >= 64 then return fill, fill end
+        local right = if op == 26 then bit32.arshift else bit32.rshift
+        if count >= 32 then return right(ahi, count - 32), fill end
+        return bit32.bor(bit32.rshift(alo, count), bit32.lshift(ahi, 32 - count)), right(ahi, count)
+    elseif op == 0 or op == 1 then
         local sum = if op == 0 then alo + blo else alo - blo
         local high = if op == 0 then ahi + bhi else ahi - bhi
         return sum % 4294967296, (high + math.floor(sum / 4294967296)) % 4294967296
@@ -404,6 +457,15 @@ local function laneOperation(op: number, element: number, size: number, a0: numb
         elseif op == 16 then r = math.floor((x + y + 1) / 2)
         elseif op == 17 or op == 18 then r = math.floor(x * y / 2 ^ bits)
         elseif op == 19 then r = math.abs(x - y)
+        elseif op == 24 then r = if bit32.band(x % 4294967296, y % 4294967296) ~= 0 then mask else 0
+        elseif op == 25 or op == 26 then
+            local count = readLane(laneB, at, 1, true)
+            if op == 26 then x = readLane(laneA, at, element, true) end
+            if count >= 0 then
+                r = if count >= bits then 0 else x * 2 ^ count
+            else
+                r = if -count >= bits then (if x < 0 then -1 else 0) else math.floor(x / 2 ^ -count)
+            end
         else error("unsupported vector lane operation " .. op, 0) end
         writeLane(laneR, at, element, r)
     end
@@ -1705,6 +1767,351 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
 end
 )";
 
+constexpr std::string_view SehOperators = R"luau(
+-- Windows x64 structured exception handling: what ntdll does for RaiseException and RtlUnwindEx, after
+-- Wine and ReactOS. Frames are found through the image's .pdata table and unwound by interpreting
+-- UNWIND_INFO. Language handlers such as __CxxFrameHandler4 are guest code that `call` runs.
+-- CONTEXT keeps registers at 0x78 + 8 * index, Rip at 0xf8, and Xmm registers at 0x1a0.
+-- The image's base and end, and its .pdata table, which holds RVAs. `active` records the calls into guest
+-- handler code in progress, innermost last: exception handlers, termination handlers, and consolidation
+-- callbacks. A frame walk that returns past one continues as Windows does: in the context of the raise, of
+-- the frame being unwound, or of the frame being resumed, with the activities in `outer` still around it.
+type SehActivity = {kind: string, context: number, outer: number}
+local seh = {base = 0, stop = 0, table = 0, count = 0, active = {} :: {SehActivity}}
+local SehContextSize = 1232
+-- Return addresses of guest code the runtime calls: walks end at handler calls, and a consolidation
+-- callback's caller is the frame being resumed.
+local SehHandlerReturn = 4294967295
+local SehConsolidateReturn = 4294967280
+type GuestCall = (number, number, number, number, number, number) -> (number, any)
+
+local function sehNew(size: number): number
+    local at = resize(0, 0, size, 0)
+    fillMemory(at, 0, 0, size, 0)
+    return at
+end
+
+local function sehCopy(target: number, source: number)
+    writeString(target, readString(source, SehContextSize))
+end
+
+local function sehRegister(context: number, index: number): number
+    return (read(8, context + 0x78 + index * 8))
+end
+
+local function sehSetRegister(context: number, index: number, lo: number, hi: number?)
+    write(8, context + 0x78 + index * 8, lo, hi or 0)
+end
+
+-- RtlLookupFunctionEntry: the RUNTIME_FUNCTION covering `pc`, or zero for a leaf function.
+local function sehLookup(pc: number): number
+    pc -= seh.base
+    local low, high = 0, seh.count - 1
+    while low <= high do
+        local middle = (low + high) // 2
+        local entry = seh.table + middle * 12
+        if pc < read(4, entry) then
+            high = middle - 1
+        elseif pc >= read(4, entry + 4) then
+            low = middle + 1
+        else
+            return entry
+        end
+    end
+    return 0
+end
+
+-- RtlVirtualUnwind: turns the context of the frame running `pc` in the function of `entry` into its
+-- caller's. Returns the frame's handler of `handlerType` (1 exception, 2 termination), its data, and the
+-- establisher frame.
+local function sehVirtualUnwind(handlerType: number, pc: number, entry: number, context: number): (number, number, number)
+    local frame = sehRegister(context, 4)
+    local establisher = frame
+    local machineFrame = false
+    local inPrologue = false
+    local info = 0
+    for depth = 1, 32 do
+        local begin = seh.base + read(4, entry)
+        info = seh.base + read(4, entry + 8)
+        local codes = read(1, info + 2)
+        local frameByte = read(1, info + 3)
+        if bit32.band(frameByte, 15) ~= 0 then
+            frame = sehRegister(context, bit32.band(frameByte, 15)) - bit32.rshift(frameByte, 4) * 16
+        end
+        if depth == 1 then
+            establisher = frame
+        end
+        -- In a prologue, only the codes for instructions that already ran apply.
+        local executed = math.huge
+        if pc >= begin and pc < begin + read(1, info + 1) then
+            executed = pc - begin
+        end
+        inPrologue = executed ~= math.huge
+        local i = 0
+        while i < codes do
+            local code = info + 4 + i * 2
+            local op = bit32.band(read(1, code + 1), 15)
+            local opInfo = bit32.rshift(read(1, code + 1), 4)
+            local slots = if op == 1 then (if opInfo == 0 then 2 else 3)
+                elseif op == 4 or op == 6 or op == 8 then 2 elseif op == 5 or op == 9 then 3 else 1
+            if executed >= read(1, code) then
+                local rsp = sehRegister(context, 4)
+                if op == 0 then
+                    sehSetRegister(context, opInfo, read(8, rsp))
+                    sehSetRegister(context, 4, rsp + 8)
+                elseif op == 1 then
+                    sehSetRegister(context, 4, rsp + (if opInfo == 0 then read(2, code + 2) * 8 else read(4, code + 2)))
+                elseif op == 2 then
+                    sehSetRegister(context, 4, rsp + opInfo * 8 + 8)
+                elseif op == 3 then
+                    sehSetRegister(context, 4, frame)
+                elseif op == 4 or op == 5 then
+                    sehSetRegister(context, opInfo, read(8, frame + (if op == 4 then read(2, code + 2) * 8 else read(4, code + 2))))
+                elseif op == 8 or op == 9 then
+                    local at = frame + (if op == 8 then read(2, code + 2) * 16 else read(4, code + 2))
+                    writeString(context + 0x1a0 + opInfo * 16, readString(at, 16))
+                elseif op == 10 then
+                    local base = rsp + (if opInfo == 1 then 8 else 0)
+                    write(8, context + 0xf8, read(8, base))
+                    sehSetRegister(context, 4, read(8, base + 24))
+                    machineFrame = true
+                end
+            end
+            i += slots
+        end
+        -- UNW_FLAG_CHAININFO: the codes continue in the function entry that follows.
+        if bit32.band(read(1, info), 0x20) == 0 then
+            break
+        end
+        entry = info + 4 + (codes + codes % 2) * 2
+    end
+    if not machineFrame then
+        local rsp = sehRegister(context, 4)
+        write(8, context + 0xf8, read(8, rsp))
+        sehSetRegister(context, 4, rsp + 8)
+    end
+    local flags = bit32.rshift(read(1, info), 3)
+    if bit32.band(flags, handlerType) == 0 or inPrologue then
+        return 0, 0, establisher
+    end
+    local codes = read(1, info + 2)
+    local handlerAt = info + 4 + (codes + codes % 2) * 2
+    return seh.base + read(4, handlerAt), handlerAt + 4, establisher
+end
+
+-- Unwinds `context` one frame, through leaf functions too. Returns the frame's handler and its data, the
+-- establisher frame, and the pc and function entry the frame was running.
+local function sehStep(handlerType: number, context: number): (number, number, number, number, number)
+    local pc = (read(8, context + 0xf8))
+    local entry = sehLookup(pc)
+    if entry == 0 then
+        local rsp = sehRegister(context, 4)
+        write(8, context + 0xf8, read(8, rsp))
+        sehSetRegister(context, 4, rsp + 8)
+        return 0, 0, rsp, pc, 0
+    end
+    local handler, data, establisher = sehVirtualUnwind(handlerType, pc, entry, context)
+    return handler, data, establisher, pc, entry
+end
+
+-- Whether `context` is a guest frame to unwind. `cursor` counts the activities around the walk's position;
+-- returning into one continues in the context it records.
+local function sehNextFrame(context: number, cursor: number): (boolean, number)
+    local pc = (read(8, context + 0xf8))
+    while (pc == SehHandlerReturn or pc == SehConsolidateReturn) and cursor >= 1 do
+        local activity = seh.active[cursor]
+        sehCopy(context, activity.context)
+        cursor = activity.outer
+        pc = (read(8, context + 0xf8))
+    end
+    return pc ~= 0 and pc < SehConsolidateReturn, cursor
+end
+
+local function sehCallWith(kind: string, context: number, outer: number, call: GuestCall, target: number, a: number,
+    b: number, c: number, d: number, marker: number): (number, any)
+    table.insert(seh.active, {kind = kind, context = context, outer = outer})
+    local result, escaped = call(target, a, b, c, d, marker)
+    table.remove(seh.active)
+    return result, escaped
+end
+
+-- Where an unwind requested now starts, as a copy, and the activities around it. One from an exception
+-- handler unwinds the frames from the raise; one from a termination handler collides with the unwind running
+-- that handler and continues at its frame. Zero means the unwind starts at its caller.
+local function sehUnwindStart(): (number, number)
+    local top = seh.active[#seh.active]
+    if top == nil or top.kind == "consolidate" then
+        return 0, #seh.active
+    end
+    local start = sehNew(SehContextSize)
+    sehCopy(start, top.context)
+    return start, top.outer
+end
+
+-- DISPATCHER_CONTEXT.
+local function sehDispatcher(pc: number, entry: number, establisher: number, context: number, handler: number,
+    data: number, target: number): number
+    local dispatcher = sehNew(80)
+    write(8, dispatcher, pc, 0)
+    write(8, dispatcher + 8, seh.base, 0)
+    write(8, dispatcher + 16, entry, 0)
+    write(8, dispatcher + 24, establisher, 0)
+    write(8, dispatcher + 32, target, 0)
+    write(8, dispatcher + 40, context, 0)
+    write(8, dispatcher + 48, handler, 0)
+    write(8, dispatcher + 56, data, 0)
+    return dispatcher
+end
+
+-- RtlDispatchException. Returns nil when a handler continues execution, or what an unwind that left
+-- the handler returned with: the address a frame resumes at.
+local function sehRaise(record: number, context: number, call: GuestCall): any
+    local work = sehNew(SehContextSize)
+    sehCopy(work, context)
+    local around = #seh.active
+    local cursor = around
+    for _ = 1, 100000 do
+        local valid
+        valid, cursor = sehNextFrame(work, cursor)
+        if not valid then
+            break
+        end
+        local handler, data, establisher, pc, entry = sehStep(1, work)
+        if handler ~= 0 then
+            local dispatcher = sehDispatcher(pc, entry, establisher, work, handler, data, 0)
+            local disposition, escaped = sehCallWith("dispatch", context, around, call, handler, record, establisher,
+                context, dispatcher, SehHandlerReturn)
+            if escaped ~= nil or disposition == 0 then
+                return escaped
+            end
+        end
+    end
+    -- No frame handled it: the filter from SetUnhandledExceptionFilter decides. MinGW's continues GCC
+    -- exceptions, so the C++ runtime terminates; MSVC's terminates for C++ exceptions.
+    if process.exceptionFilterLo ~= 0 then
+        local pointers = sehNew(16)
+        write(8, pointers, record, 0)
+        write(8, pointers + 8, context, 0)
+        local result, escaped = sehCallWith("dispatch", context, around, call, process.exceptionFilterLo, pointers, 0,
+            0, 0, SehHandlerReturn)
+        if escaped ~= nil then
+            return escaped
+        elseif result == 0xffffffff then
+            return nil
+        elseif result == 1 then
+            exitProcess(read(4, record), false)
+        end
+    end
+    error(string.format("unhandled guest exception 0x%08x", read(4, record)), 0)
+end
+
+-- RtlUnwindEx. Calls the termination handlers of the frames from `start` (or `final`, the caller's context)
+-- to `targetFrame`, and leaves the target frame's context in `final`. An unwind consolidation runs its
+-- callback, such as a C++ catch block, which returns where to continue. Returns that address, or what an
+-- unwind that escaped returned with as the second value.
+local function sehUnwind(targetFrame: number, targetIp: number, record: number, returnValue: number,
+    call: GuestCall, final: number, start: number, cursor: number): (number?, any)
+    local frame = sehNew(SehContextSize)
+    sehCopy(frame, if start ~= 0 then start else final)
+    if record == 0 then
+        record = sehNew(152)
+        write(4, record, 0xc0000027, 0)
+        write(8, record + 16, targetIp, 0)
+    end
+    write(4, record + 4, bit32.bor(read(4, record + 4), if targetFrame == 0 then 6 else 2), 0)
+    local caller = sehNew(SehContextSize)
+    local reached = false
+    for _ = 1, 100000 do
+        local valid
+        valid, cursor = sehNextFrame(frame, cursor)
+        if not valid then
+            break
+        end
+        sehCopy(caller, frame)
+        local handler, data, establisher, pc, entry = sehStep(2, caller)
+        reached = establisher == targetFrame
+        if reached then
+            write(4, record + 4, bit32.bor(read(4, record + 4), 0x20), 0)
+        end
+        if handler ~= 0 then
+            -- As in Wine, the dispatcher context of an unwind holds the frame's own context, which is the one
+            -- restored at the target: GCC's handler stores the landing pad's selector there.
+            local dispatcher = sehDispatcher(pc, entry, establisher, frame, handler, data, targetIp)
+            local _, escaped = sehCallWith("unwind", frame, cursor, call, handler, record, establisher, frame, dispatcher,
+                SehHandlerReturn)
+            if escaped ~= nil then
+                return nil, escaped
+            end
+        end
+        if reached then
+            break
+        end
+        sehCopy(frame, caller)
+    end
+    if not reached then
+        error(string.format("guest unwind did not reach frame 0x%x", targetFrame), 0)
+    end
+    sehCopy(final, frame)
+    sehSetRegister(final, 0, returnValue)
+    local resume = targetIp
+    if read(4, record) == 0x80000029 then
+        -- STATUS_UNWIND_CONSOLIDATE: ExceptionInformation[0] is the callback.
+        local continuation, escaped = sehCallWith("consolidate", final, cursor, call, (read(8, record + 32)), record, 0,
+            0, 0, SehConsolidateReturn)
+        if escaped ~= nil then
+            return nil, escaped
+        end
+        resume = continuation
+    end
+    write(8, final + 0xf8, resume, 0)
+    return resume, nil
+end
+)luau";
+
+// How unwinders find frame data: glibc's _dl_find_object and dyld's _dyld_find_unwind_sections.
+constexpr std::string_view UnwindLookups = R"luau(
+local function findUnwindObject(pcLo: number, pcHi: number): any
+    if pcHi ~= 0 then
+        return nil
+    end
+    for _, object in unwindObjects do
+        if pcLo >= object.start and pcLo < object.stop then
+            return object
+        end
+    end
+    return nil
+end
+
+-- struct dl_find_object: flags, map start and end, link map, then PT_GNU_EH_FRAME.
+function libc.dl_find_object(pcLo: number, pcHi: number, resultLo: number, resultHi: number): (number, number)
+    local object = findUnwindObject(pcLo, pcHi)
+    if object == nil or object.frameHeader == 0 then
+        return 4294967295, 4294967295
+    end
+    local result = address(resultLo, resultHi)
+    fillMemory(result, 0, 0, 96, 0)
+    write(8, result + 8, object.start, 0)
+    write(8, result + 16, object.stop, 0)
+    write(8, result + 32, object.frameHeader, 0)
+    return 0, 0
+end
+
+-- struct dyld_unwind_sections: header, __eh_frame and its size, __unwind_info and its size.
+function libc.dyld_find_unwind_sections(pcLo: number, pcHi: number, infoLo: number, infoHi: number): (number, number)
+    local object = findUnwindObject(pcLo, pcHi)
+    if object == nil then
+        return 0, 0
+    end
+    local info = address(infoLo, infoHi)
+    write(8, info, object.header, 0)
+    write(8, info + 8, object.frames, 0)
+    write(8, info + 16, object.framesSize, 0)
+    write(8, info + 24, object.compact, 0)
+    write(8, info + 32, object.compactSize, 0)
+    return 1, 0
+end
+)luau";
+
 // Host services for translated programs: arguments, standard streams, a file system, and C library I/O.
 // Each libc entry takes and returns guest words as (lo, hi) pairs.
 constexpr std::string_view ProcessOperators = R"luau(
@@ -2846,6 +3253,15 @@ function libc.failure()
     return 0, 0
 end
 
+-- No message catalogs are installed, so messages stay untranslated.
+function libc.gettext(lo: number, hi: number): (number, number)
+    return lo, hi
+end
+
+function libc.dgettext(domainLo: number, domainHi: number, lo: number, hi: number): (number, number)
+    return lo, hi
+end
+
 -- KERNEL32 for programs built against the Windows CRT. Every entry receives the four register arguments as
 -- (lo, hi) pairs followed by the stack pointer; later arguments live above the 32-byte shadow space.
 local win32 = {}
@@ -3498,6 +3914,13 @@ std::string Data::source() const {
 
 void appendRuntime(std::string& source, const RuntimeFeatures& features, const Data& data) {
     source += ArgumentReader;
+    if (features.landingPads && !data.landingPads.empty()) {
+        // Unwinders jump to these with the stack pointer of the frame that resumes.
+        source += "local landingPads: {[number]: boolean} = {";
+        for (const auto pad : data.landingPads)
+            source += std::format("[{}] = true, ", pad);
+        source += "}\n";
+    }
     // Guest process state that outlives a single export call.
     source += "\nlocal guestTrace: {number} = table.create(32, -1)\nlocal guestTraceAt = 1\n";
     source += "local function describeTrace(): string\n"
@@ -3542,8 +3965,24 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
             "criticalSection, protectMemory, cLocale, useCLocale, wideClass, testWideClass, pthreadMutex, srwLock, errnoAddress, "
             "readString, writeString = makeMemory({}, data, {}, {}, {})\n",
             data.image.size(), features.heap, !data.regions.empty(), data.regions.empty() ? RawStackSize : MappedStackSize);
-        if (features.process)
+        if (features.process) {
+            source += "\n-- Each mapped object's exception metadata, for unwinders that look it up.\n"
+                "local unwindObjects = {\n";
+            for (const auto& object : data.unwindObjects)
+                source += std::format("    {{start = {}, stop = {}, header = {}, frameHeader = {}, frames = {}, "
+                    "framesSize = {}, compact = {}, compactSize = {}}},\n", object.start, object.end, object.header,
+                    object.frameHeader, object.frames, object.framesSize, object.compact, object.compactSize);
+            source += "}\n";
             source += ProcessOperators;
+            source += UnwindLookups;
+        }
+        if (features.seh) {
+            source += SehOperators;
+            if (!data.unwindObjects.empty())
+                source += std::format("seh.base, seh.stop, seh.table, seh.count = {}, {}, {}, {}\n",
+                    data.unwindObjects.front().header, data.unwindObjects.front().end,
+                    data.unwindObjects.front().frames, data.unwindObjects.front().framesSize / 12);
+        }
         if (features.x87)
             source += X87Operators;
     }

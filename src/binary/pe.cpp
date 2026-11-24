@@ -1,10 +1,16 @@
 #include "image.h"
 #include "formats.h"
+#include "unwind.h"
 
 #include <array>
 
 namespace {
 using namespace binary;
+
+// The image maps at this guest address rather than its preferred base, which lies past guest memory. Like
+// Windows, it leaves the page at zero unmapped and gives the image a non-null base, which the C++ runtime
+// expects of RtlPcToFileHeader.
+constexpr std::size_t MapBase = 0x10000;
 
 std::vector<std::size_t> applyRelocations(Image& image, Bytes table, std::uint64_t base) {
     std::vector<std::size_t> functionPointers;
@@ -21,11 +27,11 @@ std::vector<std::size_t> applyRelocations(Image& image, Bytes table, std::uint64
                 continue;
             if (type != 10)
                 throw std::runtime_error("unsupported PE relocation type");
-            const auto at = page + (entry & 0xfff);
+            const auto at = MapBase + page + (entry & 0xfff);
             const auto pointer = read(image.bytes, at, 8);
             if (pointer < base)
                 throw std::runtime_error("PE relocation points before the image");
-            const auto address = pointer - base;
+            const auto address = MapBase + pointer - base;
             image.relocate(at, address);
             if (std::ranges::any_of(image.regions, [&](const GuestRegion& region) {
                 return region.executable && address >= region.start && address < region.end;
@@ -45,14 +51,14 @@ std::vector<GuestImport> readImports(Bytes image, Bytes directory) {
         if (!first)
             return imports;
         const auto lookup = read(descriptor, 0, 4);
-        const auto library = stringAt(image, read(descriptor, 12, 4));
+        const auto library = stringAt(image, MapBase + read(descriptor, 12, 4));
         for (std::uint64_t j = 0;; j += 8) {
-            const auto ordinal = read(image, (lookup ? lookup : first) + j, 8);
+            const auto ordinal = read(image, MapBase + (lookup ? lookup : first) + j, 8);
             if (!ordinal)
                 break;
-            slice(image, first + j, 8);
-            const auto name = ordinal >> 63 ? std::string_view("ordinal import") : stringAt(image, ordinal + 2);
-            imports.push_back({std::size_t(first + j), 8, name, true, false, library});
+            slice(image, MapBase + first + j, 8);
+            const auto name = ordinal >> 63 ? std::string_view("ordinal import") : stringAt(image, MapBase + ordinal + 2);
+            imports.push_back({std::size_t(MapBase + first + j), 8, name, true, false, library});
         }
     }
     if (!directory.empty())
@@ -62,17 +68,17 @@ std::vector<GuestImport> readImports(Bytes image, Bytes directory) {
 
 std::uint64_t exportedAddress(Bytes image, Bytes directory, std::uint64_t start, std::string_view symbol) {
     if (!directory.empty()) {
-        const auto functions = slice(image, read(directory, 28, 4), read(directory, 20, 4) * 4);
+        const auto functions = slice(image, MapBase + read(directory, 28, 4), read(directory, 20, 4) * 4);
         const auto count = read(directory, 24, 4);
-        const auto names = slice(image, read(directory, 32, 4), count * 4);
-        const auto indexes = slice(image, read(directory, 36, 4), count * 2);
+        const auto names = slice(image, MapBase + read(directory, 32, 4), count * 4);
+        const auto indexes = slice(image, MapBase + read(directory, 36, 4), count * 2);
         for (std::size_t i = 0; i < count; ++i) {
-            if (stringAt(image, read(names, i * 4, 4)) != symbol)
+            if (stringAt(image, MapBase + read(names, i * 4, 4)) != symbol)
                 continue;
             const auto target = read(functions, read(indexes, i * 2, 2) * 4, 4);
             if (target >= start && target < start + directory.size())
                 throw std::runtime_error("forwarded PE export is unsupported: " + std::string(symbol));
-            return target;
+            return MapBase + target;
         }
     }
     throw std::runtime_error("PE export was not found: " + std::string(symbol));
@@ -97,7 +103,7 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
     // Windows maps the headers at the image base; runtimes inspect them through __ImageBase.
     const auto headerSize = std::min<std::uint64_t>(read(opt, 60, 4), file.size());
     if (headerSize)
-        image.add(0, headerSize, file.first(headerSize), true, false, false);
+        image.add(MapBase, headerSize, file.first(headerSize), true, false, false);
     for (std::size_t i = 0; i < sections.size(); i += 40) {
         const auto section = sections.subspan(i, 40);
         const auto start = read(section, 12, 4);
@@ -107,7 +113,7 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
         const auto data = slice(file, read(section, 20, 4), std::min(size, length));
         constexpr std::array<std::uint8_t, 8> functionPointers{'.', 'f', 'p', 't', 'a', 'b', 'l', 'e'};
         const bool protectable = std::ranges::equal(section.first(8), functionPointers);
-        image.add(start, size, data, flags & 0x40000000, flags & 0x80000000, flags & 0x20000000, protectable);
+        image.add(MapBase + start, size, data, flags & 0x40000000, flags & 0x80000000, flags & 0x20000000, protectable);
     }
     if (image.regions.empty())
         throw std::runtime_error("PE has no loadable sections");
@@ -117,11 +123,18 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
     };
     const auto directory = [&](std::size_t id) -> Bytes {
         const auto at = directoryRva(id);
-        return at ? slice(image.bytes, at, read(directories, id * 8 + 4, 4)) : Bytes{};
+        return at ? slice(image.bytes, MapBase + at, read(directories, id * 8 + 4, 4)) : Bytes{};
     };
     const auto functionPointers = applyRelocations(image, directory(5), base);
     auto imports = readImports(image.bytes, directory(1));
-    const auto relative = [base](std::uint64_t address) { return std::size_t(address >= base ? address - base : address); };
+    // Pointers in the image were relocated to guest addresses unless the image has no relocations. Addresses
+    // given on the command line are virtual addresses or RVAs.
+    const auto relative = [base](std::uint64_t address) {
+        return std::size_t(address >= base ? MapBase + address - base : address);
+    };
+    const auto given = [base](std::uint64_t address) {
+        return std::size_t(MapBase + (address >= base ? address - base : address));
+    };
     std::optional<std::size_t> tlsVector;
     std::vector<GuestBinding> bindings;
     if (const auto tls = directory(9); !tls.empty()) {
@@ -147,10 +160,9 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
     }
     const auto resolve = [&](const GuestExport& entry) {
         if (entry.symbol == EntrySymbol)
-            return std::size_t(read(opt, 16, 4));
-        const auto address = entry.symbol.empty() ? entry.offset :
-            exportedAddress(image.bytes, directory(0), directoryRva(0), entry.symbol);
-        return relative(address);
+            return std::size_t(MapBase + read(opt, 16, 4));
+        return entry.symbol.empty() ? given(entry.offset) :
+            std::size_t(exportedAddress(image.bytes, directory(0), directoryRva(0), entry.symbol));
     };
     std::vector<GuestExport> mapped(exports.begin(), exports.end());
     for (auto& entry : mapped)
@@ -166,8 +178,8 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
     for (const auto& entry : initializers)
         addInitializer(resolve(entry));
     for (const auto& range : ranges) {
-        const auto start = relative(range.start);
-        const auto end = relative(range.end);
+        const auto start = given(range.start);
+        const auto end = given(range.end);
         if (start > end || (end - start) % 8 || !std::ranges::any_of(image.regions, [&](const GuestRegion& region) {
             return region.readable && !region.executable && start >= region.start && end <= region.end;
         })) {
@@ -185,6 +197,7 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
     const auto threadBlock = (image.bytes.size() + 15) & ~std::size_t(15);
     image.add(threadBlock, ThreadBlockSize + ProcessBlockSize + ParametersSize, {}, true, true, false);
     const auto processBlock = threadBlock + ThreadBlockSize;
+    image.relocate(processBlock + 0x10, MapBase);
     image.relocate(processBlock + 0x20, processBlock + ProcessBlockSize);
     const auto stackLimit = (image.bytes.size() + 15) & ~std::size_t(15);
     image.relocate(threadBlock + 0x08, stackLimit + MappedStackSize);
@@ -198,6 +211,15 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
     image.relocate(processBlock + 0x30, 0xffeeffe0);
     auto options = program;
     options.threadBlock = threadBlock;
+    options.imageBase = MapBase;
+    // The runtime unwinds Windows exceptions with the .pdata table, and the image's handlers transfer control
+    // to funclets and continuations that no branch names.
+    if (const auto table = directoryRva(3); table && !directory(3).empty()) {
+        const auto size = directory(3).size();
+        options.unwindObjects.push_back({MapBase, image.bytes.size(), MapBase, 0, MapBase + table, size, 0, 0});
+        windowsHandlerTargets(image.bytes, image.regions, MapBase, MapBase + table, size, options.landingPads);
+    }
+    windowsThrowTargets(image.bytes, image.regions, MapBase, options.landingPads);
 
     // The DLL C runtime exports some variables. Code reaches them through import slots, so each gets
     // synthetic storage. The standard FILE array backs __iob_func and _iob.

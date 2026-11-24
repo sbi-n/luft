@@ -38,6 +38,8 @@ EffectiveAddress x64Address(Reader& reader, unsigned mode, unsigned rm, unsigned
         displacement = signExtend(reader.read(1), 8);
     else if (mode == 2 || base == Zero)
         displacement = signExtend(reader.read(4), 32);
+    if (reader.segmented)
+        displacement += reader.threadPointer;
     return {base, displacement, index, scale};
 }
 
@@ -409,7 +411,8 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
     while (prefix == 0x66 && opcode == 0x66)
         opcode = reader.read(1);
     unsigned rex = 0;
-    if (opcode >= 0x40 && opcode <= 0x4f) {
+    const bool rexPresent = opcode >= 0x40 && opcode <= 0x4f;
+    if (rexPresent) {
         rex = opcode & 15;
         opcode = reader.read(1);
     }
@@ -439,8 +442,14 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
     }
     if (opcode == 0x0f) {
         const auto extension = reader.read(1);
-        if (prefix == 0xf3 && rex == 0 && extension == 0x1e && reader.read(1) == 0xfa)
+        if (extension == 0x1e) {
+            // The hint-NOP group: ENDBR32/64, and RDSSPD/Q, which leave their register unchanged while
+            // control-flow enforcement is off, so guests skip their shadow-stack paths.
+            const auto modrm = reader.read(1);
+            if ((modrm >> 6) != 3)
+                x64Address(reader, modrm >> 6, modrm & 7, rex);
             return {};
+        }
         if (prefix == 0xf3 && (extension == 0xb8 || extension == 0xbc || extension == 0xbd)) {
             const auto modrm = reader.read(1);
             const unsigned mode = modrm >> 6;
@@ -450,6 +459,15 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
                 : Value(Memory{x64Address(reader, mode, rm, rex)});
             return {BitScan{rex & 8 ? 8u : 4u, dst, operand, extension == 0xbd, false, extension != 0xb8,
                 extension == 0xb8}};
+        }
+        if (prefix == 0x66 && !(rex & 8) && (extension == 0xb6 || extension == 0xbe)) {
+            // MOVZX and MOVSX into a 16-bit register: extend into a temporary and merge its low word.
+            auto instruction = decodeExtend(reader, rex, rexPresent, 4, 8, extension == 0xbe);
+            auto& extend = std::get<Extend>(instruction.effect);
+            const auto target = extend.dst;
+            extend.dst = Temp;
+            instruction.after.push_back(Move{2, target, Register{Temp}});
+            return instruction;
         }
         if (prefix == 0x66 && extension == 0x1f) {
             skipMultiByteNop(reader, rex);
@@ -598,8 +616,21 @@ Instruction decodeX64(Reader& reader) {
     const bool locked = opcode == 0xf0;
     if (locked)
         opcode = reader.read(1);
-    if (opcode == 0x64)
-        return decodeStackGuard(reader);
+    if (opcode == 0x64 && !locked) {
+        const auto start = reader.pc;
+        try {
+            return decodeStackGuard(reader);
+        } catch (const std::runtime_error&) {
+        }
+        // Other FS-relative accesses reach thread-local storage at the thread pointer.
+        if (!reader.threadPointer || reader.segmented)
+            unsupported();
+        reader.pc = start;
+        reader.segmented = true;
+        auto instruction = decodeX64(reader);
+        reader.segmented = false;
+        return instruction;
+    }
     if (opcode == 0x65 && !locked) {
         // Only absolute GS loads appear in compiled Windows code: mov reg, gs:[disp32].
         auto operation = reader.read(1);
@@ -850,13 +881,24 @@ Instruction decodeX64(Reader& reader) {
         const auto op = opcode >> 3;
         return {Binary{*x64Operations[op], size, op == 7 ? Zero : 0, 0, immediate(signExtend(reader.read(4), 32)), true}};
     }
+    // ADC and SBB with the accumulator.
+    if (opcode == 0x15 || opcode == 0x1d)
+        return {Binary{opcode == 0x15 ? BinaryOp::Add : BinaryOp::Sub, size, 0, 0, immediate(signExtend(reader.read(4), 32)),
+            true, ShiftOp::Left, 0, false, 0, false, true}};
     if ((opcode & 0xc7) == 4 && x64Operations[opcode >> 3]) {
         const auto op = opcode >> 3;
         return {ByteBinary{*x64Operations[op], Register{0}, 0, Immediate{reader.read(1)}, 0, op != 7}};
     }
+    if (opcode == 0x14 || opcode == 0x1c) {
+        ByteBinary binary{opcode == 0x14 ? BinaryOp::Add : BinaryOp::Sub, Register{0}, 0, Immediate{reader.read(1)}, 0, true};
+        binary.withCarry = true;
+        return {binary};
+    }
 
     const bool registerAlu = (opcode & 0xc5) == 1 && x64Operations[opcode >> 3].has_value();
-    const bool byteAlu = (opcode & 0xc5) == 0 && x64Operations[opcode >> 3].has_value();
+    // ADC and SBB on bytes: 0x10, 0x12, 0x18, 0x1a.
+    const bool byteCarry = (opcode & 0xf5) == 0x10;
+    const bool byteAlu = ((opcode & 0xc5) == 0 && x64Operations[opcode >> 3].has_value()) || byteCarry;
     const bool carryAlu = (opcode & 0xf5) == 0x11;
     if (!registerAlu && !byteAlu && !carryAlu && opcode != 0x69 && opcode != 0x6b && opcode != 0x80 && opcode != 0x81 && opcode != 0x83 &&
         opcode != 0x84 && opcode != 0x85 && opcode != 0x87 &&
@@ -914,9 +956,11 @@ Instruction decodeX64(Reader& reader) {
             return {ByteBinary{BinaryOp::And, operand, rmField, reg, regField}};
         if (byteAlu) {
             const auto operation = opcode >> 3;
-            if (opcode & 2)
-                return {ByteBinary{*x64Operations[operation], reg, regField, operand, rmField, operation != 7}};
-            return {ByteBinary{*x64Operations[operation], operand, rmField, reg, regField, operation != 7}};
+            const auto op = byteCarry ? (operation == 2 ? BinaryOp::Add : BinaryOp::Sub) : *x64Operations[operation];
+            ByteBinary binary = opcode & 2 ? ByteBinary{op, reg, regField, operand, rmField, operation != 7}
+                                           : ByteBinary{op, operand, rmField, reg, regField, operation != 7};
+            binary.withCarry = byteCarry;
+            return {binary};
         }
         if (opcode == 0x88)
             return {ByteMove{operand, rmField, reg, regField}};
@@ -1000,10 +1044,13 @@ Instruction decodeX64(Reader& reader) {
         return {Move{size, Temp, Memory{at}}, {}, {}, 0,
             {Shift{op, size, Register{Temp}, count}, Store{size, at, Register{Temp}}}};
     }
-    if (opcode == 0x80 && x64Operations[group]) {
+    if (opcode == 0x80 && (x64Operations[group] || group == 2 || group == 3)) {
         const auto [target, field] = byteRegister(dst, rexPresent);
         const Value operand = mode == 3 ? Value(target) : Value(Memory{x64Address(reader, mode, rm, rex, 1)});
-        return {ByteBinary{*x64Operations[group], operand, field, Immediate{reader.read(1)}, 0, group != 7}};
+        const auto op = x64Operations[group] ? *x64Operations[group] : group == 2 ? BinaryOp::Add : BinaryOp::Sub;
+        ByteBinary binary{op, operand, field, Immediate{reader.read(1)}, 0, group != 7};
+        binary.withCarry = !x64Operations[group];
+        return {binary};
     }
     if (opcode == 0x89 || opcode == 0x8b || opcode == 0x8d) {
         if (mode != 3) {
@@ -1029,10 +1076,12 @@ Instruction decodeX64(Reader& reader) {
         const auto value = immediate(signExtend(reader.read(bytes), 8 * bytes));
         return {Store{opcode == 0xc6 ? 1 : size, addr, value}};
     }
-    if (mode != 3 && (opcode == 0x81 || opcode == 0x83) && x64Operations[group]) {
+    if (mode != 3 && (opcode == 0x81 || opcode == 0x83) && (x64Operations[group] || group == 2 || group == 3)) {
         const unsigned bytes = opcode == 0x83 ? 1 : 4;
         const auto addr = x64Address(reader, mode, rm, rex, bytes);
         const auto rhs = immediate(signExtend(reader.read(bytes), 8 * bytes));
+        if (!x64Operations[group])
+            return {MemoryBinary{group == 2 ? BinaryOp::Add : BinaryOp::Sub, size, Memory{addr}, rhs, true, false, true, true}};
         return {MemoryBinary{*x64Operations[group], size, Memory{addr}, rhs, group != 7}};
     }
     if (opcode == 0xf7 && group == 0) {

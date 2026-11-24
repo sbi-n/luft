@@ -1,4 +1,5 @@
 #include "recompiler.h"
+#include "binary/unwind.h"
 
 #include <algorithm>
 #include <array>
@@ -234,7 +235,7 @@ void relocate(const Sections& sections, std::span<std::uint8_t> image,
     std::uint64_t base, const SymbolVersions& versions, const Definitions& definitions,
     const Definitions& libraryDefinitions, std::vector<CopyRelocation>& copies,
     std::vector<GuestBinding>& bindings, std::vector<std::size_t>& functionPointers,
-    std::optional<GuestObject> tls, std::vector<GuestObject>& objects) {
+    std::optional<GuestObject> tls, std::vector<GuestObject>& objects, std::uint64_t threadPointer) {
     const bool arm = architecture == Architecture::Arm64;
     const unsigned copy = arm ? 1024 : 5;
     const unsigned global = arm ? 1025 : 6;
@@ -300,7 +301,8 @@ void relocate(const Sections& sections, std::span<std::uint8_t> image,
             const auto found = definitions.find({name, version});
             if (type == relative && (info >> 32) == 0) {
                 result = base + addend;
-            } else if (!arm && (type == 16 || type == 17)) {
+            } else if ((!arm && (type == 16 || type == 17 || (type == 18 && threadPointer))) ||
+                (arm && type == 1030 && threadPointer)) {
                 // Use the TLS block address as its unique module identifier in this guest.
                 std::size_t tlsBase = 0;
                 std::uint64_t offset = 0;
@@ -316,6 +318,9 @@ void relocate(const Sections& sections, std::span<std::uint8_t> image,
                         throw std::runtime_error("ELF TLS descriptor is outside load segments");
                     result = tlsBase;
                     objects.push_back({std::size_t(at), 16});
+                } else if (tlsBase && (type == 18 || type == 1030)) {
+                    // R_X86_64_TPOFF64 and R_AARCH64_TLS_TPREL64: initial-exec code adds this to the thread pointer.
+                    result = tlsBase + offset + addend - threadPointer;
                 } else if (tlsBase) {
                     result = offset + addend;
                 }
@@ -452,8 +457,12 @@ Sections mapElf(Architecture architecture, Bytes file, std::uint64_t base,
     return sections;
 }
 
+// Maps an object's TLS template. With `threadPointer`, the block is the executable's and its position sets
+// the thread pointer, which is returned there: x86-64 (variant II) puts the block right below the thread
+// pointer, and ARM64 (variant I) right above a 16-byte control block at the thread pointer.
 std::optional<GuestObject> mapTls(Bytes file, std::uint64_t base, std::vector<std::uint8_t>& image,
-    std::vector<GuestRegion>& regions, std::vector<CopyRelocation>& initializers) {
+    std::vector<GuestRegion>& regions, std::vector<CopyRelocation>& initializers,
+    std::uint64_t* threadPointer = nullptr, bool above = false) {
     const auto programs = slice(file, read(file, 32, 8), read(file, 56, 2) * 56);
     for (std::size_t offset = 0; offset < programs.size(); offset += 56) {
         const auto segment = programs.subspan(offset, 56);
@@ -466,7 +475,18 @@ std::optional<GuestObject> mapTls(Bytes file, std::uint64_t base, std::vector<st
             throw std::runtime_error("unsupported ELF TLS segment layout");
         if (!size)
             return {};
-        const auto at = (image.size() + align - 1) & ~(align - 1);
+        auto at = (image.size() + align - 1) & ~(align - 1);
+        if (threadPointer && above) {
+            const auto pointerAlign = std::max<std::uint64_t>(16, align);
+            *threadPointer = (image.size() + pointerAlign - 1) & ~(pointerAlign - 1);
+            at = *threadPointer + ((16 + align - 1) & ~(align - 1));
+            regions.push_back({std::size_t(*threadPointer), std::size_t(*threadPointer + 16), true, true, false});
+        } else if (threadPointer) {
+            const auto span = (size + align - 1) & ~(align - 1);
+            const auto pointerAlign = std::max<std::uint64_t>(64, align);
+            *threadPointer = (image.size() + span + pointerAlign - 1) & ~(pointerAlign - 1);
+            at = *threadPointer - span;
+        }
         if (at >= MaxExecutableSize || size > MaxExecutableSize - at)
             throw std::runtime_error("ELF TLS segment is outside guest memory");
         if (!data.empty()) {
@@ -486,6 +506,38 @@ std::optional<GuestObject> mapTls(Bytes file, std::uint64_t base, std::vector<st
     }
     return {};
 }
+}
+
+// Where libgcc's unwinder finds this object's frame data: _dl_find_object reports PT_GNU_EH_FRAME.
+UnwindObject unwindObject(const Sections& sections, std::uint64_t base) {
+    const auto file = sections.file;
+    const auto programs = slice(file, read(file, 32, 8), read(file, 56, 2) * 56);
+    UnwindObject object;
+    std::uint64_t low = UINT64_MAX, high = 0;
+    for (std::size_t offset = 0; offset < programs.size(); offset += 56) {
+        const auto header = programs.subspan(offset, 56);
+        const auto type = read(header, 0, 4);
+        const auto address = read(header, 16, 8);
+        if (type == 1) {
+            low = std::min(low, address);
+            high = std::max(high, address + read(header, 40, 8));
+        } else if (type == 0x6474e550) {
+            object.frameHeader = std::size_t(base + address);
+        }
+    }
+    if (low < high) {
+        object.start = std::size_t(base + low);
+        object.end = std::size_t(base + high);
+    }
+    const auto names = sections.data(sections.header(read(file, 62, 2)));
+    for (std::size_t i = 1; i < sections.headers.size() / 64; ++i) {
+        const auto section = sections.header(i);
+        if (symbolName(names, read(section, 0, 4)) == ".eh_frame" && read(section, 16, 8)) {
+            object.frames = std::size_t(base + read(section, 16, 8));
+            object.framesSize = std::size_t(read(section, 32, 8));
+        }
+    }
+    return object;
 }
 
 std::string recompileElf(Architecture architecture, Bytes file, std::span<const GuestExport> exports,
@@ -513,9 +565,41 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
         for (std::size_t i = 0; i < units.size(); ++i)
             std::fprintf(stderr, "Luft: ELF unit %zu at guest %#llx\n", i, (unsigned long long)units[i].base);
     std::vector<CopyRelocation> tlsInitializers;
-    if (architecture == Architecture::X86_64)
+    std::uint64_t threadPointer = 0;
+    std::vector<GuestBinding> bindings;
+    std::vector<GuestObject> objects;
+    if (architecture == Architecture::X86_64) {
+        // Libraries' blocks first, so the executable's ends at the thread pointer, where the thread control
+        // block starts with a pointer to itself.
+        for (auto unit = units.rbegin(); unit != units.rend(); ++unit)
+            unit->tls = mapTls(unit->sections.file, unit->base, image, regions, tlsInitializers,
+                unit->base == LoadBase ? &threadPointer : nullptr);
+        if (!threadPointer)
+            threadPointer = (image.size() + 63) & ~std::size_t(63);
+        constexpr std::size_t ControlBlockSize = 64;
+        if (threadPointer + ControlBlockSize > MaxExecutableSize)
+            throw std::runtime_error("ELF thread control block is outside guest memory");
+        image.resize(threadPointer + ControlBlockSize);
+        regions.push_back({std::size_t(threadPointer), std::size_t(threadPointer + ControlBlockSize), true, true, false});
+        for (unsigned i = 0; i < 8; ++i)
+            image[threadPointer + i] = std::uint8_t(threadPointer >> (8 * i));
+        objects.push_back({std::size_t(threadPointer), ControlBlockSize});
+        bindings.push_back({std::size_t(threadPointer), std::size_t(threadPointer)});
+        program.threadBlock = std::size_t(threadPointer);
+    } else {
         for (auto& unit : units)
-            unit.tls = mapTls(unit.sections.file, unit.base, image, regions, tlsInitializers);
+            unit.tls = mapTls(unit.sections.file, unit.base, image, regions, tlsInitializers,
+                unit.base == LoadBase ? &threadPointer : nullptr, true);
+        if (!threadPointer) {
+            threadPointer = (image.size() + 15) & ~std::size_t(15);
+            if (threadPointer + 16 > MaxExecutableSize)
+                throw std::runtime_error("ELF thread control block is outside guest memory");
+            regions.push_back({std::size_t(threadPointer), std::size_t(threadPointer + 16), true, true, false});
+        }
+        image.resize(std::max<std::size_t>(image.size(), threadPointer + 16));
+        objects.push_back({std::size_t(threadPointer), 16});
+        program.threadBlock = std::size_t(threadPointer);
+    }
     Definitions definitions, libraryDefinitions;
     for (const auto& unit : units) {
         if (!libraries.empty() || unit.tls)
@@ -525,12 +609,10 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
     }
     std::vector<GuestImport> imports;
     std::vector<CopyRelocation> copies;
-    std::vector<GuestBinding> bindings;
     std::vector<std::size_t> functionPointers;
-    std::vector<GuestObject> objects;
     for (const auto& unit : units) {
         relocate(unit.sections, image, regions, imports, architecture, unit.base, unit.versions, definitions,
-            libraryDefinitions, copies, bindings, functionPointers, unit.tls, objects);
+            libraryDefinitions, copies, bindings, functionPointers, unit.tls, objects, threadPointer);
         addDataObjects(unit.sections, unit.base, objects);
     }
     const auto importCount = imports.size();
@@ -645,6 +727,13 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
             }
         const auto mainInitializers = initArray(main, image, regions, LoadBase);
         initializers.insert(initializers.end(), mainInitializers.begin(), mainInitializers.end());
+    }
+    // C++ landing pads are reached only through the unwinder, which reads them from the frame data.
+    for (const auto& unit : units) {
+        const auto object = unwindObject(unit.sections, unit.base);
+        program.unwindObjects.push_back(object);
+        if (object.frames)
+            binary::frameLandingPads(image, object.frames, object.framesSize, program.landingPads);
     }
     return recompileMapped(architecture, image, mapped, regions, imports, objects, initializers,
         CallingConvention::Native, bindings, functionPointers, {}, program);

@@ -32,6 +32,12 @@ INPUTS = [
     (2**64 - 1000, 999), (65535, 255),
 ]
 
+# C++ apps run where a C++ runtime can be mapped: x86-64 Mach-O would need the system's, in the dyld cache.
+CXX_TARGETS = {"arm64-macho", "arm64-elf", "x86_64-elf", "x86_64-pe"}
+LLVM = Path(os.environ.get("LLVM_PREFIX", "/opt/homebrew/opt/llvm"))
+MACHO_CXX_LIBRARIES = [str(LLVM / "lib/c++/libc++.1.dylib"), str(LLVM / "lib/c++/libc++abi.1.dylib"),
+                       str(LLVM / "lib/unwind/libunwind.1.dylib")]
+
 TARGETS = {
     "arm64-macho": ("arm64", "--macho", "_"),
     "x86_64-macho": ("x86_64", "--macho", "_"),
@@ -209,22 +215,26 @@ def build_apps(work: Path, apps, targets, levels):
     for app in apps:
         cxx = app.suffix == ".cpp"
         for target in targets:
+            if cxx and target not in CXX_TARGETS:
+                continue
             for level in levels:
                 name = f"{app.stem}-{target}-{level}"
                 if target.endswith("macho"):
                     arch = TARGETS[target][0]
-                    result = run(["clang++" if cxx else "clang", "-arch", arch, f"-{level}", "-w", "-o", str(work / name),
-                                  str(work / app.name)])
+                    result = run(["clang++" if cxx else "clang", "-arch", arch, f"-{level}", "-w",
+                                  *(["-std=c++17"] if cxx else []), "-o", str(work / name), str(work / app.name)])
                     if result.returncode:
                         raise RuntimeError(result.stderr)
                     executables[(app.stem, target, level)] = work / name
                 elif target.endswith("elf"):
                     compiler = ("g++" if cxx else "gcc") if target == "arm64-elf" else \
                         ("x86_64-linux-gnu-g++" if cxx else "x86_64-linux-gnu-gcc")
-                    linux.append(f"{compiler} -{level} -w -fPIE -pie -o {name} {app.name} -lm")
+                    # The C++ runtime links statically, so the translation needs no shared libraries.
+                    runtime = " -std=c++17 -static-libstdc++ -static-libgcc" if cxx else ""
+                    linux.append(f"{compiler} -{level} -w -fPIE -pie{runtime} -o {name} {app.name} -lm")
                     executables[(app.stem, target, level)] = work / name
                 elif target == "x86_64-pe":
-                    compiler = "x86_64-w64-mingw32-g++" if cxx else "x86_64-w64-mingw32-gcc"
+                    compiler = "x86_64-w64-mingw32-g++ -std=c++17" if cxx else "x86_64-w64-mingw32-gcc"
                     linux.append(f"{compiler} -{level} -w -static -o {name}.exe {app.name}")
                     executables[(app.stem, target, level)] = work / f"{name}.exe"
     if linux:
@@ -280,7 +290,11 @@ def translate_app(args, work: Path, key, path: Path, spec):
     app, target, level = key
     arch, flag, _ = TARGETS[target]
     module = f"{path.stem.replace('.', '_').replace('-', '_')}_program"
-    result = run([args.luft, arch, str(path), "--program", flag], timeout=900)
+    libraries = []
+    if spec["cxx"] and target == "arm64-macho":
+        # The system C++ runtime lives in the dyld cache; standalone copies stand in for it.
+        libraries = [item for library in MACHO_CXX_LIBRARIES for item in ("--macho-library", library)]
+    result = run([args.luft, arch, str(path), "--program", flag, *libraries], timeout=900)
     if result.returncode:
         return f"LUFT ERROR {result.stderr.strip()}"
     (work / f"{module}.luau").write_text(result.stdout)
@@ -329,6 +343,7 @@ def test_apps(args, targets, levels):
     for app in apps:
         shutil.copy(app, work / app.name)
         specs[app.stem] = app_spec(app)
+        specs[app.stem]["cxx"] = app.suffix == ".cpp"
     executables = build_apps(work, apps, targets, levels)
     wanted = native_apps(work, executables, specs)
     failures = 0

@@ -33,6 +33,7 @@ add_executable(Luft
     src/binary/elf.cpp
     src/binary/macho.cpp
     src/binary/pe.cpp
+    src/binary/unwind.cpp
     src/lift/builder.cpp
     src/lift/x64.cpp
     src/lift/arm64.cpp

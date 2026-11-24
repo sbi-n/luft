@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 enum class Architecture { X86_64, Arm64 };
 enum class CallingConvention { Native, Microsoft };
@@ -18,6 +19,30 @@ enum class Startup {
     ElfStack,       // _start with a System V initial stack; __libc_start_main calls main.
     MainArguments,  // Mach-O LC_MAIN: main(argc, argv, envp, apple) after the initializers.
     WindowsProcess, // PE AddressOfEntryPoint with no arguments; the CRT asks KERNEL32 for its command line.
+};
+
+// Code an unwinder transfers control to, and the code range that makes it reachable: a landing pad's call
+// site, or the function whose Windows handler data names a funclet or continuation.
+struct LandingPad {
+    std::size_t target;
+    std::size_t siteStart;
+    std::size_t siteEnd;
+};
+
+// A mapped object's exception metadata, which the runtime reports to unwinders that look it up.
+struct UnwindObject {
+    std::size_t start = 0;
+    std::size_t end = 0;
+    // The Mach-O header.
+    std::size_t header = 0;
+    // ELF PT_GNU_EH_FRAME (.eh_frame_hdr).
+    std::size_t frameHeader = 0;
+    // .eh_frame or __eh_frame; the .pdata function table on Windows.
+    std::size_t frames = 0;
+    std::size_t framesSize = 0;
+    // Mach-O __unwind_info.
+    std::size_t compact = 0;
+    std::size_t compactSize = 0;
 };
 
 struct ProgramOptions {
@@ -32,6 +57,12 @@ struct ProgramOptions {
     bool darwin = false;
     // Record recently executed guest blocks and report them with runtime errors.
     bool trace = false;
+    // Exception landing pads and handler code that unwinders transfer to, found in the image's unwind data.
+    std::vector<LandingPad> landingPads = {};
+    // Where a Windows image is mapped, which GetModuleHandle and the unwinder report.
+    std::size_t imageBase = 0;
+    // Where the guest's unwinders find each mapped object's exception metadata.
+    std::vector<UnwindObject> unwindObjects = {};
 };
 
 // The guest stack sits right after the image. Executables get a larger one than raw code.
