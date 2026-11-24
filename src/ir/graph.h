@@ -109,6 +109,7 @@ struct ByteBinary {
 struct ByteShift { ShiftOp op; Value dst; unsigned field; std::optional<unsigned> count; };
 struct Shift { ShiftOp op; unsigned size; Register dst; unsigned count; };
 struct ShiftRegister { ShiftOp op; unsigned size; unsigned dst; Register src; Register count; bool flags = false; };
+struct Extract { unsigned size; unsigned dst; Register high; Register low; unsigned count; };
 struct Bitfield {
     unsigned size; unsigned dst; Register src; unsigned start; unsigned width; unsigned position; bool sign;
     bool insert = false;
@@ -123,15 +124,24 @@ struct CpuId {};
 struct VectorRegister { unsigned index; };
 struct VectorMemory { EffectiveAddress address; bool aligned; };
 using VectorOperand = std::variant<VectorRegister, VectorMemory>;
-enum class VectorOp { Xor, And, AndNot, Or, UnpackLowDwords, UnpackLowQwords, AddDwords, SubDwords };
-struct VectorBinary { VectorOp op; VectorRegister dst; VectorOperand src; std::optional<VectorRegister> lhs = {}; };
+enum class VectorOp {
+    Xor, And, AndNot, Or, UnpackLowDwords, UnpackLowQwords, AddDwords, SubDwords,
+    DotUnsignedBytes, AccumulatePairs, CompareZeroDwords, CompareZeroQwords, AddQwords, SubQwords, SumQwords,
+    CompareUnsignedWords, CompareUnsignedDwords
+};
+struct VectorBinary {
+    VectorOp op; VectorRegister dst; VectorOperand src; std::optional<VectorRegister> lhs = {}; unsigned size = 16;
+};
 struct VectorMove { VectorOperand dst; VectorOperand src; unsigned size = 16; bool keepUpper = false; };
+struct InterleavedLoad4 { VectorRegister first; EffectiveAddress address; unsigned elementSize; };
+struct VectorSplat { VectorRegister dst; Register src; unsigned elementSize; unsigned size; };
+struct VectorWiden { VectorRegister dst; VectorRegister src; unsigned bits; unsigned shift; bool upper; };
 struct VectorHalfMove { VectorOperand dst; VectorOperand src; bool dstHigh; bool srcHigh; };
 struct VectorShiftBytes { VectorRegister dst; unsigned count; bool left; };
 struct VectorIntToDouble { VectorRegister dst; VectorOperand src; };
 struct VectorSignMask { unsigned dst; VectorRegister src; unsigned size; };
-struct VectorShuffleDwords { VectorRegister dst; VectorOperand src; unsigned mask; };
-struct VectorTransfer { Register gp; VectorRegister xmm; bool toXmm; unsigned size = 8; };
+struct VectorShuffle { VectorRegister dst; VectorOperand src; unsigned mask; std::optional<bool> highWords = {}; };
+struct VectorTransfer { Register gp; VectorRegister xmm; bool toXmm; unsigned size = 8; std::optional<unsigned> lane = {}; };
 struct VectorImmediate { VectorRegister dst; std::array<std::uint32_t, 4> lanes; };
 struct VectorByteOperation { VectorRegister dst; VectorRegister src; unsigned size; bool reduce; };
 enum class FloatOp { Add, Sub, Mul, Div, Min, Max, Sqrt, Convert, Ceil, Floor, Abs };
@@ -153,9 +163,10 @@ using Effect = std::variant<Nop, Move, ByteMove, Exchange, AtomicAdd, Extend, Co
     Divide, DivideWord, Multiply, SetCondition,
     Binary, MemoryBinary, Store, PairTransfer, Push, KeepBits, ByteBinary, ByteShift, Shift, ShiftRegister,
     Bitfield, BitTest, BitScan, ByteSwap,
-    StringDirection, RepeatStore, CpuId,
-    VectorBinary, VectorMove, VectorHalfMove, VectorShiftBytes, VectorIntToDouble, VectorSignMask,
-    VectorShuffleDwords, VectorTransfer,
+    StringDirection, RepeatStore, CpuId, Extract,
+    VectorBinary, VectorMove, InterleavedLoad4, VectorSplat, VectorWiden,
+    VectorHalfMove, VectorShiftBytes, VectorIntToDouble, VectorSignMask,
+    VectorShuffle, VectorTransfer,
     VectorImmediate, VectorByteOperation,
     FloatBinary, FloatCompare,
     FloatMask, IntegerToFloat, FloatToInteger, FloatingControl>;

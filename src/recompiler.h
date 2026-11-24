@@ -26,6 +26,7 @@ struct GuestRegion {
     bool writable;
     bool executable;
     bool protectable = false;
+    bool threadLocal = false;
 };
 
 struct GuestImport {

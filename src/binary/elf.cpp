@@ -1,6 +1,7 @@
 #include "recompiler.h"
 
 #include <algorithm>
+#include <bit>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -134,12 +135,13 @@ struct Definition {
     std::uint64_t address;
     unsigned type;
     std::uint64_t size;
+    std::size_t tlsBase = 0;
 };
 using Definitions = std::map<std::pair<std::string_view, std::string_view>, Definition>;
 struct CopyRelocation { std::size_t to; std::size_t from; std::size_t size; };
 
 void addDefinitions(const Sections& sections, const SymbolVersions& versions, std::uint64_t base,
-    Definitions& definitions) {
+    Definitions& definitions, std::optional<GuestObject> tls) {
     for (std::size_t i = 1; i < sections.headers.size() / 64; ++i) {
         const auto section = sections.header(i);
         if (read(section, 4, 4) != 11)
@@ -152,7 +154,7 @@ void addDefinitions(const Sections& sections, const SymbolVersions& versions, st
             const auto binding = symbol[4] >> 4;
             const auto type = symbol[4] & 15;
             const auto visibility = symbol[5] & 3;
-            if ((binding != 1 && binding != 2 && binding != 10) || (type != 1 && type != 2) ||
+            if ((binding != 1 && binding != 2 && binding != 10) || (type != 1 && type != 2 && (type != 6 || !tls)) ||
                 (visibility != 0 && visibility != 3) || index == 0 || index >= 0xff00)
                 continue;
             const auto address = read(symbol, 8, 8);
@@ -160,7 +162,8 @@ void addDefinitions(const Sections& sections, const SymbolVersions& versions, st
                 continue;
             const auto name = symbolName(strings, read(symbol, 0, 4));
             const auto version = versions.index(i, j);
-            const Definition definition{address + base, unsigned(type), read(symbol, 16, 8)};
+            const Definition definition{type == 6 ? address : address + base, unsigned(type), read(symbol, 16, 8),
+                type == 6 ? tls->start : 0};
             definitions.try_emplace(std::pair{name, versions.version(version)}, definition);
             if (!(version & 0x8000))
                 definitions.try_emplace(std::pair{name, std::string_view{}}, definition);
@@ -227,7 +230,8 @@ void relocate(const Sections& sections, std::span<std::uint8_t> image,
     std::span<const GuestRegion> regions, std::vector<GuestImport>& imports, Architecture architecture,
     std::uint64_t base, const SymbolVersions& versions, const Definitions& definitions,
     const Definitions& libraryDefinitions, std::vector<CopyRelocation>& copies,
-    std::vector<GuestBinding>& bindings, std::vector<std::size_t>& functionPointers) {
+    std::vector<GuestBinding>& bindings, std::vector<std::size_t>& functionPointers,
+    std::optional<GuestObject> tls, std::vector<GuestObject>& objects) {
     const bool arm = architecture == Architecture::Arm64;
     const unsigned copy = arm ? 1024 : 5;
     const unsigned global = arm ? 1025 : 6;
@@ -264,10 +268,12 @@ void relocate(const Sections& sections, std::span<std::uint8_t> image,
             const auto symbol = slice(symbols, (info >> 32) * 24, 24);
             const auto width = type == copy ? std::max(std::uint64_t(1), read(symbol, 16, 8))
                                         : std::uint64_t(8);
-            const auto mapped = std::ranges::any_of(regions, [&](const GuestRegion& region) {
-                return at >= region.start && at < region.end && width <= region.end - at;
-            });
-            if (!mapped)
+            const auto mapped = [&](std::uint64_t size) {
+                return std::ranges::any_of(regions, [&](const GuestRegion& region) {
+                    return at >= region.start && at < region.end && size <= region.end - at;
+                });
+            };
+            if (!mapped(width))
                 throw std::runtime_error("ELF relocation target is outside load segments");
 
             const auto name = symbolName(strings, read(symbol, 0, 4));
@@ -285,14 +291,35 @@ void relocate(const Sections& sections, std::span<std::uint8_t> image,
                 }
             }
             std::optional<std::uint64_t> result;
+            const auto symbolIndex = read(symbol, 6, 2);
+            const auto symbolType = unsigned(symbol[4] & 15);
+            const bool local = symbolIndex != 0 && ((symbol[4] >> 4) == 0 || (symbol[5] & 3) != 0);
+            const auto found = definitions.find({name, version});
             if (type == relative && (info >> 32) == 0) {
                 result = base + addend;
-            } else if (type == absolute || type == jump || type == global) {
-                const auto symbolIndex = read(symbol, 6, 2);
-                const auto symbolType = unsigned(symbol[4] & 15);
-                const bool local = symbolIndex != 0 && ((symbol[4] >> 4) == 0 || (symbol[5] & 3) != 0);
-                const auto found = definitions.find({name, version});
-                if (!local && found != definitions.end() && (symbolType == 0 || symbolType == found->second.type))
+            } else if (!arm && (type == 16 || type == 17)) {
+                // Use the TLS block address as its unique module identifier in this guest.
+                std::size_t tlsBase = 0;
+                std::uint64_t offset = 0;
+                if (!local && found != definitions.end() && found->second.type == 6) {
+                    tlsBase = found->second.tlsBase;
+                    offset = found->second.address;
+                } else if (tls && ((info >> 32) == 0 || (symbolType == 6 && symbolIndex != 0 && symbolIndex < 0xff00))) {
+                    tlsBase = tls->start;
+                    offset = read(symbol, 8, 8);
+                }
+                if (tlsBase && type == 16) {
+                    if (!mapped(16))
+                        throw std::runtime_error("ELF TLS descriptor is outside load segments");
+                    result = tlsBase;
+                    objects.push_back({std::size_t(at), 16});
+                } else if (tlsBase) {
+                    result = offset + addend;
+                }
+            } else if ((type == absolute || type == jump || type == global) &&
+                (arm || name != "__tls_get_addr" || symbolIndex != 0 || (type != jump && type != global))) {
+                if (!local && found != definitions.end() && found->second.type != 6 &&
+                    (symbolType == 0 || symbolType == found->second.type))
                     result = found->second.address;
                 else if (symbolIndex != 0 && symbolIndex < 0xff00 && symbolType <= 2)
                     result = base + read(symbol, 8, 8);
@@ -385,6 +412,41 @@ Sections mapElf(Architecture architecture, Bytes file, std::uint64_t base,
         throw std::runtime_error("ELF requires load segments and a section table");
     return sections;
 }
+
+std::optional<GuestObject> mapTls(Bytes file, std::uint64_t base, std::vector<std::uint8_t>& image,
+    std::vector<GuestRegion>& regions, std::vector<CopyRelocation>& initializers) {
+    const auto programs = slice(file, read(file, 32, 8), read(file, 56, 2) * 56);
+    for (std::size_t offset = 0; offset < programs.size(); offset += 56) {
+        const auto segment = programs.subspan(offset, 56);
+        if (read(segment, 0, 4) != 7)
+            continue;
+        const auto data = slice(file, read(segment, 8, 8), read(segment, 32, 8));
+        const auto size = read(segment, 40, 8);
+        const auto align = std::max<std::uint64_t>(1, read(segment, 48, 8));
+        if (!std::has_single_bit(align) || align > MaxExecutableSize || data.size() > size)
+            throw std::runtime_error("unsupported ELF TLS segment layout");
+        if (!size)
+            return {};
+        const auto at = (image.size() + align - 1) & ~(align - 1);
+        if (at >= MaxExecutableSize || size > MaxExecutableSize - at)
+            throw std::runtime_error("ELF TLS segment is outside guest memory");
+        if (!data.empty()) {
+            const auto virtualAddress = read(segment, 16, 8);
+            if (virtualAddress >= MaxExecutableSize - base)
+                throw std::runtime_error("ELF TLS template is outside guest memory");
+            const auto from = base + virtualAddress;
+            if (std::ranges::none_of(regions, [&](const GuestRegion& region) {
+                    return region.readable && from >= region.start && from < region.end && data.size() <= region.end - from;
+                }))
+                throw std::runtime_error("ELF TLS template is outside load segments");
+            initializers.push_back({std::size_t(at), std::size_t(from), data.size()});
+        }
+        image.resize(at + size);
+        regions.push_back({std::size_t(at), std::size_t(at + size), true, true, false, false, true});
+        return GuestObject{std::size_t(at), std::size_t(size)};
+    }
+    return {};
+}
 }
 
 std::string recompileElf(Architecture architecture, Bytes file, std::span<const GuestExport> exports,
@@ -393,6 +455,7 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
         Sections sections;
         std::uint64_t base;
         SymbolVersions versions;
+        std::optional<GuestObject> tls = {};
     };
     std::vector<GuestRegion> regions;
     std::vector<std::uint8_t> image;
@@ -406,13 +469,17 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
         units.push_back({sections, base, symbolVersions(sections)});
     }
 
+    std::vector<CopyRelocation> tlsInitializers;
+    if (architecture == Architecture::X86_64)
+        for (auto& unit : units)
+            unit.tls = mapTls(unit.sections.file, unit.base, image, regions, tlsInitializers);
     Definitions definitions, libraryDefinitions;
-    if (!libraries.empty())
-        for (const auto& unit : units) {
-            addDefinitions(unit.sections, unit.versions, unit.base, definitions);
-            if (unit.base != LoadBase)
-                addDefinitions(unit.sections, unit.versions, unit.base, libraryDefinitions);
-        }
+    for (const auto& unit : units) {
+        if (!libraries.empty() || unit.tls)
+            addDefinitions(unit.sections, unit.versions, unit.base, definitions, unit.tls);
+        if (unit.base != LoadBase)
+            addDefinitions(unit.sections, unit.versions, unit.base, libraryDefinitions, unit.tls);
+    }
     std::vector<GuestImport> imports;
     std::vector<CopyRelocation> copies;
     std::vector<GuestBinding> bindings;
@@ -420,10 +487,11 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
     std::vector<GuestObject> objects;
     for (const auto& unit : units) {
         relocate(unit.sections, image, regions, imports, architecture, unit.base, unit.versions, definitions,
-            libraryDefinitions, copies, bindings, functionPointers);
+            libraryDefinitions, copies, bindings, functionPointers, unit.tls, objects);
         addDataObjects(unit.sections, unit.base, objects);
     }
     const auto importCount = imports.size();
+    copies.insert(copies.end(), tlsInitializers.begin(), tlsInitializers.end());
     for (const auto& copy : copies) {
         const auto data = slice(image, copy.from, copy.size);
         std::ranges::copy(data, image.begin() + copy.to);

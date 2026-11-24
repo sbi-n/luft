@@ -77,12 +77,21 @@ Instruction decodeArm(Reader& reader) {
         return {Bitfield{size, armReg(rd), Register{armReg(rn)}, wrap ? 0 : start,
             wrap ? last + 1 : last - start + 1, wrap ? width - start : 0, operation == 0, operation == 1}};
     }
+    if ((word & 0x7fa00000) == 0x13800000) {
+        const auto count = (word >> 10) & 63;
+        if (count >= size * 8 || bool(word & 0x00400000) != (size == 8))
+            unsupported();
+        return {Extract{size, armReg(rd), Register{armReg(rn)}, Register{armReg(rm)}, count}};
+    }
     if ((word & 0x3fe00800) == 0x1a800000) {
         const auto variant = ((word >> 29) & 2) | ((word >> 10) & 1);
         constexpr std::array actions{SelectElse::Copy, SelectElse::Increment, SelectElse::Invert, SelectElse::Negate};
         return {Select{size, armReg(rd), Register{armReg(rn)}, Register{armReg(rm)},
             (word >> 12) & 15, actions[variant]}};
     }
+    if ((word & 0x1fe0fc00) == 0x1a000000)
+        return {Binary{arithmetic, size, armReg(rd), armReg(rn), Register{armReg(rm)}, setFlags,
+            ShiftOp::Left, 0, false, 0, false, true}};
     if ((word & 0x3fe00410) == 0x3a400000) {
         const Value rhs = word & 0x800 ? Value(Immediate{rm}) : Value(Register{armReg(rm)});
         return {ConditionalCompare{size, Register{armReg(rn)}, rhs, (word >> 12) & 15, word & 15,
@@ -247,10 +256,59 @@ Instruction decodeArm(Reader& reader) {
     if (byteOp == 0x0e205800 || byteOp == 0x2e303800)
         return {VectorByteOperation{VectorRegister{rd}, VectorRegister{rn}, word & 0x40000000 ? 16u : 8u,
             byteOp == 0x2e303800}};
+    const auto vectorLogic = word & 0xbfe0fc00;
+    if (vectorLogic == 0x2e809400)
+        return {VectorBinary{VectorOp::DotUnsignedBytes, VectorRegister{rd}, VectorRegister{rm},
+            VectorRegister{rn}, word & 0x40000000 ? 16u : 8u}};
+    if (vectorLogic == 0x2e603c00 || vectorLogic == 0x2ea03c00)
+        return {VectorBinary{vectorLogic == 0x2e603c00 ? VectorOp::CompareUnsignedWords : VectorOp::CompareUnsignedDwords,
+            VectorRegister{rd}, VectorRegister{rm}, VectorRegister{rn}, word & 0x40000000 ? 16u : 8u}};
+    if ((word & 0xbf80fc00) == 0x2f00a400) {
+        const auto amount = (word >> 16) & 127;
+        const auto bits = std::bit_floor(amount);
+        if (bits == 16 || bits == 32)
+            return {VectorWiden{VectorRegister{rd}, VectorRegister{rn}, bits, amount - bits, bool(word & 0x40000000)}};
+    }
+    if (vectorLogic == 0x0e201c00 || vectorLogic == 0x0ea01c00 || vectorLogic == 0x2e201c00) {
+        const auto op = vectorLogic == 0x0e201c00 ? VectorOp::And :
+            vectorLogic == 0x0ea01c00 ? VectorOp::Or : VectorOp::Xor;
+        const auto width = word & 0x40000000 ? 16u : 8u;
+        if (vectorLogic == 0x0ea01c00 && rn == rm)
+            return {VectorMove{VectorRegister{rd}, VectorRegister{rn}, width}};
+        return {VectorBinary{op, VectorRegister{rd}, VectorRegister{rm}, VectorRegister{rn}, width}};
+    }
     const auto vectorAdd = word & 0xffe0fc00;
     if (vectorAdd == 0x4ea08400 || vectorAdd == 0x6ea08400)
         return {VectorBinary{vectorAdd == 0x4ea08400 ? VectorOp::AddDwords : VectorOp::SubDwords,
             VectorRegister{rd}, VectorRegister{rm}, VectorRegister{rn}}};
+    if (vectorAdd == 0x4ee08400 || vectorAdd == 0x6ee08400)
+        return {VectorBinary{vectorAdd == 0x4ee08400 ? VectorOp::AddQwords : VectorOp::SubQwords,
+            VectorRegister{rd}, VectorRegister{rm}, VectorRegister{rn}}};
+    const auto vectorUnary = word & 0xfffffc00;
+    if (vectorUnary == 0x6ea06800)
+        return {VectorBinary{VectorOp::AccumulatePairs, VectorRegister{rd}, VectorRegister{rn}}};
+    if (vectorUnary == 0x5ef1b800)
+        return {VectorBinary{VectorOp::SumQwords, VectorRegister{rd}, VectorRegister{rn}}};
+    if (vectorUnary == 0x4ea09800 || vectorUnary == 0x4ee09800)
+        return {VectorBinary{vectorUnary == 0x4ea09800 ? VectorOp::CompareZeroDwords : VectorOp::CompareZeroQwords,
+            VectorRegister{rd}, VectorRegister{rn}}};
+    if ((word & 0xbfe0fc00) == 0x0e000c00) {
+        const auto imm = (word >> 16) & 31;
+        const auto element = std::countr_zero(imm);
+        if (element < 4 && imm == (1u << element) && (element != 3 || (word & 0x40000000)))
+            return {VectorSplat{VectorRegister{rd}, Register{armReg(rn)}, 1u << element, word & 0x40000000 ? 16u : 8u}};
+    }
+    if ((word & 0xffe0fc00) == 0x4e001c00) {
+        const auto imm = (word >> 16) & 31;
+        const auto element = std::countr_zero(imm);
+        if (element == 2 || element == 3)
+            return {VectorTransfer{Register{armReg(rn)}, VectorRegister{rd}, true,
+                1u << element, imm >> (element + 1)}};
+    }
+    const auto ld4 = word & 0xfffff000;
+    if ((ld4 == 0x4c400000 || ld4 == 0x4cdf0000) && ((word >> 10) & 3) >= 2)
+        return transfer(InterleavedLoad4{VectorRegister{rd}, {rn, 0}, 1u << ((word >> 10) & 3)}, rn,
+            ld4 == 0x4cdf0000 ? 64 : 0);
     if ((word & 0xbff89c00) == 0x0f000400) {
         const auto immediate = ((word >> 11) & 0xe0) | ((word >> 5) & 0x1f);
         const auto lane = immediate << (((word >> 13) & 3) * 8);

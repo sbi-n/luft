@@ -40,6 +40,7 @@ struct LuauWord {
     std::string hi;
     std::string pair() const { return lo + ", " + hi; }
 };
+constexpr unsigned LocalVectorRegisters = 20;
 
 LuauWord wordLiteral(std::uint64_t word) {
     return {std::to_string(std::uint32_t(word)), std::to_string(word >> 32)};
@@ -89,7 +90,7 @@ public:
         if (needsMemory || features.stack)
             source += std::format("    resetMemory({})\n", features.stack);
         if (usesBudget)
-            source += data.regions.empty() ? "    local budget = 1000000\n" : "    local budget = 10000000\n";
+            source += data.regions.empty() ? "    local budget = 1000000\n" : "    local budget = 40000000\n";
         if (usesDirection)
             source += "    local direction = 1\n";
         if (usesFloatingControl)
@@ -125,8 +126,11 @@ public:
                 }
             }
         }
+        if (!xmmRegisters.empty() && *xmmRegisters.rbegin() >= LocalVectorRegisters)
+            source += std::format("    local vectorLanes = table.create({}, 0)\n", (32 - LocalVectorRegisters) * 4);
         for (const auto index : xmmRegisters)
-            source += std::format("    local {} = 0, 0, 0, 0\n", joinLanes(xmm(VectorRegister{index})));
+            if (index < LocalVectorRegisters)
+                source += std::format("    local {} = 0, 0, 0, 0\n", joinLanes(xmm(VectorRegister{index})));
         if (features.flags)
             source += "    local carry, overflow, negative, zero, parity = false, false, false, false, false\n";
         if (useRoutineTable) {
@@ -277,10 +281,12 @@ private:
 
     Lanes xmm(VectorRegister reg) {
         xmmRegisters.insert(reg.index);
-        return {
-            std::format("x{}_0", reg.index), std::format("x{}_1", reg.index),
-            std::format("x{}_2", reg.index), std::format("x{}_3", reg.index)
-        };
+        Lanes lanes;
+        for (unsigned i = 0; i < lanes.size(); ++i) {
+            lanes[i] = reg.index < LocalVectorRegisters ? std::format("x{}_{}", reg.index, i)
+                : std::format("vectorLanes[{}]", (reg.index - LocalVectorRegisters) * 4 + i + 1);
+        }
+        return lanes;
     }
 
     static std::string joinLanes(const Lanes& lanes) {
@@ -386,7 +392,7 @@ private:
         const auto dst = xmm(binary.dst);
         const auto lhsLanes = binary.lhs ? xmm(*binary.lhs) : dst;
         const auto* reg = std::get_if<VectorRegister>(&binary.src);
-        if (reg && reg->index == binary.dst.index &&
+        if (reg && reg->index == binary.lhs.value_or(binary.dst).index &&
             (binary.op == VectorOp::Xor || binary.op == VectorOp::AndNot)) {
             line(depth, joinLanes(dst) + " = 0, 0, 0, 0");
             return;
@@ -402,6 +408,50 @@ private:
         Lanes result{dst[0], dst[1], rhs[0], rhs[1]};
         if (binary.op == VectorOp::UnpackLowDwords) {
             result = {dst[0], rhs[0], dst[1], rhs[1]};
+        } else if (binary.op == VectorOp::DotUnsignedBytes) {
+            for (unsigned lane = 0; lane < binary.size / 4; ++lane) {
+                auto sum = dst[lane];
+                for (unsigned bit = 0; bit < 32; bit += 8)
+                    sum += std::format(" + bit32.extract({}, {}, 8) * bit32.extract({}, {}, 8)",
+                        lhsLanes[lane], bit, rhs[lane], bit);
+                result[lane] = "(" + sum + ") % 4294967296";
+            }
+        } else if (binary.op == VectorOp::AccumulatePairs) {
+            for (unsigned lane = 0; lane < 4; lane += 2) {
+                const auto sum = std::format("({} + {} + {})", dst[lane], rhs[lane], rhs[lane + 1]);
+                result[lane] = sum + " % 4294967296";
+                result[lane + 1] = std::format("({} + math.floor({} / 4294967296)) % 4294967296", dst[lane + 1], sum);
+            }
+        } else if (binary.op == VectorOp::AddQwords || binary.op == VectorOp::SubQwords || binary.op == VectorOp::SumQwords) {
+            const auto op = binary.op == VectorOp::SubQwords ? '-' : '+';
+            const auto sum = [&](unsigned out, const Lanes& lhs, unsigned a, unsigned b) {
+                const auto low = std::format("({} {} {})", lhs[a], op, rhs[b]);
+                result[out] = low + " % 4294967296";
+                result[out + 1] = std::format("({} {} {} + math.floor({} / 4294967296)) % 4294967296",
+                    lhs[a + 1], op, rhs[b + 1], low);
+            };
+            if (binary.op == VectorOp::SumQwords) {
+                sum(0, rhs, 0, 2);
+                result[2] = result[3] = "0";
+            } else {
+                sum(0, lhsLanes, 0, 0);
+                sum(2, lhsLanes, 2, 2);
+            }
+        } else if (binary.op == VectorOp::CompareZeroDwords || binary.op == VectorOp::CompareZeroQwords) {
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                const auto condition = binary.op == VectorOp::CompareZeroDwords ? rhs[lane] + " == 0"
+                    : rhs[lane] + " == 0 and " + rhs[lane ^ 1] + " == 0";
+                result[lane] = "if " + condition + " then 4294967295 else 0";
+            }
+        } else if (binary.op == VectorOp::CompareUnsignedWords || binary.op == VectorOp::CompareUnsignedDwords) {
+            for (unsigned lane = 0; lane < binary.size / 4; ++lane) {
+                const auto& a = lhsLanes[lane];
+                const auto& b = rhs[lane];
+                result[lane] = binary.op == VectorOp::CompareUnsignedDwords ?
+                    std::format("if {} >= {} then 4294967295 else 0", a, b) :
+                    std::format("(if bit32.band({0}, 65535) >= bit32.band({1}, 65535) then 65535 else 0) + "
+                        "(if bit32.rshift({0}, 16) >= bit32.rshift({1}, 16) then 4294901760 else 0)", a, b);
+            }
         } else if (binary.op == VectorOp::AddDwords || binary.op == VectorOp::SubDwords) {
             const auto op = binary.op == VectorOp::AddDwords ? '+' : '-';
             for (unsigned lane = 0; lane < result.size(); ++lane)
@@ -413,6 +463,8 @@ private:
                 result[lane] = std::format("bit32.{}({}, {})", name, lhs, rhs[lane]);
             }
         }
+        if (binary.size == 8)
+            result[2] = result[3] = "0";
         line(depth, joinLanes(dst) + " = " + joinLanes(result));
         if (!reg)
             line(depth - 1, "end");
@@ -570,7 +622,8 @@ private:
                     line(depth + 1, "local discardLo: number, discardHi: number = 0, 0");
                 line(depth + 1, std::format("{}{} = addFlags({}, {}, {}, {}, {}{})",
                     dst.pair(), flags ? ", carry, overflow, negative, zero" : "",
-                    subtract, arm, op.size, lhs.pair(), rhs.pair(), op.withCarry ? ", carry" : ""));
+                    subtract, arm, op.size, lhs.pair(), rhs.pair(),
+                    op.withCarry ? (arm && subtract ? ", not carry" : ", carry") : ""));
             } else {
                 const char symbol = subtract ? '-' : '+';
                 line(depth + 1, std::format("local sum = {} {} {}", lhs.lo, symbol, rhs.lo));
@@ -857,21 +910,20 @@ private:
                     const auto high = inputSize == 4 ? ", 0" : "";
                     line(depth, "do");
                     line(depth + 1, "local lhsLo, lhsHi = " + lhs + high);
-                    std::string inputs = rhs + high;
+                    line(depth + 1, "local rhsLo, rhsHi = " + rhs + high);
                     if (mul.operands == MultiplyOperands::Signed32) {
                         line(depth + 1, "lhsHi = if lhsLo >= 2147483648 then 4294967295 else 0");
-                        line(depth + 1, "local rhsLo = " + rhs);
-                        inputs = "rhsLo, if rhsLo >= 2147483648 then 4294967295 else 0";
+                        line(depth + 1, "rhsHi = if rhsLo >= 2147483648 then 4294967295 else 0");
                     }
                     const bool highResult = mul.operands == MultiplyOperands::SignedHigh || mul.operands == MultiplyOperands::UnsignedHigh;
                     const bool wideResult = mul.operands == MultiplyOperands::SignedWide || mul.operands == MultiplyOperands::UnsignedWide;
                     const bool flags = setFlags && mul.flags;
                     const auto call = highResult || wideResult || flags ?
-                        std::format("signedMultiply({}, lhsLo, lhsHi, {}{})", mul.size, inputs,
+                        std::format("signedMultiply({}, lhsLo, lhsHi, rhsLo, rhsHi{})", mul.size,
                             mul.operands == MultiplyOperands::UnsignedHigh ||
                             mul.operands == MultiplyOperands::UnsignedWide ? ", true" : "") :
-                        mul.size == 4 ? std::format("(multiply32(lhsLo, {})), 0", rhs) :
-                        std::format("multiplyLow(lhsLo, lhsHi, {})", inputs);
+                        mul.size == 4 ? "(multiply32(lhsLo, rhsLo)), 0" :
+                        "multiplyLow(lhsLo, lhsHi, rhsLo, rhsHi)";
                     if (highResult) {
                         line(depth + 1, "local _, _, _, productLo, productHi = " + call);
                         line(depth + 1, dst.pair() + " = productLo, productHi");
@@ -1085,6 +1137,28 @@ private:
                     }
                     constants[shift.dst].reset();
                 },
+                [&](const Extract& op) {
+                    if (op.dst == Zero)
+                        return;
+                    const auto high = reg(op.high.index);
+                    const auto low = reg(op.low.index);
+                    const auto blend = [](const std::string& lo, const std::string& hi, unsigned count) {
+                        return std::format("bit32.bor(bit32.rshift({}, {}), bit32.lshift({}, {}))", lo, count, hi, 32 - count);
+                    };
+                    std::string result;
+                    if (op.count == 0)
+                        result = op.size == 8 ? low.pair() : low.lo;
+                    else if (op.size == 4)
+                        result = blend(low.lo, high.lo, op.count);
+                    else if (op.count == 32)
+                        result = low.hi + ", " + high.lo;
+                    else if (op.count < 32)
+                        result = blend(low.lo, low.hi, op.count) + ", " + blend(low.hi, high.lo, op.count);
+                    else
+                        result = blend(low.hi, high.lo, op.count - 32) + ", " + blend(high.lo, high.hi, op.count - 32);
+                    assign(depth, op.dst, op.size, result);
+                    constants[op.dst].reset();
+                },
                 [&](const Bitfield& field) {
                     if (field.dst == Zero)
                         return;
@@ -1205,6 +1279,45 @@ private:
                         constants[index].reset();
                 },
                 [&](const VectorBinary& binary) { vectorBinary(depth, binary, constants); },
+                [&](const InterleavedLoad4& load) {
+                    for (unsigned reg = 0; reg < 4; ++reg) {
+                        const auto dst = xmm(VectorRegister{(load.first.index + reg) % 32});
+                        for (unsigned lane = 0; lane < 16 / load.elementSize; ++lane) {
+                            auto address = load.address;
+                            address.displacement += (lane * 4 + reg) * load.elementSize;
+                            const auto word = lane * (load.elementSize / 4);
+                            const auto fields = load.elementSize == 8 ? dst[word] + ", " + dst[word + 1] : dst[word];
+                            line(depth, fields + " = " + read(address, load.elementSize, constants));
+                        }
+                    }
+                },
+                [&](const VectorSplat& op) {
+                    const auto src = reg(op.src.index);
+                    const auto repeated = op.elementSize == 1 ? "bit32.band(" + src.lo + ", 255) * 16843009" :
+                        op.elementSize == 2 ? "bit32.band(" + src.lo + ", 65535) * 65537" : src.lo;
+                    Lanes result{"0", "0", "0", "0"};
+                    for (unsigned lane = 0; lane < op.size / 4; ++lane)
+                        result[lane] = op.elementSize == 8 && lane % 2 ? src.hi : repeated;
+                    line(depth, joinLanes(xmm(op.dst)) + " = " + joinLanes(result));
+                },
+                [&](const VectorWiden& op) {
+                    const auto src = xmm(op.src);
+                    const unsigned base = op.upper ? 2 : 0;
+                    Lanes result;
+                    if (op.bits == 16) {
+                        for (unsigned lane = 0; lane < 4; ++lane) {
+                            const auto value = std::format("bit32.extract({}, {}, 16)", src[base + lane / 2], (lane % 2) * 16);
+                            result[lane] = op.shift ? std::format("bit32.lshift({}, {})", value, op.shift) : value;
+                        }
+                    } else {
+                        for (unsigned lane = 0; lane < 2; ++lane) {
+                            const auto& value = src[base + lane];
+                            result[lane * 2] = op.shift ? std::format("bit32.lshift({}, {})", value, op.shift) : value;
+                            result[lane * 2 + 1] = op.shift ? std::format("bit32.rshift({}, {})", value, 32 - op.shift) : "0";
+                        }
+                    }
+                    line(depth, joinLanes(xmm(op.dst)) + " = " + joinLanes(result));
+                },
                 [&](const VectorMove& move) {
                     if (move.size < 16) {
                         std::string source;
@@ -1249,9 +1362,20 @@ private:
                 [&](const VectorTransfer& transfer) {
                     const auto lanes = xmm(transfer.xmm);
                     const auto gp = reg(transfer.gp.index);
-                    if (transfer.toXmm) {
+                    if (transfer.lane && transfer.toXmm) {
+                        const auto first = *transfer.lane * (transfer.size / 4);
+                        if (transfer.size == 8)
+                            line(depth, lanes[first] + ", " + lanes[first + 1] + " = " + gp.pair());
+                        else
+                            line(depth, lanes[first] + " = " + gp.lo);
+                    } else if (transfer.toXmm) {
                         const auto words = transfer.size == 8 ? gp.pair() : gp.lo + ", 0";
                         line(depth, joinLanes(lanes) + " = " + words + ", 0, 0");
+                    } else if (transfer.lane && transfer.gp.index != Zero) {
+                        const auto lane = *transfer.lane;
+                        assign(depth, transfer.gp.index, 4,
+                            std::format("bit32.extract({}, {}, 16)", lanes[lane / 2], (lane % 2) * 16));
+                        constants[transfer.gp.index].reset();
                     } else if (transfer.gp.index != Zero) {
                         assign(depth, transfer.gp.index, transfer.size,
                             transfer.size == 8 ? lanes[0] + ", " + lanes[1] : lanes[0]);
@@ -1321,7 +1445,7 @@ private:
                     assign(depth, op.dst, 4, bits);
                     constants[op.dst].reset();
                 },
-                [&](const VectorShuffleDwords& op) {
+                [&](const VectorShuffle& op) {
                     const auto* source = std::get_if<VectorRegister>(&op.src);
                     const auto input = source ? xmm(*source) : Lanes{"lane0", "lane1", "lane2", "lane3"};
                     if (!source) {
@@ -1331,9 +1455,19 @@ private:
                         line(depth++, "do");
                         line(depth, "local " + joinLanes(input) + " = " + *lanes);
                     }
-                    Lanes result;
-                    for (unsigned i = 0; i < result.size(); ++i)
-                        result[i] = input[(op.mask >> (i * 2)) & 3];
+                    auto result = input;
+                    if (op.highWords) {
+                        const unsigned base = *op.highWords ? 2 : 0;
+                        const auto pick = [&](unsigned i) {
+                            const auto index = (op.mask >> (i * 2)) & 3;
+                            return std::format("bit32.extract({}, {}, 16)", input[base + index / 2], (index % 2) * 16);
+                        };
+                        for (unsigned i = 0; i < 2; ++i)
+                            result[base + i] = std::format("{} + 65536 * {}", pick(i * 2), pick(i * 2 + 1));
+                    } else {
+                        for (unsigned i = 0; i < result.size(); ++i)
+                            result[i] = input[(op.mask >> (i * 2)) & 3];
+                    }
                     line(depth, joinLanes(xmm(op.dst)) + " = " + joinLanes(result));
                     if (!source)
                         line(depth - 1, "end");
@@ -1974,6 +2108,30 @@ private:
             return emitWindowsImport(depth, import);
         const auto name = importName(import);
         const auto arguments = argumentRegisters(arm, convention);
+        if (!arm && !import.leadingUnderscore && name == "__tls_get_addr") {
+            std::string valid;
+            for (const auto& region : data.regions) {
+                if (!region.threadLocal)
+                    continue;
+                const auto size = region.end - region.start;
+                if (!data.emitted.contains(region.start))
+                    data.materialize(region.start, unsigned(size));
+                if (!valid.empty())
+                    valid += " or ";
+                valid += std::format("(base == {} and offset < {})", region.start, size);
+            }
+            if (valid.empty())
+                return false;
+            needsMemory = true;
+            line(depth, "do");
+            line(depth + 1, "local descriptor = address(" + reg(arguments[0]).pair() + ")");
+            line(depth + 1, "local base = address(read(8, descriptor))");
+            line(depth + 1, "local offset = address(read(8, descriptor + 8))");
+            line(depth + 1, "if not (" + valid + ") then error(\"invalid guest ELF TLS descriptor\", 0) end");
+            assign(depth + 1, 0, 8, "base + offset, 0");
+            line(depth, "end");
+            return true;
+        }
         if (name == "memchr" || name == "wmemchr") {
             needsMemory = true;
             const bool wide = name == "wmemchr";

@@ -120,9 +120,10 @@ Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned
     }
     if (prefix == 0xf3 && opcode == 0xe6)
         return {VectorIntToDouble{reg, operandAt(false)}};
-    if (prefix == 0x66 && opcode == 0x70) {
+    if ((prefix == 0x66 || prefix == 0xf2 || prefix == 0xf3) && opcode == 0x70) {
         const auto operand = operandAt(false, 1);
-        return {VectorShuffleDwords{reg, operand, unsigned(reader.read(1))}};
+        return {VectorShuffle{reg, operand, unsigned(reader.read(1)),
+            prefix == 0x66 ? std::nullopt : std::optional(prefix == 0xf3)}};
     }
     if ((prefix == 0 || prefix == 0x66) && opcode == 0x50 && mode == 3)
         return {VectorSignMask{reg.index, VectorRegister{rmReg}, prefix ? 8u : 4u}};
@@ -180,6 +181,8 @@ Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned
             return {VectorMove{memory, reg, width}};
         return {VectorMove{reg, memory, width}};
     }
+    if (prefix == 0x66 && opcode == 0xc5 && mode == 3)
+        return {VectorTransfer{Register{reg.index}, VectorRegister{rmReg}, false, 2, unsigned(reader.read(1) & 7)}};
 
     if ((prefix == 0xf3 && opcode == 0x7e) || (prefix == 0x66 && opcode == 0xd6)) {
         const VectorOperand operand = mode == 3 ? VectorOperand(VectorRegister{rmReg})
@@ -194,8 +197,8 @@ Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned
     const bool unalignedMoves = (prefix == 0 && (opcode == 0x10 || opcode == 0x11)) ||
         (prefix == 0xf3 && (opcode == 0x6f || opcode == 0x7f));
     const bool logical = (prefix == 0 || prefix == 0x66) && (opcode >= 0x54 && opcode <= 0x57);
-    const bool binary = logical ||
-        (prefix == 0x66 && (opcode == 0xef || opcode == 0x62 || opcode == 0x6c || opcode == 0xfe || opcode == 0xfa));
+    const bool binary = logical || (prefix == 0x66 && (opcode == 0xdb || opcode == 0xdf || opcode == 0xeb ||
+        opcode == 0xef || opcode == 0x62 || opcode == 0x6c || opcode == 0xfe || opcode == 0xfa));
     if (!alignedMoves && !unalignedMoves && !binary)
         unsupported();
     const VectorOperand operand = mode == 3 ? VectorOperand(VectorRegister{rmReg})
@@ -203,8 +206,9 @@ Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned
     if (binary) {
         const auto kind = opcode == 0xfe ? VectorOp::AddDwords : opcode == 0xfa ? VectorOp::SubDwords :
             opcode == 0x62 ? VectorOp::UnpackLowDwords :
-            opcode == 0x6c ? VectorOp::UnpackLowQwords : opcode == 0x54 ? VectorOp::And :
-            opcode == 0x55 ? VectorOp::AndNot : opcode == 0x56 ? VectorOp::Or : VectorOp::Xor;
+            opcode == 0x6c ? VectorOp::UnpackLowQwords : opcode == 0x54 || opcode == 0xdb ? VectorOp::And :
+            opcode == 0x55 || opcode == 0xdf ? VectorOp::AndNot :
+            opcode == 0x56 || opcode == 0xeb ? VectorOp::Or : VectorOp::Xor;
         return {VectorBinary{kind, reg, operand}};
     }
     if (opcode == 0x29 || opcode == 0x11 || opcode == 0x7f)
@@ -214,6 +218,8 @@ Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned
 
 Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
     auto opcode = reader.read(1);
+    while (prefix == 0x66 && opcode == 0x66)
+        opcode = reader.read(1);
     unsigned rex = 0;
     if (opcode >= 0x40 && opcode <= 0x4f) {
         rex = opcode & 15;
@@ -223,6 +229,22 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
         return {RepeatStore{opcode == 0xaa ? 1u : (rex & 8) ? 8u : 4u}};
     if (prefix == 0x66 && opcode == 0x90 && !(rex & 1))
         return {};
+    if (prefix == 0x66 && (rex & 8) && opcode == 0xe8) {
+        const auto displacement = signExtend(reader.read(4), 32);
+        return {.end = Call{immediate(reader.pc + displacement), reader.pc}};
+    }
+    if (prefix == 0x66 && (rex & 8) && opcode == 0x8d) {
+        const auto modrm = reader.read(1);
+        const unsigned mode = modrm >> 6;
+        const unsigned rm = modrm & 7;
+        if (mode == 3)
+            unsupported();
+        const auto at = x64Address(reader, mode, rm, rex);
+        Instruction instruction{Move{8, unsigned((modrm >> 3) & 7) + (rex & 4) * 2, at}};
+        if (mode == 0 && rm == 5 && reader.mapped)
+            instruction.addressTaken = at.displacement;
+        return instruction;
+    }
     if (opcode == 0x0f) {
         const auto extension = reader.read(1);
         if (prefix == 0xf3 && rex == 0 && extension == 0x1e && reader.read(1) == 0xfa)
@@ -249,6 +271,10 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
     }
     if (prefix == 0x66 && !(rex & 8) && opcode >= 0xb8 && opcode <= 0xbf)
         return {Move{2, unsigned(opcode & 7) + (rex & 1) * 8, Immediate{reader.read(2)}}};
+    if (prefix == 0x66 && !(rex & 8) && (opcode & 0xc7) == 5 && x64Operations[opcode >> 3]) {
+        const auto op = opcode >> 3;
+        return {MemoryBinary{*x64Operations[op], 2, Register{0}, Immediate{reader.read(2)}, op != 7}};
+    }
     if (prefix == 0x66 && !(rex & 8) && opcode == 0xc7) {
         const auto modrm = reader.read(1);
         const unsigned mode = modrm >> 6;

@@ -530,9 +530,11 @@ end
 
 type DataRange = {first: number, last: number, bytes: string, mode: number}
 
-local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boolean)
+local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boolean, mapped: boolean)
+    local stackSize = if mapped then 262144 else 65536
+    local heapLimit = if mapped then 67108864 else 16777216
     local stackBottom = math.ceil(imageSize / 16) * 16
-    local stackTop = stackBottom + 65536
+    local stackTop = stackBottom + stackSize
     local stackData: buffer? = nil
     local stackInUse = false
     local contents: {buffer?} = {}
@@ -555,7 +557,7 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             if bytes then
                 buffer.fill(bytes, 0, 0)
             else
-                stackData = buffer.create(65536)
+                stackData = buffer.create(stackSize)
             end
         end
         table.clear(contents)
@@ -692,7 +694,7 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             return at, 0
         end
         local length = math.ceil(size / 16) * 16
-        if nextAllocation + length - heapStart > 16777216 then
+        if nextAllocation + length - heapStart > heapLimit then
             return 0, 0
         end
         local bytes = buffer.create(size)
@@ -1072,6 +1074,21 @@ bool Data::materializeObject(std::uint64_t at) {
 void Data::materializeIndexed(std::uint64_t at) {
     if (materializeObject(at) || !readable(at, 1) || unresolved(at, 1))
         return;
+
+    if (regions.empty()) {
+        // Raw images have no sections, so use the gap between decoded instructions.
+        std::size_t first = 0;
+        auto last = image.size();
+        for (const auto& range : code) {
+            if (range.last <= at)
+                first = std::max(first, range.last);
+            else if (range.first > at)
+                last = std::min(last, range.first);
+        }
+        materialize(first, unsigned(last - first));
+        return;
+    }
+
     const auto region = std::ranges::find_if(regions, [&](const GuestRegion& value) {
         return value.readable && !value.writable && !value.executable && at >= value.start && at < value.end;
     });
@@ -1153,8 +1170,8 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
         source += data.source();
         source += std::format("local read, write, stackTop, resetMemory, resize, readXmm, writeXmm, "
             "compareStrings, stringLength, copyMemory, fillMemory, processHeap, allocateCpp, compareMemory, "
-            "criticalSection, protectMemory, cLocale, useCLocale, wideClass, testWideClass, pthreadMutex, srwLock = makeMemory({}, data, {})\n",
-            data.image.size(), features.heap);
+            "criticalSection, protectMemory, cLocale, useCLocale, wideClass, testWideClass, pthreadMutex, srwLock = makeMemory({}, data, {}, {})\n",
+            data.image.size(), features.heap, !data.regions.empty());
     }
 }
 }
