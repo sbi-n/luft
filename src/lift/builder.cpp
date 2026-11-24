@@ -941,8 +941,9 @@ std::optional<std::size_t> rvaTableBound(const std::map<Address, Instruction>& i
         if (before->second.next != entry->first || before->second.end)
             break;
         if (const auto* origin = std::get_if<Move>(&before->second.effect); origin && origin->dst == base && origin->size == 8) {
+            // The base register holds the image base, which MSVC loads as __ImageBase.
             const auto* value = std::get_if<EffectiveAddress>(&origin->src);
-            if (!value || *value != EffectiveAddress{Zero, 0})
+            if (!value || value->base != Zero || value->index != Zero)
                 return {};
         } else if (const auto* ext = std::get_if<Extend>(&before->second.effect); ext && ext->dst == index &&
             ext->size == 8 && ext->bits == 32 && !ext->field) {
@@ -996,12 +997,17 @@ void recoverRvaTable(Address pc, Jump& jump, const std::map<Address, Instruction
     if (address.index == Zero || address.scale != 4 || address.base != base->index || address.base == target->index ||
         address.displacement < 0)
         return;
-    recordJumpTable(jump, image, regions, references, std::size_t(address.displacement), 4, 256, false);
+    // Tables hold RVAs, and the base register holds the image base the code adds to them.
+    const auto imageBase = resolveRegister(instructions, load->first, address.base).value_or(0);
+    if (imageBase < 0)
+        return;
+    const auto table = std::size_t(imageBase + address.displacement);
+    recordJumpTable(jump, image, regions, references, table, 4, 256, false, imageBase);
     if (!jump.destinations.empty() || load == instructions.begin())
         return;
 
     if (const auto bound = rvaTableBound(instructions, load, address.base, address.index)) {
-        recordJumpTable(jump, image, regions, references, address.displacement, 4, *bound, true, 0, 1, false, true);
+        recordJumpTable(jump, image, regions, references, table, 4, *bound, true, imageBase, 1, false, true);
         if (!jump.destinations.empty())
             return;
     }
@@ -1021,27 +1027,27 @@ void recoverRvaTable(Address pc, Jump& jump, const std::map<Address, Instruction
     if (remap->second.next == load->first && signByte && signByte->sign && signByte->size == 8 &&
         signByte->bits == 8 && !signByte->field && signByte->dst == address.index &&
         signByte->dst != address.base && std::holds_alternative<Memory>(signByte->src)) {
-        const auto table = std::size_t(address.displacement);
         if (table >= image.size())
             return;
         auto first = table;
         for (unsigned i = 0; i < 128 && first >= 4 && executableEnd(first - 4, image.size(), regions); ++i) {
             Reader prior{image, Address(first - 4), true};
-            const auto destination = Address(prior.read(4));
+            const auto destination = imageBase + Address(prior.read(4));
             if (destination < Address(table) - 65536 || destination >= Address(table) ||
                 std::size_t(destination) >= executableEnd(destination, image.size(), regions))
                 break;
             first -= 4;
         }
-        recordJumpTable(jump, image, regions, references, first, 4, (table - first) / 4 + 128, false, 0, 1, false, true);
+        recordJumpTable(jump, image, regions, references, first, 4, (table - first) / 4 + 128, false, imageBase, 1,
+            false, true);
         return;
     }
     if (remap->second.next == load->first) {
         const auto* origin = std::get_if<Move>(&remap->second.effect);
         const auto* relative = origin ? std::get_if<EffectiveAddress>(&origin->src) : nullptr;
-        if (relative && *relative == EffectiveAddress{Zero, 0} && origin->size == 8 && origin->dst == address.base) {
-            recordJumpTable(jump, image, regions, references, address.displacement, 4, 256,
-                false, 0, 1, false, true);
+        if (relative && relative->base == Zero && relative->index == Zero && origin->size == 8 &&
+            origin->dst == address.base) {
+            recordJumpTable(jump, image, regions, references, table, 4, 256, false, imageBase, 1, false, true);
             if (!jump.destinations.empty())
                 return;
         }
@@ -1061,9 +1067,9 @@ void recoverRvaTable(Address pc, Jump& jump, const std::map<Address, Instruction
                 first < region.end && bytes <= region.end - first;
         });
     };
-    const auto indices = std::size_t(indexes->address.displacement);
+    const auto indices = std::size_t(imageBase + indexes->address.displacement);
     const auto length = *bound;
-    const auto offsets = std::size_t(address.displacement);
+    const auto offsets = table;
     if (!isImageData(indices, length))
         return;
     const auto count = std::size_t(std::ranges::max(image.subspan(indices, length))) + 1;
@@ -1072,7 +1078,7 @@ void recoverRvaTable(Address pc, Jump& jump, const std::map<Address, Instruction
     std::set<Address> destinations;
     for (const auto offset : image.subspan(indices, length)) {
         Reader item{image, Address(offsets + offset * 4), true};
-        const auto targetPc = std::size_t(item.read(4));
+        const auto targetPc = std::size_t(imageBase + Address(item.read(4)));
         if (targetPc >= executableEnd(targetPc, image.size(), regions) ||
             (targetPc >= offsets && targetPc < offsets + count * 4) ||
             (targetPc >= indices && targetPc < indices + length))
@@ -1291,11 +1297,13 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
             functionEntries.insert(target);
         }
 
+    // On Linux the thread block is the thread pointer that x86-64 FS and ARM64 TPIDR_EL0 hold.
+    const Address threadPointer = convention != CallingConvention::Microsoft ? Address(threadBlock) : 0;
     GapDecoder gaps{[&](Address pc) -> std::optional<Instruction> {
         const auto end = pc < 0 ? 0 : executableEnd(pc, image.size(), regions);
         if (pc < 0 || pc >= Address(end))
             return std::nullopt;
-        Reader reader{image.first(end), pc, !regions.empty()};
+        Reader reader{image.first(end), pc, !regions.empty(), threadPointer};
         try {
             auto instruction = architecture == Architecture::Arm64 ? decodeArm(reader) : decodeX64(reader);
             instruction.next = reader.pc;
@@ -1331,7 +1339,7 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
             }
 
             const auto end = pc < 0 ? 0 : executableEnd(pc, image.size(), regions);
-            Reader reader{image.first(end), pc, !regions.empty()};
+            Reader reader{image.first(end), pc, !regions.empty(), threadPointer};
             Instruction instruction;
             try {
                 if (pc < 0 || pc >= Address(end))
@@ -1375,6 +1383,14 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
                 if (references && instruction.end)
                     if (auto* jump = std::get_if<Jump>(&*instruction.end))
                         recoverTable(pc, *jump);
+                // A return through a register holding a code address is a jump; libunwind pops ARM guarded
+                // control stack entries with `adr x16, next; ret x16`.
+                if (architecture == Architecture::Arm64 && instruction.end)
+                    if (const auto* ret = std::get_if<Return>(&*instruction.end))
+                        if (const auto* target = std::get_if<Register>(&ret->target); target && target->index != 30)
+                            if (const auto value = resolveRegister(instructions, pc, target->index); value &&
+                                *value >= 0 && std::size_t(*value) < executableEnd(*value, image.size(), regions))
+                                instruction.end = Jump{immediate(*value)};
             } catch (const std::runtime_error& error) {
                 instruction.end = Trap{std::format("{} at guest offset {}", error.what(), pc)};
             }

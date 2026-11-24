@@ -9,6 +9,10 @@ struct Reader {
     std::span<const std::uint8_t> image;
     Address pc;
     bool mapped;
+    // The FS segment base: the x86-64 Linux thread pointer, or zero when unknown.
+    Address threadPointer = 0;
+    // Set while decoding an FS-prefixed instruction, whose memory operands are relative to the segment.
+    bool segmented = false;
 
     std::uint64_t read(unsigned count) {
         if (pc < 0 || pc + count > Address(image.size()))

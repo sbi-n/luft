@@ -162,7 +162,8 @@ bool readsFlags(const Effect& effect) {
     const auto* registerBinary = std::get_if<Binary>(&effect);
     return std::holds_alternative<ConditionalMove>(effect) || std::holds_alternative<SetCondition>(effect) ||
         std::holds_alternative<Select>(effect) || std::holds_alternative<ConditionalCompare>(effect) ||
-        (binary && (binary->keepCarry || binary->withCarry)) || (byte && byte->keepCarry) || (shift && shift->flags) ||
+        (binary && (binary->keepCarry || binary->withCarry)) || (byte && (byte->keepCarry || byte->withCarry)) ||
+        (shift && shift->flags) ||
         std::holds_alternative<ByteShift>(effect) ||
         (immediateShift && immediateShift->op >= ShiftOp::RotateRight) ||
         (registerBinary && registerBinary->withCarry) || std::holds_alternative<BitTest>(effect) ||
@@ -409,6 +410,8 @@ Features detectFeatures(const Graph& graph, Address entry, bool arm,
                 features.flags |= op->withCarry;
             features.flags |= x87ReadsFlags(effect);
             if (const auto* op = std::get_if<MemoryBinary>(&effect))
+                features.flags |= op->withCarry;
+            if (const auto* op = std::get_if<ByteBinary>(&effect))
                 features.flags |= op->withCarry;
             if (const auto* move = std::get_if<ConditionalMove>(&effect)) {
                 features.flags = true;

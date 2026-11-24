@@ -49,8 +49,28 @@ std::string recompileMapped(Architecture architecture, std::span<const std::uint
     std::vector<GuestExport> roots(exports.begin(), exports.end());
     for (const auto pc : initializers)
         roots.push_back({"", pc});
-    const auto graph = lift(architecture, image, roots, regions, regions.empty() ? &code : nullptr,
+    auto graph = lift(architecture, image, roots, regions, regions.empty() ? &code : nullptr,
         &references, bindings, convention, tlsVector, program.threadBlock);
+    // Landing pads become entry points only where their call sites were lifted: each one pulls in the code
+    // it reaches, and most functions in mapped libraries never run. Lifting repeats as the pads expose code.
+    std::set<std::size_t> pads;
+    for (bool added = true; added && !program.landingPads.empty();) {
+        added = false;
+        for (const auto& pad : program.landingPads) {
+            if (pads.contains(pad.target) || pad.target >= executableEnd(pad.target, image.size(), regions) ||
+                (arm && pad.target % 4 != 0))
+                continue;
+            const auto block = graph.lower_bound(Address(pad.siteStart));
+            if (block == graph.end() || block->first > Address(pad.siteEnd))
+                continue;
+            pads.insert(pad.target);
+            references.functions.insert(pad.target);
+            added = true;
+        }
+        if (added)
+            graph = lift(architecture, image, roots, regions, nullptr, &references, bindings, convention, tlsVector,
+                program.threadBlock);
+    }
     return luau::lowerModule(graph, references, architecture, exports, regions, imports, objects,
         initializers, image, code, convention, program);
 }

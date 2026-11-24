@@ -112,6 +112,8 @@ struct ByteBinary {
     bool keepCarry = false;
     bool reverse = false;
     bool flags = true;
+    // ADC and SBB: the carry flag joins the sum or the difference.
+    bool withCarry = false;
 };
 struct ByteShift { ShiftOp op; Value dst; unsigned field; std::optional<unsigned> count; };
 struct Shift { ShiftOp op; unsigned size; Register dst; unsigned count; };
@@ -190,6 +192,9 @@ enum class LaneOp {
     // PACKSS/PACKUS narrow both operands with saturation: the first fills the low half, the second the high.
     PackSigned, PackUnsigned,
     ShuffleBytes, // PSHUFB: each control byte selects a byte of the first operand or zero.
+    TestBits,     // CMTST: all ones where the operands share a set bit.
+    // USHL/SSHL: shift left by the signed low byte of each second-operand lane; negative counts shift right.
+    ShiftUnsigned, ShiftSigned,
 };
 struct VectorLanes {
     LaneOp op; unsigned element; VectorRegister dst; VectorOperand rhs; std::optional<VectorRegister> lhs = {};

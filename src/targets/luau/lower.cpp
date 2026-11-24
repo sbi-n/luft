@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <format>
 #include <ranges>
 #include <set>
@@ -65,21 +66,23 @@ public:
 
     std::string lower() {
         const auto result = reg(0);
+        if (!data.landingPads.empty())
+            includeFunctionPointers();
         addFunction(entry);
         for (const auto pc : initializers)
             addFunction(pc);
-        std::string bodies;
+        std::vector<std::string> bodies;
         std::set<Address> importRoutines;
         for (std::size_t i = 0;;) {
             for (; i < pending.size(); ++i) {
                 const auto target = pending[i];
-                body = std::format("    {} = function(expectedReturn: number): GuestRoutine?\n", routine(target));
+                body = std::format("    {} = function(expectedReturn: number): any\n", routine(target));
                 active.clear();
                 regionEntry = target;
                 remaining = 256;
                 region(target, 2, {});
                 body += "    end\n";
-                bodies += body;
+                bodies.push_back(std::move(body));
             }
             // Imports whose addresses escape into registers become callable through function pointers.
             bool emitted = false;
@@ -87,14 +90,17 @@ public:
                 if (!usesFunctionPointers || !importRoutines.insert(token).second)
                     continue;
                 emitted = true;
-                body = std::format("    {} = function(expectedReturn: number): GuestRoutine?\n", routine(token));
+                body = std::format("    {} = function(expectedReturn: number): any\n", routine(token));
                 active.clear();
-                if (emitImport(2, *import))
+                tailCall = true;
+                const bool emitted = emitImport(2, *import);
+                tailCall = false;
+                if (emitted)
                     returnFromFunction(2, arm ? Return{Register{30}} : Return{StackTop{}});
                 else
                     trap(2, std::format("unsupported guest import {} called through a pointer", importName(*import)));
                 body += "    end\n";
-                bodies += body;
+                bodies.push_back(std::move(body));
             }
             if (!emitted && i == pending.size())
                 break;
@@ -155,8 +161,10 @@ public:
                 source += std::format("    local {}: GuestRoutine\n", functionName(token));
         }
         if (usesFunctionPointers)
-            source += "    local functionPointers: {[number]: GuestRoutine?} = {}\n";
-        source += bodies;
+            source += "    local functionPointers: {[number]: any} = resumeRoutines\n";
+        if (usesSeh)
+            source += exceptionHelpers();
+        source += groupRoutines(bodies);
         if (usesFunctionPointers) {
             for (const auto target : addressTaken)
                 source += std::format("    functionPointers[{}] = {}\n", target, routine(target));
@@ -176,7 +184,7 @@ public:
                     source += std::format("    {} = 4294967295, 0\n", reg(30).pair());
                 else
                     source += std::format("    {} -= {}\n    write(8, {}, 4294967295, 0)\n", sp.lo, 8 + shadowSpace, sp.lo);
-                source += std::format("    runGuestRoutine({}, 4294967295)\n", routine(pc));
+                source += std::format("    checkUnwound(runGuestRoutine({}, 4294967295))\n", routine(pc));
                 if (shadowSpace)
                     source += std::format("    {} += {}\n", sp.lo, shadowSpace);
             }
@@ -223,7 +231,7 @@ public:
             const unsigned frameSize = 8 + shadowSpace;
             source += std::format("    {} -= {}\n    write(8, {}, 4294967295, 0)\n", sp.lo, frameSize, sp.lo);
         }
-        source += std::format("    runGuestRoutine({}, 4294967295)\n", routine(entry));
+        source += std::format("    checkUnwound(runGuestRoutine({}, 4294967295))\n", routine(entry));
         if (isProgram())
             source += std::format("    exitProcess({}, true)\n", result.lo);
         // Exit callbacks registered with __cxa_atexit stay queued until the guest process exits.
@@ -231,10 +239,33 @@ public:
         return source;
     }
 
+    // A Luau function holds at most 32767 child closures. Larger programs define their routines inside
+    // group functions, each a child of the entry.
+    std::string groupRoutines(const std::vector<std::string>& bodies) const {
+        std::size_t limit = 30000, group = 16000;
+        if (const auto* forced = std::getenv("LUFT_ROUTINE_GROUP"))
+            limit = group = std::max<std::size_t>(1, std::strtoull(forced, nullptr, 10));
+        std::string source;
+        if (bodies.size() <= limit || !useRoutineTable) {
+            for (const auto& body : bodies)
+                source += body;
+            return source;
+        }
+        for (std::size_t first = 0, index = 0; first < bodies.size(); first += group, ++index) {
+            source += std::format("    local function defineRoutines{}()\n", index);
+            for (auto i = first; i < std::min(bodies.size(), first + group); ++i)
+                source += bodies[i];
+            source += std::format("    end\n    defineRoutines{}()\n", index);
+        }
+        return source;
+    }
+
     bool usesMemory() const { return needsMemory || features.stack; }
     bool usesFlags() const { return features.flags || needsAddFlags; }
     bool usesStackGuard() const { return needsStackGuard; }
     bool usesHeap() const { return needsHeap; }
+    bool usesSehRuntime() const { return usesSeh; }
+    bool usesLandingPadTable() const { return usesLandingPads; }
     bool usesShift() const { return needsShift; }
     bool usesDivision() const { return needsDivision; }
     bool usesMultiply() const { return needsMultiply; }
@@ -282,6 +313,10 @@ private:
     bool needsProcess = false;
     bool needsX87 = false;
     bool tailCall = false;
+    // Where the caller resumes while an import call is emitted.
+    std::optional<Address> callResume;
+    bool usesSeh = false;
+    bool usesLandingPads = false;
     bool usesFunctionPointers = false;
     bool usesExitCallbacks = false;
     bool usesBudget = false;
@@ -379,6 +414,13 @@ private:
         if (const auto known = knownAddress(addr, constants); known && *known < data.image.size()) {
             if (const auto word = data.immutableWord(*known, size))
                 return size == 8 ? wordLiteral(*word).pair() : std::to_string(std::uint32_t(*word));
+            if (const auto* import = data.unresolved(*known, size); import && import->callable && size == 8 &&
+                import->start == *known && import->size == 8) {
+                // An import's address read in place, as weak references are tested, is its placeholder.
+                const auto token = ImportToken + import->start;
+                importTokens.emplace(Address(token), import);
+                return wordLiteral(token).pair();
+            }
             if ((!data.readable(*known, size) && !data.materialized(*known)) || data.unresolved(*known, size))
                 return std::format("error({}, 0)", quoted(memoryError(*known, size)));
             if (data.readable(*known, size))
@@ -1123,7 +1165,8 @@ private:
                     if (setFlags || compare.writeBack) {
                         if (compare.op == BinaryOp::Add || compare.op == BinaryOp::Sub) {
                             const bool subtract = compare.op == BinaryOp::Sub;
-                            line(depth + 1, std::format("local total = a {} b", subtract ? '-' : '+'));
+                            line(depth + 1, std::format("local total = a {} b{}", subtract ? '-' : '+',
+                                compare.withCarry ? std::format(" {} (if carry then 1 else 0)", subtract ? '-' : '+') : ""));
                             line(depth + 1, "local byte = total % 256");
                             if (setFlags) {
                                 if (!compare.keepCarry)
@@ -2234,14 +2277,16 @@ private:
             if ((convention != CallingConvention::Microsoft || (imported && runtimeLibrary(imported->library))) &&
                 (name == "_setjmp" || name == "setjmp" || name == "_setjmpex" || name == "__sigsetjmp" || name == "sigsetjmp")) {
                 emitSetjmp(depth, call->resume);
-            } else if (imported && emitImport(depth, *imported)) {
+            } else if (callResume = call->resume; imported && emitImport(depth, *imported)) {
+                callResume.reset();
                 region(call->resume, depth, {});
             } else if (const auto callee = resolveTarget(call->target, constants)) {
                 addFunction(*callee);
                 callPrologue(depth, call->resume);
-                line(depth, std::format("runGuestRoutine({}, {})", routine(*callee), call->resume));
+                callRoutine(depth, routine(*callee), call->resume);
                 region(call->resume, depth, {});
-            } else if (emitImport(depth, call->target, constants)) {
+            } else if (callResume = call->resume; emitImport(depth, call->target, constants)) {
+                callResume.reset();
                 region(call->resume, depth, {});
             } else if (const auto* direct = findImport(call->target, constants)) {
                 trap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
@@ -2274,7 +2319,14 @@ private:
                 (std::holds_alternative<Memory>(jump->target) && !findImport(jump->target, constants, true)))) {
                 includeFunctionPointers();
                 needsMemory = true;
-                line(depth, std::format("local callee = functionPointers[address({})]", value(jump->target, 8, constants)));
+                line(depth, std::format("local target = address({})", value(jump->target, 8, constants)));
+                if (!data.landingPads.empty() && convention != CallingConvention::Microsoft) {
+                    // libgcc's unwinder resumes a landing pad with an indirect jump from the frame's stack.
+                    usesLandingPads = true;
+                    line(depth, std::format("if landingPads[target] then unwindStack = {} return target end",
+                        reg(arm ? 31 : 4).lo));
+                }
+                line(depth, "local callee = functionPointers[target]");
                 line(depth, std::format("if not callee then error(\"unknown guest tail-call target at {:#x}\", 0) end", pc));
                 line(depth, "return callee");
             }
@@ -2310,11 +2362,26 @@ private:
             addFunction(entry);
     }
 
-    void runCallback(unsigned depth, std::string_view callback) {
+    // Calls a routine for a guest call that resumes at `resume`. Unwinding past this frame returns the
+    // target address from the enclosing routine.
+    void callRoutine(unsigned depth, std::string_view callee, Address resume) {
+        // The frame's stack pointer once the call returns identifies it to unwinders.
+        const auto frameStack = arm ? reg(31).lo : reg(4).lo + " + 8";
+        line(depth, std::format("do local unwound = runGuestRoutine({}, {}, {}) if unwound then return unwound end end",
+            callee, resume, frameStack));
+    }
+
+    // Runs a guest callback from emulated library code. Inside a routine body, unwinding past the callback
+    // continues outward; inside a Luau closure it cannot, so it fails.
+    void runCallback(unsigned depth, std::string_view callback, bool propagate = false) {
         if (arm)
             line(depth, "local linkLo, linkHi = " + reg(30).pair());
         callPrologue(depth, 4294967295);
-        line(depth, std::format("runGuestRoutine({}, 4294967295)", callback));
+        if (propagate)
+            line(depth, std::format("do local unwound = runGuestRoutine({}, 4294967295) if unwound then return unwound end end",
+                callback));
+        else
+            line(depth, std::format("checkUnwound(runGuestRoutine({}, 4294967295))", callback));
         if (arm)
             assign(depth, 30, 8, "linkLo, linkHi");
     }
@@ -2326,7 +2393,7 @@ private:
         line(depth + 1, std::format("local callee = functionPointers[address({})]", value(target, 8, constants)));
         line(depth + 1, "if not callee then error(\"unknown guest function pointer\", 0) end");
         callPrologue(depth + 1, resume);
-        line(depth + 1, std::format("runGuestRoutine(callee, {})", resume));
+        callRoutine(depth + 1, "callee", resume);
         line(depth, "end");
         region(resume, depth, {});
     }
@@ -2356,13 +2423,14 @@ private:
                     index, index, vector[0], vector[1]));
             }
         }
+        line(depth + 1, "local escaped: number? = nil");
         line(depth + 1, std::format("protectJump(jumpFrames, address({}), function(jumpValue: number): ()",
             environment.pair()));
         assign(depth + 2, 0, 8, "jumpValue, 0");
-        line(depth + 2, "local function resumeRoutine(expectedReturn: number): GuestRoutine?");
+        line(depth + 2, "local function resumeRoutine(expectedReturn: number): any");
         region(resume, depth + 3, {});
         line(depth + 2, "end");
-        line(depth + 2, "runGuestRoutine(resumeRoutine, expectedReturn)");
+        line(depth + 2, "escaped = runGuestRoutine(resumeRoutine, expectedReturn)");
         line(depth + 1, "end, function()");
         for (const auto index : nonvolatile)
             line(depth + 2, std::format("{} = saved{}lo, saved{}hi", reg(index).pair(), index, index));
@@ -2374,25 +2442,30 @@ private:
             }
         }
         line(depth + 1, "end)");
-        line(depth + 1, "return nil");
+        line(depth + 1, "return escaped");
         line(depth, "end");
     }
 
     void returnFromFunction(unsigned depth, const Return& ret) {
+        // A return elsewhere, such as an unwinder's return to a landing pad, resumes the frame that owns the
+        // stack pointer.
+        const auto unwind = [&](const std::string& lo, const std::string& hi) {
+            line(depth, std::format("if {} ~= expectedReturn or {} ~= 0 then", lo, hi));
+            line(depth + 1, std::format("if {} ~= 0 then error(\"guest returned to an address outside guest memory\", 0) end", hi));
+            line(depth + 1, std::format("unwindStack = {}", reg(arm ? 31 : 4).lo));
+            line(depth + 1, "return " + lo);
+            line(depth, "end");
+        };
         if (arm) {
             const auto value = reg(std::get<Register>(ret.target).index);
-            line(depth, std::format("if {} ~= expectedReturn or {} ~= 0 then", value.lo, value.hi));
-            trap(depth + 1, "indirect ARM64 return is unsupported");
-            line(depth, "end");
+            unwind(value.lo, value.hi);
         } else if (features.stack) {
             stackPop(depth);
             if (ret.stackAdjust) {
                 const auto sp = reg(4);
                 line(depth, std::format("{} = offset({}, {})", sp.pair(), sp.pair(), ret.stackAdjust));
             }
-            line(depth, "if savedLo ~= expectedReturn or savedHi ~= 0 then");
-            trap(depth + 1, "indirect x86-64 return is unsupported");
-            line(depth, "end");
+            unwind("savedLo", "savedHi");
         }
         line(depth, "return nil");
     }
@@ -2546,6 +2619,132 @@ private:
         line(depth, "end");
     }
 
+    // ntdll exception dispatch and unwinding over the image's .pdata table. Handlers run as guest code through
+    // sehCall, and RtlUnwindEx resumes its target frame by unwinding to it.
+    bool emitExceptionImport(unsigned depth, std::string_view name) {
+        static constexpr std::array<std::string_view, 7> names{"RaiseException", "RtlUnwindEx", "RtlUnwind",
+            "RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind", "RtlPcToFileHeader"};
+        if (arm || std::ranges::find(names, name) == names.end())
+            return false;
+        usesSeh = true;
+        needsMemory = true;
+        needsHeap = true;
+        includeFunctionPointers();
+        for (unsigned index = 0; index < 16; ++index)
+            reg(index);
+        const auto args = argumentRegisters(arm, convention);
+        const auto arg = [&](unsigned index) { return reg(args[index]); };
+        // The caller's context once the import returns: a call resumes after it, and a tail call or a call
+        // through a pointer left the return address on the stack.
+        const auto sp = reg(4).lo;
+        const auto rip = callResume && !tailCall ? std::to_string(*callResume) : std::format("(read(8, {}))", sp);
+        const auto rsp = callResume && !tailCall ? sp : sp + " + 8";
+        const auto stack = argumentStack();
+        if (name == "RtlPcToFileHeader") {
+            line(depth, "do");
+            line(depth + 1, std::format("local pc = address({})", arg(0).pair()));
+            line(depth + 1, "local base = if pc >= seh.base and pc < seh.stop then seh.base else 0");
+            line(depth + 1, std::format("write(8, address({}), base, 0)", arg(1).pair()));
+            assign(depth + 1, 0, 8, "base, 0");
+            line(depth, "end");
+        } else if (name == "RtlLookupFunctionEntry") {
+            line(depth, "do");
+            line(depth + 1, std::format("local entry = sehLookup(address({}))", arg(0).pair()));
+            line(depth + 1, std::format("write(8, address({}), if entry ~= 0 then seh.base else 0, 0)", arg(1).pair()));
+            assign(depth + 1, 0, 8, "entry, 0");
+            line(depth, "end");
+        } else if (name == "RtlVirtualUnwind") {
+            line(depth, "do");
+            line(depth + 1, std::format("local handler, data, establisher = sehVirtualUnwind({}, address({}), address({}), "
+                "address(stackArgument({}, 4)))", arg(0).lo, arg(2).pair(), arg(3).pair(), stack));
+            line(depth + 1, std::format("write(8, address(stackArgument({}, 5)), data, 0)", stack));
+            line(depth + 1, std::format("write(8, address(stackArgument({}, 6)), establisher, 0)", stack));
+            assign(depth + 1, 0, 8, "handler, 0");
+            line(depth, "end");
+        } else if (name == "RtlCaptureContext") {
+            line(depth, std::format("sehCapture(address({}), {}, {})", arg(0).pair(), rip, rsp));
+        } else if (name == "RaiseException") {
+            line(depth, "do");
+            line(depth + 1, "local record = sehNew(152)");
+            line(depth + 1, std::format("write(4, record, {}, 0)", arg(0).lo));
+            line(depth + 1, std::format("write(4, record + 4, bit32.band({}, 1), 0)", arg(1).lo));
+            line(depth + 1, std::format("write(8, record + 16, {}, 0)", rip));
+            line(depth + 1, std::format("local count = math.min({}, 15)", arg(2).lo));
+            line(depth + 1, "write(4, record + 24, count, 0)");
+            line(depth + 1, std::format("local parameters = address({})", arg(3).pair()));
+            line(depth + 1, "for i = 0, count - 1 do write(8, record + 32 + i * 8, read(8, parameters + i * 8)) end");
+            line(depth + 1, "local context = sehNew(SehContextSize)");
+            line(depth + 1, std::format("sehCapture(context, {}, {})", rip, rsp));
+            line(depth + 1, "local escaped = sehRaise(record, context, sehCall)");
+            line(depth + 1, "if escaped ~= nil then return escaped end");
+            line(depth, "end");
+        } else {
+            // RtlUnwindEx(frame, ip, record, value, context, history) and RtlUnwind(frame, ip, record, value).
+            line(depth, "do");
+            if (name == "RtlUnwindEx")
+                line(depth + 1, std::format("local final = address(stackArgument({}, 4))", stack));
+            else
+                line(depth + 1, "local final = 0");
+            line(depth + 1, "if final == 0 then final = sehNew(SehContextSize) end");
+            // The start is copied first: the caller may pass the context being dispatched as `final`.
+            line(depth + 1, "local start, cursor = sehUnwindStart()");
+            line(depth + 1, std::format("sehCapture(final, {}, {})", rip, rsp));
+            line(depth + 1, std::format("local resume, escaped = sehUnwind(address({}), address({}), address({}), {}, "
+                "sehCall, final, start, cursor)", arg(0).pair(), arg(1).pair(), arg(2).pair(), arg(3).lo));
+            line(depth + 1, "if escaped ~= nil then return escaped end");
+            line(depth + 1, "sehRestore(final)");
+            line(depth + 1, "unwindStack = " + sp);
+            line(depth + 1, "return resume");
+            line(depth, "end");
+        }
+        return true;
+    }
+
+    // Per-entry helpers for exception imports: they read and write the guest registers.
+    std::string exceptionHelpers() {
+        std::string source = "    local function sehCapture(context: number, rip: number, rsp: number)\n"
+            "        fillMemory(context, 0, 0, SehContextSize, 0)\n"
+            "        write(4, context + 0x30, 0x10000b, 0)\n"
+            "        write(4, context + 0x34, 0x1f80, 0)\n"
+            "        write(2, context + 0x38, 0x33, 0)\n"
+            "        write(2, context + 0x42, 0x2b, 0)\n"
+            "        write(4, context + 0x118, 0x1f80, 0)\n";
+        std::string restore = "    local function sehRestore(context: number)\n";
+        for (const auto index : registers) {
+            if (index >= 16)
+                continue;
+            const auto at = 0x78 + index * 8;
+            source += std::format("        write(8, context + {}, {})\n", at, reg(index).pair());
+            restore += std::format("        {} = read(8, context + {})\n", reg(index).pair(), at);
+        }
+        source += "        write(8, context + 0x98, rsp, 0)\n        write(8, context + 0xf8, rip, 0)\n";
+        for (const auto index : xmmRegisters) {
+            if (index >= 16 || index >= LocalVectorRegisters)
+                continue;
+            const auto lanes = xmm(VectorRegister{index});
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                const auto at = 0x1a0 + index * 16 + lane * 4;
+                source += std::format("        write(4, context + {}, {}, 0)\n", at, lanes[lane]);
+                restore += std::format("        {} = (read(4, context + {}))\n", lanes[lane], at);
+            }
+        }
+        source += "    end\n";
+        restore += "    end\n";
+        const auto sp = reg(4);
+        source += restore;
+        // Runs a handler or callback with four arguments; returns RAX, or the address an unwind escaped with.
+        source += "    local function sehCall(target: number, a: number, b: number, c: number, d: number, marker: number): (number, any)\n"
+            "        local callee = functionPointers[target]\n"
+            "        if not callee then error(string.format(\"unknown guest exception handler 0x%x\", target), 0) end\n";
+        source += std::format("        {} = a, 0\n        {} = b, 0\n        {} = c, 0\n        {} = d, 0\n",
+            reg(1).pair(), reg(2).pair(), reg(8).pair(), reg(9).pair());
+        source += std::format("        {0} -= 40\n        write(8, {0}, marker, 0)\n", sp.lo);
+        source += "        local escaped = runGuestRoutine(callee, marker)\n"
+            "        if escaped ~= nil then return 0, escaped end\n";
+        source += std::format("        {} += 32\n        return {}\n    end\n", sp.lo, reg(0).lo);
+        return source;
+    }
+
     bool emitWindowsImport(unsigned depth, const GuestImport& import) {
         auto library = std::string(import.library);
         for (auto& ch : library)
@@ -2555,6 +2754,8 @@ private:
             return false;
 
         const auto name = import.name;
+        if (emitExceptionImport(depth, name))
+            return true;
         struct Entry { std::string_view name; std::string_view target; };
         static constexpr std::array entries{
             Entry{"GetStdHandle", "GetStdHandle"}, Entry{"GetFileType", "GetFileType"}, Entry{"WriteFile", "WriteFile"},
@@ -2564,8 +2765,8 @@ private:
             Entry{"FlushFileBuffers", "yes"}, Entry{"GetConsoleMode", "no"}, Entry{"GetConsoleOutputCP", "GetACP"},
             Entry{"ReadConsoleW", "no"}, Entry{"GetCommandLineW", "GetCommandLineW"},
             Entry{"GetCommandLineA", "GetCommandLineA"}, Entry{"GetModuleFileNameW", "GetModuleFileNameW"},
-            Entry{"GetModuleFileNameA", "GetModuleFileNameA"}, Entry{"GetModuleHandleW", "no"},
-            Entry{"GetModuleHandleExW", "no"}, Entry{"GetProcAddress", "no"}, Entry{"FreeLibrary", "yes"},
+            Entry{"GetModuleFileNameA", "GetModuleFileNameA"}, Entry{"GetProcAddress", "no"},
+            Entry{"FreeLibrary", "yes"},
             Entry{"GetEnvironmentStringsW", "GetEnvironmentStringsW"}, Entry{"FreeEnvironmentStringsW", "yes"},
             Entry{"SetEnvironmentVariableW", "yes"}, Entry{"GetStartupInfoW", "GetStartupInfoW"},
             Entry{"GetCPInfo", "GetCPInfo"}, Entry{"GetACP", "GetACP"}, Entry{"GetOEMCP", "GetOEMCP"},
@@ -2584,10 +2785,9 @@ private:
             Entry{"TerminateProcess", "TerminateProcess"}, Entry{"IsProcessorFeaturePresent", "IsProcessorFeaturePresent"},
             Entry{"IsDebuggerPresent", "no"}, Entry{"InitializeSListHead", "InitializeSListHead"},
             Entry{"UnhandledExceptionFilter", "yes"}, Entry{"TlsAlloc", "TlsAlloc"}, Entry{"TlsGetValue", "TlsGetValue"},
-            Entry{"TlsSetValue", "TlsSetValue"}, Entry{"TlsFree", "TlsFree"}, Entry{"RaiseException", "RaiseException"},
+            Entry{"TlsSetValue", "TlsSetValue"}, Entry{"TlsFree", "TlsFree"},
             Entry{"FindFirstFileExW", "FindFirstFileExW"}, Entry{"FindNextFileW", "no"}, Entry{"FindClose", "yes"},
-            Entry{"SetStdHandle", "yes"}, Entry{"RtlPcToFileHeader", "no"}, Entry{"RtlLookupFunctionEntry", "no"},
-            Entry{"RtlCaptureContext", "no"}, Entry{"Sleep", "no"}, Entry{"IsDBCSLeadByteEx", "no"},
+            Entry{"SetStdHandle", "yes"}, Entry{"Sleep", "no"}, Entry{"IsDBCSLeadByteEx", "no"},
             Entry{"VirtualQuery", "VirtualQuery"}, Entry{"GetStartupInfoA", "GetStartupInfoW"},
         };
         if (const auto entry = std::ranges::find(entries, name, &Entry::name); entry != entries.end()) {
@@ -2596,6 +2796,26 @@ private:
             const auto args = argumentRegisters(arm, convention);
             assign(depth, 0, 8, std::format("win32.{}({}, {}, {}, {}, {})", entry->target, reg(args[0]).pair(),
                 reg(args[1]).pair(), reg(args[2]).pair(), reg(args[3]).pair(), argumentStack()));
+            return true;
+        }
+        if (name == "GetModuleHandleW" || name == "GetModuleHandleA" || name == "GetModuleHandleExW" ||
+            name == "GetModuleHandleExA") {
+            // The executable is the only module: a null name or an address inside it names the image.
+            needsMemory = true;
+            const auto args = argumentRegisters(arm, convention);
+            const auto base = std::to_string(program.imageBase);
+            if (name.starts_with("GetModuleHandleEx")) {
+                // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS treats the name as an address.
+                line(depth, "do");
+                line(depth + 1, std::format("local named = address({})", reg(args[1]).pair()));
+                line(depth + 1, std::format("local found = named == 0 or (bit32.btest({}, 4) and named >= {} and named < {})",
+                    reg(args[0]).lo, base, data.image.size()));
+                line(depth + 1, std::format("write(8, address({}), if found then {} else 0, 0)", reg(args[2]).pair(), base));
+                assign(depth + 1, 0, 4, "if found then 1 else 0");
+                line(depth, "end");
+            } else {
+                assign(depth, 0, 8, std::format("if address({}) == 0 then {} else 0, 0", reg(args[0]).pair(), base));
+            }
             return true;
         }
         if (name == "EncodePointer" || name == "DecodePointer") {
@@ -3196,7 +3416,7 @@ private:
 
     // Calls a guest function pointer with integer arguments and leaves its result in the return register.
     void callGuest(unsigned depth, const std::string& target, std::span<const std::string> values,
-        std::string_view missing) {
+        std::string_view missing, bool propagate = true) {
         includeFunctionPointers();
         needsMemory = true;
         const auto arguments = argumentRegisters(arm, convention);
@@ -3206,7 +3426,7 @@ private:
             assign(depth, arguments[i], 8, values[i]);
         if (convention == CallingConvention::Microsoft)
             line(depth, reg(4).lo + " -= 32");
-        runCallback(depth, "callee");
+        runCallback(depth, "callee", propagate);
         if (convention == CallingConvention::Microsoft)
             line(depth, reg(4).lo + " += 32");
     }
@@ -3464,7 +3684,11 @@ private:
             Entry{"aligned_alloc", "aligned_alloc", 2}, Entry{"posix_memalign", "posix_memalign", 3},
             Entry{"mach_absolute_time", "mach_absolute_time", 0}, Entry{"mach_timebase_info", "mach_timebase_info", 1},
             Entry{"dlopen", "failure", 0}, Entry{"dlsym", "failure", 0}, Entry{"dladdr", "failure", 0},
-            Entry{"_dyld_register_func_for_remove_image", "success", 0}, Entry{"_dyld_find_unwind_sections", "failure", 0},
+            Entry{"_dyld_register_func_for_remove_image", "success", 0},
+            Entry{"_dyld_find_unwind_sections", "dyld_find_unwind_sections", 2},
+            Entry{"_dl_find_object", "dl_find_object", 2}, Entry{"__getauxval", "failure", 1},
+            Entry{"getauxval", "failure", 1}, Entry{"gettext", "gettext", 1}, Entry{"dgettext", "dgettext", 2},
+            Entry{"dcgettext", "dgettext", 3},
             Entry{"isspace", "isspace", 1}, Entry{"strcoll_l", "strcoll", 2}, Entry{"strcoll", "strcoll", 2},
         };
         const auto arguments = argumentRegisters(arm, convention);
@@ -3652,6 +3876,10 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     const bool arm = architecture == Architecture::Arm64;
     const auto loops = recoverLoops(graph);
     Data data{image, regions, imports, code, objects, {}};
+    data.unwindObjects = program.unwindObjects;
+    for (const auto& pad : program.landingPads)
+        if (references.functions.contains(Address(pad.target)) && graph.contains(Address(pad.target)))
+            data.landingPads.insert(pad.target);
     // Mapped images embed all of their data: references through computed pointers are common.
     if (!regions.empty())
         data.materializeAll();
@@ -3675,6 +3903,8 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     bool vector = false;
     bool process = false;
     bool x87 = false;
+    bool seh = false;
+    bool landingPads = false;
     std::map<Address, std::string> functions;
     const auto lower = [&](Address entry) {
         if (functions.contains(entry))
@@ -3701,6 +3931,8 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
             vector |= emitter.usesVector();
             process |= emitter.usesProcess();
             x87 |= emitter.usesX87();
+            seh |= emitter.usesSehRuntime();
+            landingPads |= emitter.usesLandingPadTable();
             functions.emplace(entry, std::move(body));
         }
     };
@@ -3709,12 +3941,14 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     for (const auto& entry : exports)
         lower(entry.offset);
 
+    if (seh)
+        process = true;
     if (process)
         memory = heap = floating = true;
     if (x87)
         memory = floating = vector = true;
     const RuntimeFeatures runtime{flags, shifts, division, multiply, jumpFrames, memory, stackGuard, heap, floating, prime,
-        structured, decimal, vector, process, x87};
+        structured, decimal, vector, process, x87, seh, landingPads};
     return printModule(functions, exports, runtime, data, program);
 }
 }
