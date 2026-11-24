@@ -25,7 +25,7 @@ std::string recompileMapped(Architecture architecture, std::span<const std::uint
     std::span<const GuestImport> imports, std::span<const GuestObject> objects,
     std::span<const std::size_t> initializers, CallingConvention convention,
     std::span<const GuestBinding> bindings, std::span<const std::size_t> functionPointers,
-    std::optional<std::size_t> tlsVector) {
+    std::optional<std::size_t> tlsVector, const ProgramOptions& program) {
     const bool arm = architecture == Architecture::Arm64;
     std::set<std::string_view> names;
     for (const auto& entry : exports) {
@@ -50,7 +50,7 @@ std::string recompileMapped(Architecture architecture, std::span<const std::uint
     for (const auto pc : initializers)
         roots.push_back({"", pc});
     const auto graph = lift(architecture, image, roots, regions, regions.empty() ? &code : nullptr,
-        &references, bindings, convention, tlsVector);
+        &references, bindings, convention, tlsVector, program.threadBlock);
     return luau::lowerModule(graph, references, architecture, exports, regions, imports, objects,
-        initializers, image, code, convention);
+        initializers, image, code, convention, program);
 }

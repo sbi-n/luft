@@ -1,7 +1,10 @@
 #include "recompiler.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -341,7 +344,7 @@ void relocate(const Sections& sections, std::span<std::uint8_t> image,
                 const bool callable = read(symbol, 6, 2) == 0 &&
                     (type == jump || (type == global && (symbol[4] & 15) == 2));
                 imports.push_back({std::size_t(at), std::size_t(width),
-                    name.empty() ? "unknown ELF relocation" : name, callable});
+                    name.empty() ? "unknown ELF relocation" : name, callable, false, {}, type == copy});
             }
         }
     }
@@ -410,6 +413,42 @@ Sections mapElf(Architecture architecture, Bytes file, std::uint64_t base,
     }
     if (regions.size() == previous || sections.headers.empty())
         throw std::runtime_error("ELF requires load segments and a section table");
+
+    // Executable segments often hold read-only data too, such as jump tables and string literals. Only
+    // SHF_EXECINSTR sections stay executable so the translator can read the rest as data.
+    std::vector<std::pair<std::size_t, std::size_t>> code;
+    for (std::size_t i = 1; i < sections.headers.size() / 64; ++i) {
+        const auto section = sections.header(i);
+        const auto flags = read(section, 8, 8);
+        const auto address = read(section, 16, 8);
+        const auto size = read(section, 32, 8);
+        if ((flags & 6) == 6 && size && address < MaxExecutableSize - base && size <= MaxExecutableSize - base - address)
+            code.emplace_back(std::size_t(address + base), std::size_t(address + base + size));
+    }
+    std::ranges::sort(code);
+    std::vector<GuestRegion> refined(regions.begin(), regions.begin() + std::ptrdiff_t(previous));
+    for (auto i = previous; i < regions.size(); ++i) {
+        const auto region = regions[i];
+        std::vector<std::pair<std::size_t, std::size_t>> inside;
+        for (const auto& [first, last] : code)
+            if (first >= region.start && last <= region.end)
+                inside.emplace_back(first, last);
+        if (!region.executable || inside.empty()) {
+            refined.push_back(region);
+            continue;
+        }
+        auto cursor = region.start;
+        for (const auto& [first, last] : inside) {
+            if (first > cursor)
+                refined.push_back({cursor, first, region.readable, region.writable, false});
+            if (last > std::max(first, cursor))
+                refined.push_back({std::max(first, cursor), last, region.readable, region.writable, true});
+            cursor = std::max(cursor, last);
+        }
+        if (cursor < region.end)
+            refined.push_back({cursor, region.end, region.readable, region.writable, false});
+    }
+    regions = std::move(refined);
     return sections;
 }
 
@@ -450,7 +489,8 @@ std::optional<GuestObject> mapTls(Bytes file, std::uint64_t base, std::vector<st
 }
 
 std::string recompileElf(Architecture architecture, Bytes file, std::span<const GuestExport> exports,
-    bool initialize, std::span<const Bytes> libraries) {
+    bool initialize, std::span<const Bytes> libraries, const ProgramOptions& options) {
+    auto program = options;
     struct Unit {
         Sections sections;
         std::uint64_t base;
@@ -469,6 +509,9 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
         units.push_back({sections, base, symbolVersions(sections)});
     }
 
+    if (std::getenv("LUFT_DEBUG"))
+        for (std::size_t i = 0; i < units.size(); ++i)
+            std::fprintf(stderr, "Luft: ELF unit %zu at guest %#llx\n", i, (unsigned long long)units[i].base);
     std::vector<CopyRelocation> tlsInitializers;
     if (architecture == Architecture::X86_64)
         for (auto& unit : units)
@@ -507,7 +550,61 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
         }
     }
     std::optional<std::size_t> singleThreaded;
+    std::optional<std::size_t> stackGuard;
+    // glibc's stdin, stdout, and stderr variables point at synthetic FILE objects the runtime recognizes.
+    std::optional<std::size_t> streams;
+    const auto standardStream = [](std::string_view name) -> std::optional<unsigned> {
+        if (name == "stdin") return 0;
+        if (name == "stdout") return 1;
+        if (name == "stderr") return 2;
+        return std::nullopt;
+    };
     std::erase_if(imports, [&](const GuestImport& import) {
+        const auto stream = import.callable || import.size != 8 ? std::nullopt : standardStream(import.name);
+        if (stream) {
+            if (!streams) {
+                const auto at = (image.size() + 15) & ~std::size_t(15);
+                const auto size = 3 * StreamObjectSize + 3 * 8;
+                if (at + size > MaxExecutableSize)
+                    return false;
+                image.resize(at + size);
+                regions.push_back({at, at + size, true, true, false});
+                objects.push_back({at, size});
+                for (unsigned i = 0; i < 3; ++i) {
+                    const auto object = at + i * StreamObjectSize;
+                    program.streams[i] = object;
+                    for (unsigned byte = 0; byte < 8; ++byte)
+                        image[at + 3 * StreamObjectSize + i * 8 + byte] = std::uint8_t(std::uint64_t(object) >> (8 * byte));
+                }
+                streams = at;
+            }
+            const auto object = *streams + *stream * StreamObjectSize;
+            const auto variable = *streams + 3 * StreamObjectSize + *stream * 8;
+            // A copy relocation places the FILE pointer itself in the executable; a GOT entry points to it.
+            const auto value = import.copy ? object : variable;
+            for (unsigned i = 0; i < 8; ++i)
+                image[import.start + i] = std::uint8_t(std::uint64_t(value) >> (8 * i));
+            bindings.push_back({import.start, value, !import.copy});
+            return true;
+        }
+        if (!import.callable && import.name == "__stack_chk_guard" && import.size == 8) {
+            // AArch64 reads the stack protector canary through the GOT. Point it at a synthetic value.
+            if (!stackGuard) {
+                const auto at = (image.size() + 7) & ~std::size_t(7);
+                if (at + 8 > MaxExecutableSize)
+                    return false;
+                image.resize(at + 8);
+                constexpr std::array<std::uint8_t, 8> guard{0, 0xa5, 0xa5, 0xa5, 0x5a, 0x5a, 0x5a, 0x5a};
+                std::ranges::copy(guard, image.begin() + at);
+                regions.push_back({at, at + 8, true, false, false});
+                objects.push_back({at, 8});
+                stackGuard = at;
+            }
+            for (unsigned i = 0; i < 8; ++i)
+                image[import.start + i] = std::uint8_t(std::uint64_t(*stackGuard) >> (8 * i));
+            bindings.push_back({import.start, *stackGuard});
+            return true;
+        }
         if (import.callable || import.name != "__libc_single_threaded")
             return false;
         if (import.size == 1) {
@@ -532,12 +629,23 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
     });
     std::vector<GuestExport> mapped(exports.begin(), exports.end());
     for (auto& entry : mapped) {
-        const auto address = entry.symbol.empty() ? entry.offset : functionAddress(main, entry.symbol);
+        const auto address = entry.symbol == EntrySymbol ? read(file, 24, 8) :
+            entry.symbol.empty() ? entry.offset : functionAddress(main, entry.symbol);
         if (address >= MaxExecutableSize - LoadBase)
             throw std::runtime_error("ELF export address is outside guest memory");
         entry.offset = std::size_t(address + LoadBase);
     }
-    const auto initializers = initialize ? initArray(main, image, regions, LoadBase) : std::vector<std::size_t>{};
+    std::vector<std::size_t> initializers;
+    if (initialize) {
+        // Programs initialize their libraries before the executable itself.
+        if (program.startup != Startup::Library)
+            for (std::size_t i = 1; i < units.size(); ++i) {
+                const auto unitInitializers = initArray(units[i].sections, image, regions, units[i].base);
+                initializers.insert(initializers.end(), unitInitializers.begin(), unitInitializers.end());
+            }
+        const auto mainInitializers = initArray(main, image, regions, LoadBase);
+        initializers.insert(initializers.end(), mainInitializers.begin(), mainInitializers.end());
+    }
     return recompileMapped(architecture, image, mapped, regions, imports, objects, initializers,
-        CallingConvention::Native, bindings, functionPointers);
+        CallingConvention::Native, bindings, functionPointers, {}, program);
 }

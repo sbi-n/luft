@@ -50,9 +50,10 @@ class StructuredFunction {
 public:
     StructuredFunction(const Graph& graph, const std::set<Address>& addressTaken,
         const LoopExits& loops, Data& data, Address entry, bool arm, CallingConvention convention,
-        std::span<const std::size_t> initializers)
+        std::span<const std::size_t> initializers, const ProgramOptions& program)
         : graph(graph), addressTaken(addressTaken), data(data), entry(entry), arm(arm), convention(convention),
-          initializers(initializers), loops(loops), features(detectFeatures(graph, entry, arm, initializers)),
+          initializers(initializers), program(program), loops(loops),
+          features(withProgramStack(detectFeatures(graph, entry, arm, initializers), program)),
           flagsAtEntry(features.flags ? liveFlagsAtEntry(graph, features.calls) : std::set<Address>{}),
           useRoutineTable(graph.size() > 48) {
         for (const auto& [pc, block] : graph) {
@@ -68,15 +69,35 @@ public:
         for (const auto pc : initializers)
             addFunction(pc);
         std::string bodies;
-        for (std::size_t i = 0; i < pending.size(); ++i) {
-            const auto target = pending[i];
-            body = std::format("    {} = function(expectedReturn: number): GuestRoutine?\n", routine(target));
-            active.clear();
-            regionEntry = target;
-            remaining = 256;
-            region(target, 2, {});
-            body += "    end\n";
-            bodies += body;
+        std::set<Address> importRoutines;
+        for (std::size_t i = 0;;) {
+            for (; i < pending.size(); ++i) {
+                const auto target = pending[i];
+                body = std::format("    {} = function(expectedReturn: number): GuestRoutine?\n", routine(target));
+                active.clear();
+                regionEntry = target;
+                remaining = 256;
+                region(target, 2, {});
+                body += "    end\n";
+                bodies += body;
+            }
+            // Imports whose addresses escape into registers become callable through function pointers.
+            bool emitted = false;
+            for (const auto& [token, import] : std::map(importTokens)) {
+                if (!usesFunctionPointers || !importRoutines.insert(token).second)
+                    continue;
+                emitted = true;
+                body = std::format("    {} = function(expectedReturn: number): GuestRoutine?\n", routine(token));
+                active.clear();
+                if (emitImport(2, *import))
+                    returnFromFunction(2, arm ? Return{Register{30}} : Return{StackTop{}});
+                else
+                    trap(2, std::format("unsupported guest import {} called through a pointer", importName(*import)));
+                body += "    end\n";
+                bodies += body;
+            }
+            if (!emitted && i == pending.size())
+                break;
         }
 
         const auto argumentRegs = argumentRegisters(arm, convention);
@@ -87,25 +108,17 @@ public:
         if (arm && features.calls)
             reg(30);
         std::string source = std::format("    local args = readArguments({}, ...)\n", argCount);
-        if (needsMemory || features.stack)
-            source += std::format("    resetMemory({})\n", features.stack);
+        if (needsMemory || features.stack || !initializers.empty())
+            source += std::format("    resetMemory({})\n", features.stack || !initializers.empty());
         if (usesBudget)
-            source += data.regions.empty() ? "    local budget = 1000000\n" : "    local budget = 40000000\n";
+            source += std::format("    local budget = {}\n", program.instructionLimit ? program.instructionLimit :
+                std::uint64_t(1) << 53);
         if (usesDirection)
             source += "    local direction = 1\n";
         if (usesFloatingControl)
             source += "    local mxcsr, x87Control = 0x1f80, 0x037f\n";
-        if (usesExceptionFilter)
-            source += "    local exceptionFilterLo, exceptionFilterHi = 0, 0\n";
-        if (usesLastError)
-            source += "    local lastError = 0\n";
-        if (usesFiberSlots)
-            source += "    local fiberSlots: {[number]: {lo: number, hi: number, callbackLo: number, callbackHi: number}?} = {}\n"
-                "    local fiberNext = 0\n";
         if (needsJumpFrames)
             source += "    local jumpFrames: JumpFrames = {}\n";
-        if (usesExitCallbacks)
-            source += "    local exitCallbacks: {() -> ()} = {}\n";
         for (const auto index : registers) {
             const auto cell = reg(index);
             if (features.stack && index == (arm ? 31u : 4u)) {
@@ -138,14 +151,21 @@ public:
         } else {
             for (const auto target : pending)
                 source += std::format("    local {}: GuestRoutine\n", functionName(target));
+            for (const auto token : importRoutines)
+                source += std::format("    local {}: GuestRoutine\n", functionName(token));
         }
         if (usesFunctionPointers)
             source += "    local functionPointers: {[number]: GuestRoutine?} = {}\n";
         source += bodies;
-        if (usesFunctionPointers)
+        if (usesFunctionPointers) {
             for (const auto target : addressTaken)
                 source += std::format("    functionPointers[{}] = {}\n", target, routine(target));
+            for (const auto token : importRoutines)
+                source += std::format("    functionPointers[{}] = {}\n", token, routine(token));
+        }
         if (!initializers.empty()) {
+            // Static constructors run once per module, before the first export call.
+            source += "    if not process.initialized then\n        process.initialized = true\n";
             const unsigned stackRegister = arm ? 31 : 4;
             const auto sp = reg(stackRegister);
             for (const auto pc : initializers) {
@@ -182,23 +202,32 @@ public:
                 source += "    carry, overflow, negative, zero, parity = false, false, false, false, false\n";
             if (usesDirection)
                 source += "    direction = 1\n";
+            source += "    end\n";
         }
-        if (features.stack && !arm) {
+        if (isProgram()) {
+            needsProcess = true;
+            source += "    local argc, argv, envp = processArguments()\n";
+            const auto args = argumentRegs;
+            if (program.startup == Startup::ElfStack) {
+                // _start finds argc, argv, and envp on the initial stack and never returns.
+                const auto sp = reg(arm ? 31 : 4);
+                source += std::format("    {} = processStack(stackTop, argc, argv, envp), 0\n", sp.pair());
+                source += std::format("    {} = 0, 0\n", reg(arm ? 0 : 2).pair());
+            } else if (program.startup == Startup::MainArguments) {
+                source += std::format("    {} = argc, 0\n    {} = argv, 0\n    {} = envp, 0\n    {} = envp, 0\n",
+                    reg(args[0]).pair(), reg(args[1]).pair(), reg(args[2]).pair(), reg(args[3]).pair());
+            }
+        }
+        if (features.stack && !arm && program.startup != Startup::ElfStack) {
             const auto sp = reg(4);
             const unsigned frameSize = 8 + shadowSpace;
             source += std::format("    {} -= {}\n    write(8, {}, 4294967295, 0)\n", sp.lo, frameSize, sp.lo);
         }
         source += std::format("    runGuestRoutine({}, 4294967295)\n", routine(entry));
-        if (usesExitCallbacks) {
-            source += std::format("    local result = {{lo = {}, hi = {}}}\n", result.lo, result.hi);
-            source += "    while #exitCallbacks > 0 do\n"
-                "        local callback = table.remove(exitCallbacks)\n"
-                "        if callback then callback() end\n"
-                "    end\n"
-                "    return result\n";
-        } else {
-            source += std::format("    return {{lo = {}, hi = {}}}\n", result.lo, result.hi);
-        }
+        if (isProgram())
+            source += std::format("    exitProcess({}, true)\n", result.lo);
+        // Exit callbacks registered with __cxa_atexit stay queued until the guest process exits.
+        source += std::format("    return {{lo = {}, hi = {}}}\n", result.lo, result.hi);
         return source;
     }
 
@@ -213,6 +242,9 @@ public:
     bool usesPrime() const { return needsPrime; }
     bool usesDecimal() const { return needsDecimal; }
     bool usesJumpFrames() const { return needsJumpFrames; }
+    bool usesVector() const { return needsVector; }
+    bool usesProcess() const { return needsProcess; }
+    bool usesX87() const { return needsX87; }
 
 private:
     const Graph& graph;
@@ -222,8 +254,17 @@ private:
     bool arm;
     CallingConvention convention;
     std::span<const std::size_t> initializers;
+    const ProgramOptions& program;
     const LoopExits& loops;
     Features features;
+
+    static Features withProgramStack(Features features, const ProgramOptions& program) {
+        if (program.startup != Startup::Library)
+            features.stack = features.calls = true;
+        return features;
+    }
+
+    bool isProgram() const { return program.startup != Startup::Library; }
     std::set<Address> flagsAtEntry;
     bool useRoutineTable;
     bool needsMemory = false;
@@ -237,6 +278,10 @@ private:
     bool needsDecimal = false;
     bool needsAddFlags = false;
     bool needsJumpFrames = false;
+    bool needsVector = false;
+    bool needsProcess = false;
+    bool needsX87 = false;
+    bool tailCall = false;
     bool usesFunctionPointers = false;
     bool usesExitCallbacks = false;
     bool usesBudget = false;
@@ -334,9 +379,10 @@ private:
         if (const auto known = knownAddress(addr, constants); known && *known < data.image.size()) {
             if (const auto word = data.immutableWord(*known, size))
                 return size == 8 ? wordLiteral(*word).pair() : std::to_string(std::uint32_t(*word));
-            if (!data.readable(*known, size) || data.unresolved(*known, size))
+            if ((!data.readable(*known, size) && !data.materialized(*known)) || data.unresolved(*known, size))
                 return std::format("error({}, 0)", quoted(memoryError(*known, size)));
-            data.materialize(*known, size);
+            if (data.readable(*known, size))
+                data.materialize(*known, size);
         }
         needsMemory = true;
         const auto expression = std::format("read({}, address({}))", size, addressPair(addr, constants));
@@ -352,7 +398,7 @@ private:
                 needsMemory = true;
                 return std::format("readXmm(address({}), true)", addressPair(mem.address, constants));
             }
-            if (!data.readable(*at, 16) || data.unresolved(*at, 16)) {
+            if ((!data.readable(*at, 16) && !data.materialized(*at)) || data.unresolved(*at, 16)) {
                 trap(depth, memoryError(*at, 16));
                 return std::nullopt;
             }
@@ -370,6 +416,22 @@ private:
         }
         needsMemory = true;
         return std::format("readXmm(address({}), {})", addressPair(mem.address, constants), mem.aligned);
+    }
+
+    // Returns the lanes of a vector operand. Memory operands load into locals named prefix0..prefix3, so
+    // callers must open a block first.
+    std::optional<Lanes> operandLanes(unsigned depth, const VectorOperand& operand, const Constants& constants,
+        std::string_view prefix) {
+        if (const auto* reg = std::get_if<VectorRegister>(&operand))
+            return xmm(*reg);
+        const auto source = readVector(depth, operand, constants);
+        if (!source)
+            return std::nullopt;
+        Lanes lanes;
+        for (unsigned i = 0; i < lanes.size(); ++i)
+            lanes[i] = std::format("{}{}", prefix, i);
+        line(depth, "local " + joinLanes(lanes) + " = " + *source);
+        return lanes;
     }
 
     bool prepareWrite(unsigned depth, const EffectiveAddress& addr, unsigned size, const Constants& constants) {
@@ -459,7 +521,7 @@ private:
         } else if (binary.op != VectorOp::UnpackLowQwords) {
             const auto name = binary.op == VectorOp::Xor ? "bxor" : binary.op == VectorOp::Or ? "bor" : "band";
             for (unsigned lane = 0; lane < result.size(); ++lane) {
-                const auto lhs = binary.op == VectorOp::AndNot ? "bit32.bnot(" + dst[lane] + ")" : dst[lane];
+                const auto lhs = binary.op == VectorOp::AndNot ? "bit32.bnot(" + lhsLanes[lane] + ")" : lhsLanes[lane];
                 result[lane] = std::format("bit32.{}({}, {})", name, lhs, rhs[lane]);
             }
         }
@@ -556,10 +618,12 @@ private:
         }
     }
 
-    void stackPush(unsigned depth, const LuauWord& word) {
+    void stackPush(unsigned depth, const LuauWord& word) { stackPush(depth, word.pair()); }
+
+    void stackPush(unsigned depth, const std::string& word) {
         const auto sp = reg(4);
         line(depth, "do");
-        line(depth + 1, "local valueLo, valueHi = " + word.pair());
+        line(depth + 1, "local valueLo, valueHi = " + word);
         line(depth + 1, std::format("{} = offset({}, -8)", sp.pair(), sp.pair()));
         line(depth + 1, std::format("write(8, address({}), valueLo, valueHi)", sp.pair()));
         line(depth, "end");
@@ -693,7 +757,9 @@ private:
         line(depth, "end");
     }
 
-    void effects(unsigned depth, const Block& block, Constants& constants) {
+    void effects(unsigned depth, Address pc, const Block& block, Constants& constants) {
+        if (program.trace)
+            line(depth, std::format("guestTrace[guestTraceAt] = {}; guestTraceAt = guestTraceAt % 32 + 1", pc));
         std::set<const Effect*> liveWrites;
         if (features.flags) {
             bool live = observesExitFlags(block, features.calls);
@@ -711,6 +777,14 @@ private:
             std::visit(Visit{
                 [](const Nop&) {},
                 [&](const Move& move) {
+                    if (const auto* import = importSlot(move.src, constants); import && move.size == 8 && move.dst != Zero) {
+                        // Loading an import's address yields a placeholder that a later indirect call resolves.
+                        const auto token = ImportToken + import->start;
+                        importTokens.emplace(Address(token), import);
+                        assign(depth, move.dst, 8, wordLiteral(token).pair());
+                        constants[move.dst] = token;
+                        return;
+                    }
                     const bool pop = std::holds_alternative<StackTop>(move.src);
                     if (pop) {
                         line(depth, "do");
@@ -869,8 +943,8 @@ private:
                     needsDivision = true;
                     const auto quotient = reg(0);
                     const auto remainder = reg(2);
-                    line(depth, std::format("{}, {} = unsignedDivide({}, {}, {}, {})", quotient.pair(), remainder.pair(),
-                        div.size, quotient.pair(), remainder.pair(),
+                    line(depth, std::format("{}, {} = {}({}, {}, {}, {})", quotient.pair(), remainder.pair(),
+                        div.sign ? "signedDivide" : "unsignedDivide", div.size, quotient.pair(), remainder.pair(),
                         value(div.divisor, div.size, constants) + (div.size == 4 ? ", 0" : "")));
                     constants[0].reset();
                     constants[2].reset();
@@ -1028,7 +1102,7 @@ private:
                     line(depth, "end");
                 },
                 [&](const Push& push) {
-                    stackPush(depth, reg(push.src.index));
+                    stackPush(depth, value(push.src, 8, constants));
                     constants[4].reset();
                 },
                 [&](const KeepBits& keep) {
@@ -1129,6 +1203,11 @@ private:
                             unsigned(shift.op), shift.size, input));
                         if (setFlags && features.parity && !rotate)
                             line(depth + 2, "parity = evenParity(" + dst.lo + ")");
+                        if (shift.size == 4 && !arm) {
+                            // A 32-bit operation still zero-extends its destination when the count is zero.
+                            line(depth + 1, "else");
+                            line(depth + 2, std::format("{}, {} = {}, 0", dst.lo, dst.hi, reg(shift.src.index).lo));
+                        }
                         line(depth + 1, "end");
                         line(depth, "end");
                     } else {
@@ -1159,6 +1238,41 @@ private:
                     assign(depth, op.dst, op.size, result);
                     constants[op.dst].reset();
                 },
+                [&](const X87& op) {
+                    needsX87 = true;
+                    needsMemory = true;
+                    const auto at = op.memory ? std::format("address({})", addressPair(*op.memory, constants)) :
+                        std::string("0");
+                    const auto call = std::format("x87Execute({}, {}, {})", op.opcode, op.modrm, at);
+                    const bool compareFlags = !op.memory && (op.opcode == 0xdb || op.opcode == 0xdf) &&
+                        op.modrm >= 0xe8 && op.modrm < 0xf8;
+                    const bool conditional = !op.memory && (op.opcode == 0xda || op.opcode == 0xdb) && op.modrm < 0xe0;
+                    if (compareFlags) {
+                        if (setFlags) {
+                            line(depth, "zero, parity, carry = " + call);
+                            line(depth, "overflow, negative = false, false");
+                        } else {
+                            line(depth, call);
+                        }
+                    } else if (!op.memory && op.opcode == 0xdf && op.modrm == 0xe0) {
+                        line(depth, std::format("{0} = bit32.replace({0}, {1}, 0, 16)", reg(0).lo, call));
+                        constants[0].reset();
+                    } else if (conditional) {
+                        // FCMOVcc tests CF, ZF, and PF like the unsigned integer conditions.
+                        constexpr std::array<std::string_view, 4> tests{"carry", "zero", "carry or zero", "parity"};
+                        const auto test = std::string(tests[(op.modrm >> 3) & 3]);
+                        line(depth, std::format("if {}({}) then {} end", op.opcode == 0xdb ? "not " : "", test, call));
+                    } else {
+                        line(depth, call);
+                    }
+                },
+                [&](const DoubleShift& op) {
+                    needsShift = true;
+                    const auto dst = reg(op.dst);
+                    assign(depth, op.dst, 8, std::format("doubleShift({}, {}, {}, {}, {})", op.left, op.size,
+                        reg(1).lo, dst.pair(), reg(op.src.index).pair()));
+                    constants[op.dst].reset();
+                },
                 [&](const Bitfield& field) {
                     if (field.dst == Zero)
                         return;
@@ -1182,11 +1296,42 @@ private:
                     constants[field.dst].reset();
                 },
                 [&](const BitScan& scan) {
-                    if (scan.dst == Zero)
+                    if (scan.dst == Zero && !setFlags)
                         return;
                     line(depth, "do");
                     const auto input = value(scan.src, scan.size, constants);
                     line(depth + 1, scan.size == 8 ? "local lo, hi = " + input : "local lo, hi = " + input + ", 0");
+                    if (scan.population || scan.counts) {
+                        if (scan.population) {
+                            needsShift = true;
+                            line(depth + 1, "local count = sumBytes(populationByByte(lo)) + sumBytes(populationByByte(hi))");
+                        } else if (scan.reverse) {
+                            line(depth + 1, scan.size == 8 ? "local count = if hi ~= 0 then bit32.countlz(hi) else 32 + bit32.countlz(lo)"
+                                                           : "local count = bit32.countlz(lo)");
+                        } else {
+                            line(depth + 1, scan.size == 8 ? "local count = if lo ~= 0 then bit32.countrz(lo) else 32 + bit32.countrz(hi)"
+                                                           : "local count = bit32.countrz(lo)");
+                        }
+                        if (setFlags) {
+                            if (scan.population)
+                                line(depth + 1, "carry, overflow, negative, zero = false, false, false, count == 0");
+                            else
+                                line(depth + 1, "carry, zero = lo == 0 and hi == 0, count == 0");
+                            if (features.parity)
+                                line(depth + 1, scan.population ? "parity = false" : "parity = parity");
+                        }
+                        if (scan.dst != Zero)
+                            assign(depth + 1, scan.dst, 4, "count");
+                        line(depth, "end");
+                        if (scan.dst != Zero)
+                            constants[scan.dst].reset();
+                        return;
+                    }
+                    if (scan.dst == Zero) {
+                        line(depth + 1, "zero = lo == 0 and hi == 0");
+                        line(depth, "end");
+                        return;
+                    }
                     if (scan.leadingCount) {
                         assign(depth + 1, scan.dst, 4, scan.size == 8 ?
                             "if hi ~= 0 then bit32.countlz(hi) else 32 + bit32.countlz(lo)" : "bit32.countlz(lo)");
@@ -1260,6 +1405,71 @@ private:
                     constants[1] = 0;
                     constants[7].reset();
                 },
+                [&](const StringMove& move) {
+                    usesDirection = true;
+                    needsMemory = true;
+                    const auto source = reg(6);
+                    const auto target = reg(7);
+                    const auto count = reg(1);
+                    const auto step = std::format("direction * {}", move.size);
+                    if (move.repeat) {
+                        usesBudget = true;
+                        line(depth, std::format("if {} ~= 0 or {} > budget then error(\"guest instruction limit exceeded\", 0) end",
+                            count.hi, count.lo));
+                        line(depth, "budget -= " + count.lo);
+                        line(depth, "if " + count.lo + " > 0 then");
+                        // Forward copies of non-overlapping ranges become one buffer copy.
+                        line(depth + 1, std::format("local from, to = address({}), address({})", source.pair(), target.pair()));
+                        line(depth + 1, std::format("local bytes = {} * {}", count.lo, move.size));
+                        line(depth + 1, "if direction == 1 and (to + bytes <= from or from + bytes <= to) then");
+                        line(depth + 2, "copyMemory(to, 0, from, 0, bytes, 0)");
+                        line(depth + 2, std::format("{} = offset({}, bytes)", source.pair(), source.pair()));
+                        line(depth + 2, std::format("{} = offset({}, bytes)", target.pair(), target.pair()));
+                        line(depth + 1, "else");
+                        line(depth + 2, "for _ = 1, " + count.lo + " do");
+                        line(depth + 3, std::format("write({}, address({}), read({}, address({})))", move.size, target.pair(),
+                            move.size, source.pair()));
+                        line(depth + 3, std::format("{} = offset({}, {})", source.pair(), source.pair(), step));
+                        line(depth + 3, std::format("{} = offset({}, {})", target.pair(), target.pair(), step));
+                        line(depth + 2, "end");
+                        line(depth + 1, "end");
+                        line(depth, "end");
+                        line(depth, count.pair() + " = 0, 0");
+                        constants[1] = 0;
+                    } else {
+                        line(depth, std::format("write({}, address({}), read({}, address({})))", move.size, target.pair(),
+                            move.size, source.pair()));
+                        line(depth, std::format("{} = offset({}, {})", source.pair(), source.pair(), step));
+                        line(depth, std::format("{} = offset({}, {})", target.pair(), target.pair(), step));
+                    }
+                    constants[6].reset();
+                    constants[7].reset();
+                },
+                [&](const CompareExchange& exchange) {
+                    if (!prepareWrite(depth, exchange.address, exchange.size, constants))
+                        return;
+                    needsAddFlags = true;
+                    const auto accumulator = reg(0);
+                    const auto source = reg(exchange.src.index);
+                    line(depth, "do");
+                    line(depth + 1, "local at = address(" + addressPair(exchange.address, constants) + ")");
+                    line(depth + 1, std::format("local oldLo, oldHi = read({}, at)", exchange.size));
+                    line(depth + 1, std::format("local _, _, c, o, n, z = addFlags(true, false, {}, {}, oldLo, oldHi)",
+                        exchange.size, exchange.size == 8 ? accumulator.pair() : accumulator.lo + ", 0"));
+                    if (setFlags) {
+                        line(depth + 1, "carry, overflow, negative, zero = c, o, n, z");
+                        if (features.parity)
+                            line(depth + 1, std::format("parity = evenParity(({} - oldLo) % 256)", accumulator.lo));
+                    }
+                    line(depth + 1, "if z then");
+                    line(depth + 2, std::format("write({}, at, {})", exchange.size,
+                        exchange.size == 8 ? source.pair() : source.lo + ", 0"));
+                    line(depth + 1, "else");
+                    assign(depth + 2, 0, exchange.size, exchange.size == 8 ? "oldLo, oldHi" : "oldLo");
+                    line(depth + 1, "end");
+                    line(depth, "end");
+                    constants[0].reset();
+                },
                 [&](const CpuId&) {
                     const auto a = reg(0);
                     const auto b = reg(3);
@@ -1323,10 +1533,12 @@ private:
                         std::string source;
                         if (const auto* src = std::get_if<VectorRegister>(&move.src)) {
                             const auto lanes = xmm(*src);
-                            source = lanes[0] + ", " + (move.size == 8 ? lanes[1] : "0");
+                            const auto low = move.size >= 4 ? lanes[0] :
+                                std::format("bit32.extract({}, 0, {})", lanes[0], move.size * 8);
+                            source = low + ", " + (move.size == 8 ? lanes[1] : "0");
                         } else {
                             source = read(std::get<VectorMemory>(move.src).address, move.size, constants);
-                            if (move.size == 4)
+                            if (move.size < 8)
                                 source += ", 0";
                         }
                         if (const auto* dst = std::get_if<VectorRegister>(&move.dst)) {
@@ -1362,19 +1574,29 @@ private:
                 [&](const VectorTransfer& transfer) {
                     const auto lanes = xmm(transfer.xmm);
                     const auto gp = reg(transfer.gp.index);
+                    const auto bits = transfer.size * 8;
+                    const auto offset = transfer.lane.value_or(0) * bits;
                     if (transfer.lane && transfer.toXmm) {
-                        const auto first = *transfer.lane * (transfer.size / 4);
+                        const auto first = offset / 32;
                         if (transfer.size == 8)
                             line(depth, lanes[first] + ", " + lanes[first + 1] + " = " + gp.pair());
-                        else
+                        else if (transfer.size == 4)
                             line(depth, lanes[first] + " = " + gp.lo);
+                        else
+                            line(depth, std::format("{0} = bit32.replace({0}, {1}, {2}, {3})", lanes[first], gp.lo,
+                                offset % 32, bits));
                     } else if (transfer.toXmm) {
                         const auto words = transfer.size == 8 ? gp.pair() : gp.lo + ", 0";
                         line(depth, joinLanes(lanes) + " = " + words + ", 0, 0");
                     } else if (transfer.lane && transfer.gp.index != Zero) {
-                        const auto lane = *transfer.lane;
-                        assign(depth, transfer.gp.index, 4,
-                            std::format("bit32.extract({}, {}, 16)", lanes[lane / 2], (lane % 2) * 16));
+                        const auto first = offset / 32;
+                        if (transfer.size == 8)
+                            assign(depth, transfer.gp.index, 8, lanes[first] + ", " + lanes[first + 1]);
+                        else if (transfer.size == 4)
+                            assign(depth, transfer.gp.index, 4, lanes[first]);
+                        else
+                            assign(depth, transfer.gp.index, 4,
+                                std::format("bit32.extract({}, {}, {})", lanes[first], offset % 32, bits));
                         constants[transfer.gp.index].reset();
                     } else if (transfer.gp.index != Zero) {
                         assign(depth, transfer.gp.index, transfer.size,
@@ -1508,7 +1730,7 @@ private:
                         return;
                     }
                     line(depth, "do");
-                    line(depth + 1, "local lhs = " + floatOperand(op.dst, op.size, constants));
+                    line(depth + 1, "local lhs = " + floatOperand(op.lhs.value_or(op.dst), op.size, constants));
                     line(depth + 1, "local rhs = " + rhs);
                     if (op.op == FloatOp::Min || op.op == FloatOp::Max) {
                         const auto comparison = op.op == FloatOp::Min ? '<' : '>';
@@ -1555,14 +1777,21 @@ private:
                 [&](const IntegerToFloat& op) {
                     needsFloating = true;
                     const auto words = value(op.src, op.integerSize, constants) + (op.integerSize == 4 ? ", 0" : "");
-                    writeFloat(depth, op.dst, op.size, std::format("integerAsFloat({}, {}, {}, {})",
-                        op.integerSize, op.size, op.sign, words));
+                    auto converted = std::format("integerAsFloat({}, {}, {}, {})", op.integerSize, op.size, op.sign, words);
+                    if (op.fractionBits)
+                        converted = std::format("{} / {}", converted, std::uint64_t(1) << op.fractionBits);
+                    writeFloat(depth, op.dst, op.size, converted);
                 },
                 [&](const FloatToInteger& op) {
                     needsFloating = true;
                     auto input = floatOperand(op.src, op.floatSize, constants);
+                    if (op.fractionBits)
+                        input = std::format("{} * {}", input, std::uint64_t(1) << op.fractionBits);
+                    if (op.rounding == Rounding::NearestEven || op.rounding == Rounding::Away)
+                        needsVector = true;
                     if (op.rounding != Rounding::Truncate)
-                        input = std::string(op.rounding == Rounding::Up ? "math.ceil(" : "math.floor(") + input + ")";
+                        input = std::string(op.rounding == Rounding::Up ? "math.ceil(" : op.rounding == Rounding::Down ?
+                            "math.floor(" : op.rounding == Rounding::NearestEven ? "roundEven(" : "roundAway(") + input + ")";
                     assign(depth, op.dst, 8, std::format("truncateFloat({}, {}, {}, {})", op.size, arm, op.sign,
                         input));
                     constants[op.dst].reset();
@@ -1578,6 +1807,268 @@ private:
                         line(depth, std::format("write({}, address({}), {}, 0)", control.size,
                             addressPair(control.address, constants), cell));
                     }
+                },
+                [&](const VectorLanes& op) {
+                    needsVector = true;
+                    line(depth, "do");
+                    if (const auto rhs = operandLanes(depth + 1, op.rhs, constants, "rhs")) {
+                        const auto lhs = op.lhs ? xmm(*op.lhs) : xmm(op.dst);
+                        line(depth + 1, std::format("{} = laneOperation({}, {}, {}, {}, {})", joinLanes(xmm(op.dst)),
+                            unsigned(op.op), op.element, op.size, joinLanes(lhs), joinLanes(*rhs)));
+                    }
+                    line(depth, "end");
+                },
+                [&](const VectorFloatLanes& op) {
+                    needsVector = true;
+                    line(depth, "do");
+                    if (auto rhs = operandLanes(depth + 1, op.rhs, constants, "rhs")) {
+                        if (op.rhsLane) {
+                            const auto source = *rhs;
+                            for (unsigned i = 0; i < 4; ++i)
+                                (*rhs)[i] = op.element == 4 ? source[*op.rhsLane] : source[*op.rhsLane * 2 + i % 2];
+                        }
+                        const auto lhs = op.lhs ? xmm(*op.lhs) : xmm(op.dst);
+                        line(depth + 1, std::format("{} = vectorFloatLanes({}, {}, {}, {}, {})", joinLanes(xmm(op.dst)),
+                            unsigned(op.op), op.element, op.size, joinLanes(lhs), joinLanes(*rhs)));
+                    }
+                    line(depth, "end");
+                },
+                [&](const VectorShiftLanes& op) {
+                    needsVector = true;
+                    line(depth, "do");
+                    std::string count = std::to_string(op.count);
+                    if (op.countOperand) {
+                        const auto lanes = operandLanes(depth + 1, *op.countOperand, constants, "count");
+                        if (!lanes) {
+                            line(depth, "end");
+                            return;
+                        }
+                        count = std::format("if {} ~= 0 or {} > 255 then 255 else {}", (*lanes)[1], (*lanes)[0], (*lanes)[0]);
+                    }
+                    line(depth + 1, std::format("{} = vectorShift({}, {}, {}, {}, {})", joinLanes(xmm(op.dst)),
+                        unsigned(op.op), op.element, op.size, count, joinLanes(xmm(op.src))));
+                    line(depth, "end");
+                },
+                [&](const VectorPermute& op) {
+                    line(depth, "do");
+                    const auto first = operandLanes(depth + 1, op.first, constants, "first");
+                    const auto second = first ? operandLanes(depth + 1, op.second, constants, "second") : std::nullopt;
+                    if (first && second) {
+                        const auto previous = xmm(op.dst);
+                        const auto source = [&](unsigned index) -> const Lanes& {
+                            return index < 16 ? *first : index < 32 ? *second : previous;
+                        };
+                        Lanes result;
+                        for (unsigned lane = 0; lane < 4; ++lane) {
+                            const auto* bytes = &op.bytes[lane * 4];
+                            const auto start = bytes[0];
+                            const bool whole = start != 255 && start % 4 == 0 && bytes[1] == start + 1 &&
+                                bytes[2] == start + 2 && bytes[3] == start + 3;
+                            if (whole) {
+                                result[lane] = source(start)[(start % 16) / 4];
+                                continue;
+                            }
+                            std::vector<std::string> parts;
+                            for (unsigned k = 0; k < 4;) {
+                                const auto index = bytes[k];
+                                if (index == 255) {
+                                    ++k;
+                                    continue;
+                                }
+                                const auto& word = source(index)[(index % 16) / 4];
+                                const bool half = k % 2 == 0 && index % 2 == 0 && bytes[k + 1] == index + 1;
+                                const auto width = half ? 16u : 8u;
+                                auto part = std::format("bit32.extract({}, {}, {})", word, (index % 4) * 8, width);
+                                if (k)
+                                    part = std::format("bit32.lshift({}, {})", part, k * 8);
+                                parts.push_back(part);
+                                k += half ? 2 : 1;
+                            }
+                            if (parts.empty())
+                                result[lane] = "0";
+                            else if (parts.size() == 1)
+                                result[lane] = parts.front();
+                            else {
+                                result[lane] = "bit32.bor(" + parts.front();
+                                for (std::size_t i = 1; i < parts.size(); ++i)
+                                    result[lane] += ", " + parts[i];
+                                result[lane] += ")";
+                            }
+                        }
+                        line(depth + 1, joinLanes(previous) + " = " + joinLanes(result));
+                    }
+                    line(depth, "end");
+                },
+                [&](const VectorConvert& op) {
+                    needsVector = true;
+                    line(depth, "do");
+                    if (const auto src = operandLanes(depth + 1, op.src, constants, "source")) {
+                        const auto dst = xmm(op.dst);
+                        line(depth + 1, std::format("{} = vectorConvert({}, {}, {}, {}, {}, {}, {})", joinLanes(dst),
+                            unsigned(op.kind), op.element, op.upper, op.shift, op.size, joinLanes(dst), joinLanes(*src)));
+                    }
+                    line(depth, "end");
+                },
+                [&](const VectorReduce& op) {
+                    needsVector = true;
+                    const auto call = std::format("vectorReduce({}, {}, {}, {})", unsigned(op.op), op.element, op.size,
+                        joinLanes(xmm(op.src)));
+                    if (op.op == ReduceOp::SignMask) {
+                        if (op.gp != Zero) {
+                            assign(depth, op.gp, 4, "(" + call + ")");
+                            constants[op.gp].reset();
+                        }
+                    } else {
+                        const auto dst = xmm(op.dst);
+                        line(depth, "do");
+                        line(depth + 1, "local lo, hi = " + call);
+                        line(depth + 1, joinLanes(dst) + " = lo, hi, 0, 0");
+                        line(depth, "end");
+                    }
+                },
+                [&](const VectorBlend& op) {
+                    line(depth, "do");
+                    const auto yes = operandLanes(depth + 1, op.yes, constants, "yes");
+                    const auto no = yes ? operandLanes(depth + 1, op.no, constants, "no") : std::nullopt;
+                    if (yes && no) {
+                        const auto mask = xmm(op.mask);
+                        Lanes result;
+                        for (unsigned lane = 0; lane < 4; ++lane) {
+                            auto bits = mask[lane];
+                            if (op.laneSign) {
+                                const auto top = op.element == 8 ? mask[lane | 1] : mask[lane];
+                                bits = "(if " + top + " >= 2147483648 then 4294967295 else 0)";
+                            }
+                            result[lane] = std::format("bit32.bor(bit32.band({0}, {1}), bit32.band(bit32.bnot({0}), {2}))",
+                                bits, (*yes)[lane], (*no)[lane]);
+                        }
+                        line(depth + 1, joinLanes(xmm(op.dst)) + " = " + joinLanes(result));
+                    }
+                    line(depth, "end");
+                },
+                [&](const ScalarFloat& op) {
+                    const auto dst = xmm(op.dst);
+                    line(depth, "do");
+                    const auto src = operandLanes(depth + 1, op.src, constants, "source");
+                    if (!src) {
+                        line(depth, "end");
+                        return;
+                    }
+                    const auto top = op.size == 8 ? 1u : 0u;
+                    if (op.op == ScalarFloatOp::Negate) {
+                        if (op.size == 8)
+                            line(depth + 1, std::format("{}, {} = {}, bit32.bxor({}, 0x80000000)", dst[0], dst[1], (*src)[0], (*src)[1]));
+                        else
+                            line(depth + 1, std::format("{} = bit32.bxor({}, 0x80000000)", dst[0], (*src)[0]));
+                    } else {
+                        needsFloating = true;
+                        needsVector = true;
+                        const auto value = std::format("decodeFloat({}, {}, {})", op.size, (*src)[0], op.size == 8 ? (*src)[1] : "0");
+                        const auto lhs = op.lhs ? xmm(*op.lhs) : dst;
+                        const auto other = std::format("decodeFloat({}, {}, {})", op.size, lhs[0], op.size == 8 ? lhs[1] : "0");
+                        std::string result;
+                        switch (op.op) {
+                            case ScalarFloatOp::RoundNearestEven: result = "roundEven(" + value + ")"; break;
+                            case ScalarFloatOp::RoundAway: result = "roundAway(" + value + ")"; break;
+                            case ScalarFloatOp::Floor: result = "math.floor(" + value + ")"; break;
+                            case ScalarFloatOp::Ceil: result = "math.ceil(" + value + ")"; break;
+                            case ScalarFloatOp::Truncate: result = "roundTruncate(" + value + ")"; break;
+                            case ScalarFloatOp::NegateMultiply: result = "-(" + other + " * " + value + ")"; break;
+                            default:
+                                result = std::format("scalarMinMax({}, {}, {})", unsigned(op.op) - unsigned(ScalarFloatOp::MinNumber),
+                                    other, value);
+                                break;
+                        }
+                        const auto fields = op.size == 8 ? dst[0] + ", " + dst[1] : dst[0];
+                        line(depth + 1, std::format("{} = encodeFloat({}, {})", fields, op.size, result));
+                    }
+                    if (op.clearUpper) {
+                        for (unsigned lane = top + 1; lane < 4; ++lane)
+                            line(depth + 1, dst[lane] + " = 0");
+                    }
+                    line(depth, "end");
+                },
+                [&](const FusedMultiply& op) {
+                    needsFloating = true;
+                    const auto lanes = [&](VectorRegister reg) {
+                        const auto words = xmm(reg);
+                        return std::format("decodeFloat({}, {}, {})", op.size, words[0], op.size == 8 ? words[1] : "0");
+                    };
+                    const auto dst = xmm(op.dst);
+                    const auto fields = op.size == 8 ? dst[0] + ", " + dst[1] : dst[0];
+                    line(depth, std::format("{} = encodeFloat({}, {}{} * {} {} {})", fields, op.size, op.negateProduct ? "-" : "",
+                        lanes(op.a), lanes(op.b), op.negateAddend ? '-' : '+', lanes(op.c)));
+                    if (op.clearUpper)
+                        for (unsigned lane = op.size == 8 ? 2 : 1; lane < 4; ++lane)
+                            line(depth, dst[lane] + " = 0");
+                },
+                [&](const FloatSelect& op) {
+                    const auto dst = xmm(op.dst);
+                    const auto yes = xmm(op.yes);
+                    const auto no = xmm(op.no);
+                    const auto count = op.size == 8 ? 2u : 1u;
+                    std::string chosen;
+                    for (unsigned lane = 0; lane < 4; ++lane) {
+                        if (lane)
+                            chosen += ", ";
+                        chosen += lane < count ? std::format("if {} then {} else {}", ArmConditions[op.condition], yes[lane], no[lane]) : "0";
+                    }
+                    line(depth, joinLanes(dst) + " = " + chosen);
+                },
+                [&](const FloatConditionalCompare& op) {
+                    if (!setFlags)
+                        return;
+                    needsFloating = true;
+                    line(depth, std::format("if {} then", ArmConditions[op.condition]));
+                    line(depth + 1, "local lhs = " + floatOperand(op.lhs, op.size, constants));
+                    line(depth + 1, "local rhs = " + (op.rhs ? floatOperand(*op.rhs, op.size, constants) : std::string("0")));
+                    line(depth + 1, "carry, zero, overflow, negative = not (lhs < rhs), lhs == rhs, lhs ~= lhs or rhs ~= rhs, lhs < rhs");
+                    line(depth, "else");
+                    line(depth + 1, std::format("carry, overflow, negative, zero = {}, {}, {}, {}",
+                        bool(op.otherwise & 2), bool(op.otherwise & 1), bool(op.otherwise & 8), bool(op.otherwise & 4)));
+                    line(depth, "end");
+                },
+                [&](const VectorLaneMove& op) {
+                    const auto dst = xmm(op.dst);
+                    const auto src = xmm(op.src);
+                    if (op.element >= 4) {
+                        const auto words = op.element / 4;
+                        for (unsigned i = 0; i < words; ++i)
+                            line(depth, std::format("{} = {}", dst[op.dstLane * words + i], src[op.srcLane * words + i]));
+                        return;
+                    }
+                    const auto bits = op.element * 8;
+                    const auto from = op.srcLane * bits;
+                    const auto to = op.dstLane * bits;
+                    line(depth, std::format("{0} = bit32.replace({0}, bit32.extract({1}, {2}, {3}), {4}, {3})", dst[to / 32],
+                        src[from / 32], from % 32, bits, to % 32));
+                },
+                [&](const VectorLaneLoad& op) {
+                    const auto dst = xmm(op.dst);
+                    const auto value = read(op.address, op.element, constants);
+                    line(depth, "do");
+                    if (op.element == 8)
+                        line(depth + 1, "local lo, hi = " + value);
+                    else
+                        line(depth + 1, "local lo, hi = " + value + ", 0");
+                    if (op.replicate) {
+                        Lanes result{"0", "0", "0", "0"};
+                        for (unsigned lane = 0; lane < op.size / 4; ++lane) {
+                            result[lane] = op.element == 8 ? (lane % 2 ? "hi" : "lo") : op.element == 4 ? "lo" :
+                                op.element == 2 ? "lo * 65537" : "lo * 16843009";
+                        }
+                        line(depth + 1, joinLanes(dst) + " = " + joinLanes(result));
+                    } else if (op.element >= 4) {
+                        const auto words = op.element / 4;
+                        line(depth + 1, dst[op.lane * words] + " = lo");
+                        if (words == 2)
+                            line(depth + 1, dst[op.lane * 2 + 1] + " = hi");
+                    } else {
+                        const auto bits = op.element * 8;
+                        const auto at = op.lane * bits;
+                        line(depth + 1, std::format("{0} = bit32.replace({0}, lo, {1}, {2})", dst[at / 32], at % 32, bits));
+                    }
+                    line(depth, "end");
                 },
             }, effect);
         }
@@ -1614,6 +2105,8 @@ private:
     }
 
     void tick(unsigned depth, std::size_t count) {
+        if (!program.instructionLimit)
+            return;
         usesBudget = true;
         line(depth, std::format("budget -= {}", count));
         line(depth, "if budget < 0 then error(\"guest instruction limit exceeded\", 0) end");
@@ -1698,13 +2191,13 @@ private:
                     count += part.effects.size() + part.hasTerminator;
                 }
                 tick(depth + 1, block.effects.size() + block.hasTerminator);
-                effects(depth + 1, block, loopConstants);
+                effects(depth + 1, pc, block, loopConstants);
                 const auto expression = condition(branch->condition);
                 line(depth + 1, std::format("if {} then break end", taken ? "not (" + expression + ")" : expression));
                 if (count)
                     tick(depth + 1, count);
                 for (const auto address : loop)
-                    effects(depth + 1, graph.at(address), loopConstants);
+                    effects(depth + 1, address, graph.at(address), loopConstants);
                 line(depth, "end");
                 region(exit, depth, {});
                 active.erase(pc);
@@ -1717,15 +2210,15 @@ private:
             tick(depth + 1, block.effects.size() + block.hasTerminator);
             Constants loop{};
             loop[Zero] = 0;
-            effects(depth + 1, block, loop);
+            effects(depth + 1, pc, block, loop);
             line(depth, "end");
             active.erase(pc);
             return;
         }
-        effects(depth, block, constants);
+        effects(depth, pc, block, constants);
         if (target) {
             const auto* imported = arm ? findImport(Immediate{std::uint64_t(*target)}, constants, true) : nullptr;
-            if (imported && emitImport(depth, *imported))
+            if (imported && tailImport(depth, *imported))
                 returnFromFunction(depth, Return{Register{30}});
             else
                 region(*target, depth, constants);
@@ -1738,7 +2231,8 @@ private:
         } else if (const auto* call = std::get_if<Call>(&block.end)) {
             const auto* imported = findImport(call->target, constants, true);
             const auto name = imported ? importName(*imported) : std::string_view{};
-            if (convention != CallingConvention::Microsoft && (name == "_setjmp" || name == "setjmp")) {
+            if ((convention != CallingConvention::Microsoft || (imported && runtimeLibrary(imported->library))) &&
+                (name == "_setjmp" || name == "setjmp" || name == "_setjmpex" || name == "__sigsetjmp" || name == "sigsetjmp")) {
                 emitSetjmp(depth, call->resume);
             } else if (imported && emitImport(depth, *imported)) {
                 region(call->resume, depth, {});
@@ -1749,6 +2243,8 @@ private:
                 region(call->resume, depth, {});
             } else if (emitImport(depth, call->target, constants)) {
                 region(call->resume, depth, {});
+            } else if (const auto* direct = findImport(call->target, constants)) {
+                trap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
             } else if (!imported && !addressTaken.empty() &&
                 (std::holds_alternative<Register>(call->target) || std::holds_alternative<Memory>(call->target))) {
                 emitFunctionPointer(depth, call->target, call->resume, constants);
@@ -1770,8 +2266,10 @@ private:
                 line(depth, "end");
             } else if (const auto target = resolveTarget(jump->target, constants))
                 region(*target, depth, constants);
-            else if (emitImport(depth, jump->target, constants))
+            else if (tailImport(depth, jump->target, constants))
                 returnFromFunction(depth, arm ? Return{Register{30}} : Return{StackTop{}});
+            else if (const auto* direct = findImport(jump->target, constants))
+                trap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
             else if (!addressTaken.empty() && (std::holds_alternative<Register>(jump->target) ||
                 (std::holds_alternative<Memory>(jump->target) && !findImport(jump->target, constants, true)))) {
                 includeFunctionPointers();
@@ -1899,7 +2397,30 @@ private:
         line(depth, "return nil");
     }
 
+    // Placeholder addresses for imports loaded into registers. They lie above all guest memory, and calls
+    // through them reach generated routines that perform the import.
+    static constexpr std::uint64_t ImportToken = 0xf0000000ull;
+    std::map<Address, const GuestImport*> importTokens;
+
+    const GuestImport* importSlot(const Value& source, const Constants& constants) const {
+        const auto* memory = std::get_if<Memory>(&source);
+        const auto address = memory ? knownAddress(memory->address, constants) : std::nullopt;
+        const auto* import = address ? data.unresolved(*address, 8) : nullptr;
+        if (!import || !import->callable || import->start != *address || import->size != 8)
+            return nullptr;
+        return import;
+    }
+
     const GuestImport* findImport(const Value& target, const Constants& constants, bool throughThunk = false) const {
+        if (const auto* source = std::get_if<Register>(&target)) {
+            if (const auto value = constants[source->index]; value && *value >= ImportToken &&
+                *value < ImportToken + MaxExecutableSize) {
+                const auto slot = *value - ImportToken;
+                const auto* import = data.unresolved(slot, 8);
+                if (import && import->start == slot && import->callable)
+                    return import;
+            }
+        }
         if (arm) {
             if (!throughThunk)
                 return nullptr;
@@ -1907,8 +2428,13 @@ private:
             if (!address || !graph.contains(*address))
                 return nullptr;
             const auto& block = graph.at(*address);
-            if (block.effects.size() != 2)
+            if (block.effects.size() != 2 && block.effects.size() != 3)
                 return nullptr;
+            if (block.effects.size() == 3) {
+                const auto* add = std::get_if<Binary>(&block.effects[2]);
+                if (!add || add->op != BinaryOp::Add || add->flags || add->count || !std::holds_alternative<Immediate>(add->rhs))
+                    return nullptr;
+            }
             const auto* page = std::get_if<Move>(&block.effects[0]);
             const auto* load = std::get_if<Move>(&block.effects[1]);
             const auto* jump = std::get_if<Jump>(&block.end);
@@ -1947,6 +2473,26 @@ private:
         return import && emitImport(depth, *import);
     }
 
+    // A jump to an import is a tail call: on x86-64 the return address is already on the stack, so stack
+    // arguments start one word higher than at a call.
+    bool tailImport(unsigned depth, const GuestImport& import) {
+        tailCall = true;
+        const bool emitted = emitImport(depth, import);
+        tailCall = false;
+        return emitted;
+    }
+
+    bool tailImport(unsigned depth, const Value& target, const Constants& constants) {
+        const auto* import = findImport(target, constants);
+        return import && tailImport(depth, *import);
+    }
+
+    // The guest stack pointer as an address where the import's stack arguments begin.
+    std::string argumentStack() {
+        const auto sp = std::format("address({})", reg(arm ? 31 : 4).pair());
+        return tailCall && !arm ? sp + " + 8" : sp;
+    }
+
     std::string_view importName(const GuestImport& import) const {
         auto name = import.name;
         if (import.leadingUnderscore && name.starts_with('_'))
@@ -1961,26 +2507,26 @@ private:
         const auto index = reg(args[0]);
         const auto value = reg(args[1]);
         if (name == "FlsAlloc") {
-            line(depth, std::format("fiberSlots[fiberNext] = {{lo = 0, hi = 0, callbackLo = {}, callbackHi = {}}}",
+            line(depth, std::format("process.fiberSlots[process.fiberNext] = {{lo = 0, hi = 0, callbackLo = {}, callbackHi = {}}}",
                 index.lo, index.hi));
-            assign(depth, 0, 4, "fiberNext");
-            line(depth, "fiberNext += 1");
+            assign(depth, 0, 4, "process.fiberNext");
+            line(depth, "process.fiberNext += 1");
             return;
         }
         line(depth, "do");
-        line(depth + 1, "local slot = fiberSlots[" + index.lo + "]");
+        line(depth + 1, "local slot = process.fiberSlots[" + index.lo + "]");
         line(depth + 1, "if not slot then");
-        line(depth + 2, "lastError = 87");
+        line(depth + 2, "process.lastError = 87");
         assign(depth + 2, 0, 4, "0");
         line(depth + 1, "else");
         if (name == "FlsGetValue") {
-            line(depth + 2, "if slot.lo == 0 and slot.hi == 0 then lastError = 0 end");
+            line(depth + 2, "if slot.lo == 0 and slot.hi == 0 then process.lastError = 0 end");
             assign(depth + 2, 0, 8, "slot.lo, slot.hi");
         } else if (name == "FlsSetValue") {
             line(depth + 2, "slot.lo, slot.hi = " + value.pair());
             assign(depth + 2, 0, 4, "1");
         } else {
-            line(depth + 2, "fiberSlots[" + index.lo + "] = nil");
+            line(depth + 2, "process.fiberSlots[" + index.lo + "] = nil");
             line(depth + 2, "if (slot.lo ~= 0 or slot.hi ~= 0) and (slot.callbackLo ~= 0 or slot.callbackHi ~= 0) then");
             includeFunctionPointers();
             needsMemory = true;
@@ -2005,11 +2551,53 @@ private:
         for (auto& ch : library)
             if (ch >= 'A' && ch <= 'Z')
                 ch += 'a' - 'A';
-        if (library != "kernel32.dll" && library != "kernelbase.dll" &&
-            !library.starts_with("api-ms-win-core-heap-"))
+        if (library != "kernel32.dll" && library != "kernelbase.dll" && !library.starts_with("api-ms-win-core-"))
             return false;
 
         const auto name = import.name;
+        struct Entry { std::string_view name; std::string_view target; };
+        static constexpr std::array entries{
+            Entry{"GetStdHandle", "GetStdHandle"}, Entry{"GetFileType", "GetFileType"}, Entry{"WriteFile", "WriteFile"},
+            Entry{"ReadFile", "ReadFile"}, Entry{"WriteConsoleW", "WriteConsoleW"}, Entry{"CreateFileW", "CreateFileW"},
+            Entry{"CloseHandle", "CloseHandle"}, Entry{"GetFileSizeEx", "GetFileSizeEx"},
+            Entry{"SetFilePointerEx", "SetFilePointerEx"}, Entry{"SetEndOfFile", "SetEndOfFile"},
+            Entry{"FlushFileBuffers", "yes"}, Entry{"GetConsoleMode", "no"}, Entry{"GetConsoleOutputCP", "GetACP"},
+            Entry{"ReadConsoleW", "no"}, Entry{"GetCommandLineW", "GetCommandLineW"},
+            Entry{"GetCommandLineA", "GetCommandLineA"}, Entry{"GetModuleFileNameW", "GetModuleFileNameW"},
+            Entry{"GetModuleFileNameA", "GetModuleFileNameA"}, Entry{"GetModuleHandleW", "no"},
+            Entry{"GetModuleHandleExW", "no"}, Entry{"GetProcAddress", "no"}, Entry{"FreeLibrary", "yes"},
+            Entry{"GetEnvironmentStringsW", "GetEnvironmentStringsW"}, Entry{"FreeEnvironmentStringsW", "yes"},
+            Entry{"SetEnvironmentVariableW", "yes"}, Entry{"GetStartupInfoW", "GetStartupInfoW"},
+            Entry{"GetCPInfo", "GetCPInfo"}, Entry{"GetACP", "GetACP"}, Entry{"GetOEMCP", "GetOEMCP"},
+            Entry{"IsValidCodePage", "yes"}, Entry{"MultiByteToWideChar", "MultiByteToWideChar"},
+            Entry{"WideCharToMultiByte", "WideCharToMultiByte"}, Entry{"LCMapStringW", "LCMapStringW"},
+            Entry{"LCMapStringEx", "LCMapStringEx"}, Entry{"GetStringTypeW", "GetStringTypeW"},
+            Entry{"CompareStringW", "CompareStringW"}, Entry{"GetLocaleInfoW", "GetLocaleInfoW"},
+            Entry{"GetUserDefaultLCID", "GetUserDefaultLCID"}, Entry{"IsValidLocale", "yes"},
+            Entry{"EnumSystemLocalesW", "yes"}, Entry{"GetDateFormatW", "no"}, Entry{"GetTimeFormatW", "no"},
+            Entry{"GetTimeZoneInformation", "GetTimeZoneInformation"},
+            Entry{"QueryPerformanceCounter", "QueryPerformanceCounter"},
+            Entry{"QueryPerformanceFrequency", "QueryPerformanceFrequency"},
+            Entry{"GetSystemTimeAsFileTime", "GetSystemTimeAsFileTime"},
+            Entry{"GetCurrentProcessId", "GetCurrentProcessId"}, Entry{"GetCurrentThreadId", "GetCurrentThreadId"},
+            Entry{"GetCurrentProcess", "GetCurrentProcess"}, Entry{"ExitProcess", "ExitProcess"},
+            Entry{"TerminateProcess", "TerminateProcess"}, Entry{"IsProcessorFeaturePresent", "IsProcessorFeaturePresent"},
+            Entry{"IsDebuggerPresent", "no"}, Entry{"InitializeSListHead", "InitializeSListHead"},
+            Entry{"UnhandledExceptionFilter", "yes"}, Entry{"TlsAlloc", "TlsAlloc"}, Entry{"TlsGetValue", "TlsGetValue"},
+            Entry{"TlsSetValue", "TlsSetValue"}, Entry{"TlsFree", "TlsFree"}, Entry{"RaiseException", "RaiseException"},
+            Entry{"FindFirstFileExW", "FindFirstFileExW"}, Entry{"FindNextFileW", "no"}, Entry{"FindClose", "yes"},
+            Entry{"SetStdHandle", "yes"}, Entry{"RtlPcToFileHeader", "no"}, Entry{"RtlLookupFunctionEntry", "no"},
+            Entry{"RtlCaptureContext", "no"}, Entry{"Sleep", "no"}, Entry{"IsDBCSLeadByteEx", "no"},
+            Entry{"VirtualQuery", "VirtualQuery"}, Entry{"GetStartupInfoA", "GetStartupInfoW"},
+        };
+        if (const auto entry = std::ranges::find(entries, name, &Entry::name); entry != entries.end()) {
+            needsProcess = true;
+            needsMemory = true;
+            const auto args = argumentRegisters(arm, convention);
+            assign(depth, 0, 8, std::format("win32.{}({}, {}, {}, {}, {})", entry->target, reg(args[0]).pair(),
+                reg(args[1]).pair(), reg(args[2]).pair(), reg(args[3]).pair(), argumentStack()));
+            return true;
+        }
         if (name == "EncodePointer" || name == "DecodePointer") {
             const auto pointer = reg(argumentRegisters(arm, convention)[0]);
             assign(depth, 0, 8, std::format("bit32.bxor({}, 0xa5a55a5a), bit32.bxor({}, 0x5a5aa5a5)",
@@ -2019,7 +2607,7 @@ private:
         if (name == "LoadLibraryExW") {
             // PE imports are resolved at translation time. This guest has no optional dynamic DLLs.
             usesLastError = true;
-            line(depth, "lastError = 126");
+            line(depth, "process.lastError = 126");
             assign(depth, 0, 8, "0, 0");
             return true;
         }
@@ -2029,7 +2617,7 @@ private:
             const auto args = argumentRegisters(arm, convention);
             assign(depth, 0, 4, std::format("protectMemory({}, {}, {}, {})",
                 reg(args[0]).pair(), reg(args[1]).pair(), reg(args[2]).lo, reg(args[3]).pair()));
-            line(depth, "if " + reg(0).lo + " == 0 then lastError = 87 end");
+            line(depth, "if " + reg(0).lo + " == 0 then process.lastError = 87 end");
             return true;
         }
         if (name == "FlsAlloc" || name == "FlsGetValue" || name == "FlsSetValue" || name == "FlsFree") {
@@ -2039,16 +2627,16 @@ private:
         if (name == "GetLastError" || name == "SetLastError") {
             usesLastError = true;
             if (name == "GetLastError")
-                assign(depth, 0, 4, "lastError");
+                assign(depth, 0, 4, "process.lastError");
             else
-                line(depth, "lastError = " + reg(argumentRegisters(arm, convention)[0]).lo);
+                line(depth, "process.lastError = " + reg(argumentRegisters(arm, convention)[0]).lo);
             return true;
         }
         if (name == "SetUnhandledExceptionFilter") {
             usesExceptionFilter = true;
             const auto handler = reg(argumentRegisters(arm, convention)[0]);
             const auto result = reg(0);
-            line(depth, std::format("{}, exceptionFilterLo, exceptionFilterHi = exceptionFilterLo, exceptionFilterHi, {}",
+            line(depth, std::format("{}, process.exceptionFilterLo, process.exceptionFilterHi = process.exceptionFilterLo, process.exceptionFilterHi, {}",
                 result.pair(), handler.pair()));
             return true;
         }
@@ -2103,18 +2691,29 @@ private:
         return true;
     }
 
+    static bool runtimeLibrary(std::string_view library) {
+        std::string lower(library);
+        for (auto& ch : lower)
+            if (ch >= 'A' && ch <= 'Z')
+                ch += 'a' - 'A';
+        return lower.starts_with("msvcrt") || lower.starts_with("ucrtbase") || lower.starts_with("api-ms-win-crt-") ||
+            lower.starts_with("vcruntime") || lower.starts_with("msvcr");
+    }
+
     bool emitImport(unsigned depth, const GuestImport& import) {
-        if (convention == CallingConvention::Microsoft)
+        if (convention == CallingConvention::Microsoft && !runtimeLibrary(import.library))
             return emitWindowsImport(depth, import);
         const auto name = importName(import);
         const auto arguments = argumentRegisters(arm, convention);
+        if (emitMathImport(depth, name) || emitRuntimeImport(depth, name))
+            return true;
         if (!arm && !import.leadingUnderscore && name == "__tls_get_addr") {
             std::string valid;
             for (const auto& region : data.regions) {
                 if (!region.threadLocal)
                     continue;
                 const auto size = region.end - region.start;
-                if (!data.emitted.contains(region.start))
+                if (!data.materialized(region.start))
                     data.materialize(region.start, unsigned(size));
                 if (!valid.empty())
                     valid += " or ";
@@ -2335,7 +2934,7 @@ private:
             line(depth + 1, std::format("local callback = functionPointers[address({})]", first.pair()));
             line(depth + 1, "if not callback then error(\"unknown guest exit callback\", 0) end");
             line(depth + 1, std::format("local argLo, argHi = {}", argument.pair()));
-            line(depth + 1, "table.insert(exitCallbacks, function()");
+            line(depth + 1, "table.insert(process.exitCallbacks, function()");
             assign(depth + 2, arguments[0], 8, "argLo, argHi");
             callPrologue(depth + 2, 4294967295);
             line(depth + 2, "runGuestRoutine(callback, 4294967295)");
@@ -2412,6 +3011,616 @@ private:
         return true;
     }
 
+    // Floating-point arguments use the vector argument registers; on Windows they share positions with
+    // integer arguments, so an integer after one double arrives in the second integer register.
+    bool emitMathImport(unsigned depth, std::string_view name) {
+        static const std::map<std::string_view, std::string_view> unary{
+            {"sqrt", "math.sqrt(x)"}, {"floor", "math.floor(x)"}, {"ceil", "math.ceil(x)"},
+            {"trunc", "roundTruncate(x)"}, {"round", "roundAway(x)"}, {"fabs", "math.abs(x)"},
+            {"exp", "math.exp(x)"}, {"exp2", "2 ^ x"}, {"expm1", "math.exp(x) - 1"}, {"log", "math.log(x)"},
+            {"log2", "math.log(x, 2)"}, {"log10", "math.log10(x)"}, {"log1p", "math.log(1 + x)"},
+            {"sin", "math.sin(x)"}, {"cos", "math.cos(x)"}, {"tan", "math.tan(x)"}, {"asin", "math.asin(x)"},
+            {"acos", "math.acos(x)"}, {"atan", "math.atan(x)"}, {"sinh", "math.sinh(x)"}, {"cosh", "math.cosh(x)"},
+            {"tanh", "math.tanh(x)"}, {"cbrt", "(if x < 0 then -((-x) ^ (1 / 3)) else x ^ (1 / 3))"},
+            {"nearbyint", "roundEven(x)"}, {"rint", "roundEven(x)"},
+        };
+        static const std::map<std::string_view, std::string_view> binary{
+            {"pow", "x ^ y"}, {"atan2", "math.atan2(x, y)"}, {"fmod", "math.fmod(x, y)"},
+            {"hypot", "math.sqrt(x * x + y * y)"}, {"fmin", "scalarMinMax(0, x, y)"}, {"fmax", "scalarMinMax(1, x, y)"},
+            {"fdim", "(if x > y then x - y else 0)"},
+            {"copysign", "(if (y < 0 or 1 / y < 0) then -math.abs(x) else math.abs(x))"},
+        };
+        auto base = name;
+        unsigned size = 8;
+        const auto find = [&](const auto& table) {
+            if (table.contains(base))
+                return true;
+            if (base.ends_with('f') && table.contains(base.substr(0, base.size() - 1))) {
+                base = base.substr(0, base.size() - 1);
+                size = 4;
+                return true;
+            }
+            return false;
+        };
+        const auto arguments = argumentRegisters(arm, convention);
+        const bool microsoft = convention == CallingConvention::Microsoft;
+        const auto x = floatOperand(VectorRegister{0}, 4, {});
+        const auto decode = [&](unsigned index) {
+            const auto lanes = xmm(VectorRegister{index});
+            return std::format("decodeFloat({}, {}, {})", size, lanes[0], size == 8 ? lanes[1] : "0");
+        };
+        const auto result = [&](const std::string& expression) {
+            needsFloating = true;
+            needsVector = true;
+            const auto lanes = xmm(VectorRegister{0});
+            const auto fields = size == 8 ? lanes[0] + ", " + lanes[1] : lanes[0];
+            line(depth, "do");
+            line(depth + 1, "local x = " + decode(0));
+            line(depth + 1, "local y = " + decode(1));
+            line(depth + 1, std::format("{} = encodeFloat({}, {})", fields, size, expression));
+            for (unsigned lane = size == 8 ? 2 : 1; lane < 4; ++lane)
+                line(depth + 1, lanes[lane] + " = 0");
+            line(depth, "end");
+            return true;
+        };
+        (void)x;
+        if (find(unary))
+            return result(std::string(unary.at(base)));
+        if (find(binary))
+            return result(std::string(binary.at(base)));
+        base = name;
+        size = 8;
+        const auto integer = arguments[microsoft ? 1 : 0];
+        if (base == "ldexp" || base == "scalbn" || base == "ldexpf" || base == "scalbnf") {
+            if (base.ends_with('f'))
+                size = 4;
+            const auto n = reg(integer).lo;
+            return result(std::format("math.ldexp(x, if {0} >= 2147483648 then {0} - 4294967296 else {0})", n));
+        }
+        if (base == "frexp" || base == "frexpf" || base == "modf" || base == "modff") {
+            if (base.ends_with('f'))
+                size = 4;
+            needsMemory = true;
+            const auto pointer = reg(integer).pair();
+            if (base.starts_with("frexp")) {
+                line(depth, "do");
+                line(depth + 1, std::format("local mantissa, exponent = math.frexp({})", decode(0)));
+                line(depth + 1, std::format("write(4, address({}), exponent % 4294967296, 0)", pointer));
+                line(depth, "end");
+                return result("math.frexp(x)");
+            }
+            line(depth, "do");
+            line(depth + 1, std::format("local whole = math.modf({})", decode(0)));
+            if (size == 8)
+                line(depth + 1, std::format("write(8, address({}), encodeFloat(8, whole))", pointer));
+            else
+                line(depth + 1, std::format("write(4, address({}), encodeFloat(4, whole))", pointer));
+            line(depth, "end");
+            return result("select(2, math.modf(x))");
+        }
+        if (base == "lround" || base == "llround" || base == "lrint" || base == "llrint" ||
+            base == "lroundf" || base == "llroundf" || base == "lrintf" || base == "llrintf") {
+            if (base.ends_with('f'))
+                size = 4;
+            needsFloating = true;
+            needsVector = true;
+            // Windows `long` is 32 bits wide.
+            const unsigned width = microsoft && !base.starts_with("ll") ? 4 : 8;
+            const auto rounding = base.find("rint") != std::string_view::npos ? "roundEven" : "roundAway";
+            assign(depth, 0, 8, std::format("truncateFloat({}, {}, true, {}({}))", width, arm, rounding, decode(0)));
+            return true;
+        }
+        return false;
+    }
+
+    // ABI of variadic arguments for the runtime's argument readers.
+    unsigned variadicKind() const {
+        if (convention == CallingConvention::Microsoft)
+            return 3;
+        if (arm)
+            return program.darwin ? 2 : 1;
+        return 0;
+    }
+
+    // A Luau expression building an argument reader for the variadic arguments after `named` named ones.
+    std::string variadicArguments(unsigned named) {
+        const auto arguments = argumentRegisters(arm, convention);
+        std::string ints, floats;
+        for (const auto index : arguments)
+            ints += (ints.empty() ? "" : ", ") + reg(index).pair();
+        for (unsigned index = 0; index < 8; ++index) {
+            const auto lanes = xmm(VectorRegister{index});
+            floats += (floats.empty() ? "" : ", ") + lanes[0] + ", " + lanes[1];
+        }
+        return std::format("registerArguments({}, {}, {{{}}}, {}, {{{}}}, 0)", variadicKind(), argumentStack(), ints,
+            named, floats);
+    }
+
+    bool emitFormatImport(unsigned depth, std::string_view name) {
+        // Output kinds: standard output, a FILE stream, a descriptor, a buffer, a bounded buffer, a new string.
+        enum Kind { Out, Stream, Descriptor, Buffer, Bounded, Allocated };
+        struct Form { std::string_view name; Kind kind; unsigned format; unsigned size; bool list; };
+        static constexpr std::array forms{
+            Form{"printf", Out, 0, 0, false}, Form{"vprintf", Out, 0, 0, true},
+            Form{"fprintf", Stream, 1, 0, false}, Form{"vfprintf", Stream, 1, 0, true},
+            Form{"dprintf", Descriptor, 1, 0, false}, Form{"vdprintf", Descriptor, 1, 0, true},
+            Form{"sprintf", Buffer, 1, 0, false}, Form{"vsprintf", Buffer, 1, 0, true},
+            Form{"snprintf", Bounded, 2, 1, false}, Form{"vsnprintf", Bounded, 2, 1, true},
+            Form{"asprintf", Allocated, 1, 0, false}, Form{"vasprintf", Allocated, 1, 0, true},
+            Form{"__printf_chk", Out, 1, 0, false}, Form{"__vprintf_chk", Out, 1, 0, true},
+            Form{"__fprintf_chk", Stream, 2, 0, false}, Form{"__vfprintf_chk", Stream, 2, 0, true},
+            Form{"__sprintf_chk", Buffer, 3, 0, false}, Form{"__vsprintf_chk", Buffer, 3, 0, true},
+            Form{"__snprintf_chk", Bounded, 4, 1, false}, Form{"__vsnprintf_chk", Bounded, 4, 1, true},
+            Form{"__asprintf_chk", Allocated, 2, 0, false}, Form{"__vasprintf_chk", Allocated, 2, 0, true},
+            Form{"snprintf_l", Bounded, 3, 1, false}, Form{"vsnprintf_l", Bounded, 3, 1, true},
+            Form{"asprintf_l", Allocated, 2, 0, false}, Form{"vasprintf_l", Allocated, 2, 0, true},
+            Form{"sprintf_l", Buffer, 2, 0, false}, Form{"printf_l", Out, 1, 0, false},
+        };
+        const auto form = std::ranges::find(forms, name, &Form::name);
+        if (form == forms.end())
+            return false;
+        needsProcess = true;
+        needsMemory = true;
+        const auto arguments = argumentRegisters(arm, convention);
+        const auto arg = [&](unsigned index) { return reg(arguments[index]); };
+        const bool windows = convention == CallingConvention::Microsoft;
+        line(depth, "do");
+        const auto reader = form->list ? std::format("listArguments({}, {})", variadicKind(), arg(form->format + 1).pair())
+                                       : variadicArguments(form->format + 1);
+        line(depth + 1, std::format("local text = formatGuest(guestString(address({})), {}, {})", arg(form->format).pair(),
+            reader, windows));
+        switch (form->kind) {
+            case Out: line(depth + 1, "hostWrite(1, text)"); break;
+            case Stream: line(depth + 1, std::format("hostWrite(streamDescriptor({}), text)", arg(0).pair())); break;
+            case Descriptor: line(depth + 1, std::format("hostWrite(signed32({}), text)", arg(0).lo)); break;
+            case Buffer:
+                line(depth + 1, std::format("writeString(address({}), text)", arg(0).pair()));
+                line(depth + 1, std::format("write(1, address({}) + #text, 0, 0)", arg(0).pair()));
+                break;
+            case Bounded:
+                line(depth + 1, std::format("local limit = address({})", arg(form->size).pair()));
+                line(depth + 1, "if limit > 0 then");
+                line(depth + 2, "local kept = string.sub(text, 1, limit - 1)");
+                line(depth + 2, std::format("writeString(address({}), kept)", arg(0).pair()));
+                line(depth + 2, std::format("write(1, address({}) + #kept, 0, 0)", arg(0).pair()));
+                line(depth + 1, "end");
+                break;
+            case Allocated:
+                line(depth + 1, std::format("write(8, address({}), newGuestString(text), 0)", arg(0).pair()));
+                break;
+        }
+        assign(depth + 1, 0, 4, "#text");
+        line(depth, "end");
+        return true;
+    }
+
+    // Calls a guest function pointer with integer arguments and leaves its result in the return register.
+    void callGuest(unsigned depth, const std::string& target, std::span<const std::string> values,
+        std::string_view missing) {
+        includeFunctionPointers();
+        needsMemory = true;
+        const auto arguments = argumentRegisters(arm, convention);
+        line(depth, std::format("local callee = functionPointers[address({})]", target));
+        line(depth, std::format("if not callee then error({}, 0) end", quoted(missing)));
+        for (std::size_t i = 0; i < values.size(); ++i)
+            assign(depth, arguments[i], 8, values[i]);
+        if (convention == CallingConvention::Microsoft)
+            line(depth, reg(4).lo + " -= 32");
+        runCallback(depth, "callee");
+        if (convention == CallingConvention::Microsoft)
+            line(depth, reg(4).lo + " += 32");
+    }
+
+    bool emitProcessImport(unsigned depth, std::string_view name) {
+        const auto arguments = argumentRegisters(arm, convention);
+        const auto arg = [&](unsigned index) { return reg(arguments[index]); };
+        if (name == "__libc_start_main") {
+            needsProcess = true;
+            line(depth, "do");
+            line(depth + 1, std::format("local count, vector = {}, {}", arg(1).lo, arg(2).lo));
+            const std::array values{std::string("count, 0"), std::string("vector, 0"),
+                std::string("vector + (count + 1) * 8, 0")};
+            callGuest(depth + 1, arg(0).pair(), values, "unknown guest main function");
+            line(depth + 1, std::format("exitProcess({}, true)", reg(0).lo));
+            line(depth, "end");
+            return true;
+        }
+        if (name == "exit" || name == "_exit" || name == "_Exit" || name == "quick_exit") {
+            needsProcess = true;
+            line(depth, std::format("exitProcess({}, {})", arg(0).lo, name == "exit"));
+            return true;
+        }
+        if (name == "atexit") {
+            usesExitCallbacks = true;
+            includeFunctionPointers();
+            needsMemory = true;
+            line(depth, "do");
+            line(depth + 1, std::format("local callback = functionPointers[address({})]", arg(0).pair()));
+            line(depth + 1, "if not callback then error(\"unknown guest exit callback\", 0) end");
+            line(depth + 1, "table.insert(process.exitCallbacks, function()");
+            runCallback(depth + 2, "callback");
+            line(depth + 1, "end)");
+            assign(depth + 1, 0, 4, "0");
+            line(depth, "end");
+            return true;
+        }
+        if (name == "__cxa_finalize")
+            return true;
+        if (convention == CallingConvention::Microsoft && emitRuntimeStartup(depth, name))
+            return true;
+        if (name == "qsort" || name == "bsearch") {
+            includeFunctionPointers();
+            needsMemory = true;
+            const bool search = name == "bsearch";
+            // qsort(base, count, size, compare); bsearch(key, base, count, size, compare).
+            const auto base = arg(search ? 1 : 0), count = arg(search ? 2 : 1), size = arg(search ? 3 : 2);
+            const auto compare = arg(search ? 4 : 3);
+            line(depth, "do");
+            line(depth + 1, std::format("local first, count, size = address({}), address({}), address({})", base.pair(),
+                count.pair(), size.pair()));
+            line(depth + 1, std::format("local key = address({})", arg(0).pair()));
+            line(depth + 1, std::format("local comparator = functionPointers[address({})]", compare.pair()));
+            line(depth + 1, "if not comparator then error(\"unknown guest comparison function\", 0) end");
+            line(depth + 1, "local function order(left: number, right: number): number");
+            assign(depth + 2, arguments[0], 8, "left, 0");
+            assign(depth + 2, arguments[1], 8, "right, 0");
+            if (convention == CallingConvention::Microsoft)
+                line(depth + 2, reg(4).lo + " -= 32");
+            runCallback(depth + 2, "comparator");
+            if (convention == CallingConvention::Microsoft)
+                line(depth + 2, reg(4).lo + " += 32");
+            line(depth + 2, std::format("return signed32({})", reg(0).lo));
+            line(depth + 1, "end");
+            needsProcess = true;
+            if (search) {
+                line(depth + 1, "local low, high, found = 0, count - 1, 0");
+                line(depth + 1, "while low <= high do");
+                line(depth + 2, "local middle = (low + high) // 2");
+                line(depth + 2, "local sign = order(key, first + middle * size)");
+                line(depth + 2, "if sign == 0 then found = first + middle * size; break end");
+                line(depth + 2, "if sign < 0 then high = middle - 1 else low = middle + 1 end");
+                line(depth + 1, "end");
+                assign(depth + 1, 0, 8, "found, 0");
+            } else {
+                // A stable merge sort keeps comparator calls well defined for inconsistent orderings.
+                line(depth + 1, "local items = {}");
+                line(depth + 1, "for i = 0, count - 1 do items[i + 1] = readString(first + i * size, size) end");
+                line(depth + 1, "local scratch = resize(0, 0, math.max(2 * size, 1), 0)");
+                line(depth + 1, "local function less(a: string, b: string): boolean");
+                line(depth + 2, "writeString(scratch, a)");
+                line(depth + 2, "writeString(scratch + size, b)");
+                line(depth + 2, "return order(scratch, scratch + size) < 0");
+                line(depth + 1, "end");
+                line(depth + 1, "local function sort(list: {string}): {string}");
+                line(depth + 2, "if #list <= 1 then return list end");
+                line(depth + 2, "local middle = #list // 2");
+                line(depth + 2, "local left, right = sort(table.move(list, 1, middle, 1, {})), sort(table.move(list, middle + 1, #list, 1, {}))");
+                line(depth + 2, "local merged, i, j = {}, 1, 1");
+                line(depth + 2, "while i <= #left and j <= #right do");
+                line(depth + 3, "if less(right[j], left[i]) then table.insert(merged, right[j]); j += 1 else table.insert(merged, left[i]); i += 1 end");
+                line(depth + 2, "end");
+                line(depth + 2, "for k = i, #left do table.insert(merged, left[k]) end");
+                line(depth + 2, "for k = j, #right do table.insert(merged, right[k]) end");
+                line(depth + 2, "return merged");
+                line(depth + 1, "end");
+                line(depth + 1, "for i, item in sort(items) do writeString(first + (i - 1) * size, item) end");
+                line(depth + 1, "resize(scratch, 0, 0, 0)");
+            }
+            line(depth, "end");
+            return true;
+        }
+        return false;
+    }
+
+    // The DLL C runtime's process startup, as the MinGW CRT uses it.
+    bool emitRuntimeStartup(unsigned depth, std::string_view name) {
+        const auto arguments = argumentRegisters(arm, convention);
+        const auto arg = [&](unsigned index) { return reg(arguments[index]); };
+        if (name == "__getmainargs" || name == "__wgetmainargs") {
+            if (name == "__wgetmainargs")
+                return false;
+            needsProcess = true;
+            line(depth, "do");
+            line(depth + 1, "local count, vector, environment = processArguments()");
+            line(depth + 1, std::format("write(4, address({}), count, 0)", arg(0).pair()));
+            line(depth + 1, std::format("write(8, address({}), vector, 0)", arg(1).pair()));
+            line(depth + 1, std::format("write(8, address({}), environment, 0)", arg(2).pair()));
+            assign(depth + 1, 0, 4, "0");
+            line(depth, "end");
+            return true;
+        }
+        if (name == "_initterm" || name == "_initterm_e") {
+            includeFunctionPointers();
+            needsMemory = true;
+            line(depth, "do");
+            line(depth + 1, std::format("local first, last = address({}), address({})", arg(0).pair(), arg(1).pair()));
+            line(depth + 1, "local status = 0");
+            line(depth + 1, "for at = first, last - 8, 8 do");
+            line(depth + 2, "local targetLo, targetHi = read(8, at)");
+            line(depth + 2, "if targetLo ~= 0 or targetHi ~= 0 then");
+            callGuest(depth + 3, "targetLo, targetHi", {}, "unknown guest initializer");
+            if (name == "_initterm_e")
+                line(depth + 3, std::format("if {} ~= 0 then status = {}; break end", reg(0).lo, reg(0).lo));
+            line(depth + 2, "end");
+            line(depth + 1, "end");
+            assign(depth + 1, 0, 4, "status");
+            line(depth, "end");
+            return true;
+        }
+        if (name == "_onexit" || name == "_crt_atexit" || name == "_register_onexit_function") {
+            usesExitCallbacks = true;
+            includeFunctionPointers();
+            needsMemory = true;
+            const auto function = name == "_register_onexit_function" ? arg(1) : arg(0);
+            line(depth, "do");
+            line(depth + 1, std::format("local callbackLo, callbackHi = {}", function.pair()));
+            line(depth + 1, "local callback = functionPointers[address(callbackLo, callbackHi)]");
+            line(depth + 1, "if not callback then error(\"unknown guest exit callback\", 0) end");
+            line(depth + 1, "table.insert(process.exitCallbacks, function()");
+            line(depth + 2, reg(4).lo + " -= 32");
+            runCallback(depth + 2, "callback");
+            line(depth + 2, reg(4).lo + " += 32");
+            line(depth + 1, "end)");
+            assign(depth + 1, 0, 8, name == "_onexit" ? "callbackLo, callbackHi" : "0, 0");
+            line(depth, "end");
+            return true;
+        }
+        if (name == "_cexit" || name == "_c_exit") {
+            if (name == "_cexit") {
+                line(depth, "while #process.exitCallbacks > 0 do");
+                line(depth + 1, "local callback = table.remove(process.exitCallbacks)");
+                line(depth + 1, "if callback then callback() end");
+                line(depth, "end");
+            }
+            return true;
+        }
+        if (name == "_amsg_exit") {
+            trap(depth, "guest C runtime reported a fatal error");
+            return true;
+        }
+        if (name == "__iob_func" || name == "__acrt_iob_func") {
+            if (!program.streams[0])
+                return false;
+            const auto index = name == "__acrt_iob_func" ? std::format(" + {} * 48", arg(0).lo) : std::string();
+            assign(depth, 0, 8, std::format("{}{}, 0", program.streams[0], index));
+            return true;
+        }
+        if (name == "___lc_codepage_func") {
+            assign(depth, 0, 4, "0");
+            return true;
+        }
+        if (name == "___mb_cur_max_func") {
+            assign(depth, 0, 4, "1");
+            return true;
+        }
+        if (name == "_lock" || name == "_unlock" || name == "__set_app_type" || name == "__setusermatherr" ||
+            name == "_set_app_type" || name == "_configthreadlocale" || name == "_set_invalid_parameter_handler") {
+            assign(depth, 0, 8, "0, 0");
+            return true;
+        }
+        return false;
+    }
+
+    bool emitLibraryImport(unsigned depth, std::string_view name) {
+        // Functions with integer arguments implemented by the runtime's libc table.
+        struct Entry { std::string_view name; std::string_view target; unsigned arguments; };
+        static constexpr std::array entries{
+            Entry{"write", "write", 3}, Entry{"read", "read", 3}, Entry{"open", "open", 2}, Entry{"open64", "open", 2},
+            Entry{"openat", "openat", 3}, Entry{"close", "close", 1}, Entry{"lseek", "lseek", 3},
+            Entry{"lseek64", "lseek", 3}, Entry{"fstat", "fstat", 2}, Entry{"fstat64", "fstat", 2},
+            Entry{"stat", "stat", 2}, Entry{"stat64", "stat", 2}, Entry{"lstat", "stat", 2}, Entry{"isatty", "isatty", 1},
+            Entry{"fopen", "fopen", 2}, Entry{"fopen64", "fopen", 2}, Entry{"fdopen", "fdopen", 2},
+            Entry{"fclose", "fclose", 1}, Entry{"fileno", "fileno", 1}, Entry{"fwrite", "fwrite", 4},
+            Entry{"fwrite_unlocked", "fwrite", 4}, Entry{"fread", "fread", 4}, Entry{"fread_unlocked", "fread", 4},
+            Entry{"fputc", "fputc", 2}, Entry{"putc", "fputc", 2}, Entry{"_IO_putc", "fputc", 2},
+            Entry{"fputc_unlocked", "fputc", 2}, Entry{"putc_unlocked", "fputc", 2}, Entry{"fputs", "fputs", 2},
+            Entry{"fputs_unlocked", "fputs", 2}, Entry{"puts", "puts", 1}, Entry{"putchar", "putchar", 1},
+            Entry{"putchar_unlocked", "putchar", 1}, Entry{"fgetc", "fgetc", 1}, Entry{"getc", "fgetc", 1},
+            Entry{"_IO_getc", "fgetc", 1}, Entry{"getc_unlocked", "fgetc", 1}, Entry{"fgetc_unlocked", "fgetc", 1},
+            Entry{"getchar", "getchar", 0}, Entry{"ungetc", "ungetc", 2}, Entry{"fgets", "fgets", 3},
+            Entry{"fflush", "fflush", 1}, Entry{"fflush_unlocked", "fflush", 1}, Entry{"setvbuf", "setvbuf", 4},
+            Entry{"setbuf", "setvbuf", 2}, Entry{"fseek", "fseek", 3}, Entry{"fseeko", "fseek", 3},
+            Entry{"fseeko64", "fseek", 3}, Entry{"ftell", "ftell", 1}, Entry{"ftello", "ftell", 1},
+            Entry{"ftello64", "ftell", 1}, Entry{"rewind", "rewind", 1}, Entry{"feof", "feof", 1},
+            Entry{"ferror", "ferror", 1}, Entry{"clearerr", "clearerr", 1}, Entry{"__uflow", "__uflow", 1},
+            Entry{"__overflow", "__overflow", 2}, Entry{"__srget", "__srget", 1}, Entry{"__swbuf", "__swbuf", 2},
+            Entry{"getenv", "getenv", 1}, Entry{"secure_getenv", "getenv", 1}, Entry{"strtol", "strtol", 3},
+            Entry{"strtoll", "strtol", 3}, Entry{"__isoc23_strtol", "strtol", 3}, Entry{"__isoc23_strtoll", "strtol", 3},
+            Entry{"strtoimax", "strtol", 3}, Entry{"strtoul", "strtoul", 3}, Entry{"strtoull", "strtoul", 3},
+            Entry{"__isoc23_strtoul", "strtoul", 3}, Entry{"__isoc23_strtoull", "strtoul", 3},
+            Entry{"strtoumax", "strtoul", 3}, Entry{"atoi", "atoi", 1}, Entry{"atol", "atol", 1},
+            Entry{"atoll", "atol", 1}, Entry{"time", "time", 1}, Entry{"clock", "clock", 0},
+            Entry{"clock_gettime", "clock_gettime", 2}, Entry{"gettimeofday", "gettimeofday", 2},
+            Entry{"setlocale", "setlocale", 2}, Entry{"getpid", "getpid", 0}, Entry{"sysconf", "sysconf", 1},
+            Entry{"signal", "signal", 2}, Entry{"sigaction", "sigaction", 3},
+            Entry{"pthread_self", "pthread_self", 0}, Entry{"pthread_mach_thread_np", "pthread_mach_thread_np", 1},
+            Entry{"pthread_equal", "pthread_equal", 2}, Entry{"pthread_key_create", "pthread_key_create", 2},
+            Entry{"pthread_key_delete", "success", 1}, Entry{"pthread_getspecific", "pthread_getspecific", 1},
+            Entry{"pthread_setspecific", "pthread_setspecific", 2}, Entry{"pthread_mutex_init", "success", 2},
+            Entry{"pthread_mutex_destroy", "success", 1}, Entry{"pthread_mutexattr_init", "success", 1},
+            Entry{"pthread_mutexattr_settype", "success", 2}, Entry{"pthread_mutexattr_destroy", "success", 1},
+            Entry{"pthread_cond_init", "success", 2}, Entry{"pthread_cond_destroy", "success", 1},
+            Entry{"pthread_cond_wait", "pthread_cond_wait", 2}, Entry{"pthread_rwlock_init", "success", 2},
+            Entry{"pthread_rwlock_destroy", "success", 1}, Entry{"pthread_rwlock_rdlock", "success", 1},
+            Entry{"pthread_rwlock_wrlock", "success", 1}, Entry{"pthread_rwlock_unlock", "success", 1},
+            Entry{"sched_yield", "success", 0},
+            Entry{"__maskrune", "__maskrune", 2}, Entry{"__maskrune_l", "__maskrune", 2},
+            Entry{"__toupper", "__toupper", 1}, Entry{"__tolower", "__tolower", 1},
+            Entry{"__toupper_l", "__toupper", 1}, Entry{"__tolower_l", "__tolower", 1},
+            Entry{"___toupper_l", "__toupper", 1}, Entry{"___tolower_l", "__tolower", 1},
+            Entry{"___mb_cur_max_l", "__mb_cur_max_l", 0},
+            Entry{"toupper_l", "__toupper", 1}, Entry{"tolower_l", "__tolower", 1},
+            Entry{"__mb_cur_max_l", "__mb_cur_max_l", 0}, Entry{"wctob", "wctob", 1}, Entry{"wctob_l", "wctob", 1},
+            Entry{"btowc_l", "btowc", 1}, Entry{"mbtowc", "mbtowc", 3}, Entry{"mbtowc_l", "mbtowc", 3},
+            Entry{"mbrtowc", "mbrtowc", 3}, Entry{"mbrtowc_l", "mbrtowc", 3}, Entry{"mbrlen", "mbrlen", 2},
+            Entry{"mbrlen_l", "mbrlen", 2}, Entry{"wcrtomb", "wcrtomb", 2}, Entry{"wcrtomb_l", "wcrtomb", 2},
+            Entry{"mbsrtowcs", "mbsrtowcs", 3}, Entry{"mbsrtowcs_l", "mbsrtowcs", 3},
+            Entry{"mbsnrtowcs", "mbsnrtowcs", 4}, Entry{"mbsnrtowcs_l", "mbsnrtowcs", 4},
+            Entry{"wcsnrtombs", "wcsnrtombs", 4}, Entry{"wcsnrtombs_l", "wcsnrtombs", 4},
+            Entry{"wcslen", "wcslen", 1}, Entry{"localeconv", "localeconv", 0}, Entry{"localeconv_l", "localeconv", 0},
+            Entry{"strspn", "strspn", 2}, Entry{"strcspn", "strcspn", 2}, Entry{"strpbrk", "strpbrk", 2},
+            Entry{"strncpy", "strncpy", 3}, Entry{"strncat", "strncat", 3}, Entry{"strdup", "strdup", 1},
+            Entry{"strerror", "strerror", 1}, Entry{"strerror_r", "strerror_r", 3}, Entry{"__xpg_strerror_r", "strerror_r", 3},
+            Entry{"aligned_alloc", "aligned_alloc", 2}, Entry{"posix_memalign", "posix_memalign", 3},
+            Entry{"mach_absolute_time", "mach_absolute_time", 0}, Entry{"mach_timebase_info", "mach_timebase_info", 1},
+            Entry{"dlopen", "failure", 0}, Entry{"dlsym", "failure", 0}, Entry{"dladdr", "failure", 0},
+            Entry{"_dyld_register_func_for_remove_image", "success", 0}, Entry{"_dyld_find_unwind_sections", "failure", 0},
+            Entry{"isspace", "isspace", 1}, Entry{"strcoll_l", "strcoll", 2}, Entry{"strcoll", "strcoll", 2},
+        };
+        const auto arguments = argumentRegisters(arm, convention);
+        if (name == "strtod" || name == "strtof" || name == "atof" || name == "__isoc23_strtod" ||
+            name == "__isoc23_strtof" || name == "strtold") {
+            needsProcess = true;
+            needsFloating = true;
+            const auto end = name == "atof" ? std::string("0, 0") : reg(arguments[1]).pair();
+            const unsigned size = name.ends_with('f') && name != "atof" ? 4 : 8;
+            const auto lanes = xmm(VectorRegister{0});
+            line(depth, std::format("{}, {} = encodeFloat({}, libc.strtod({}, {}))", lanes[0], lanes[1], size,
+                reg(arguments[0]).pair(), end));
+            line(depth, std::format("{}, {} = 0, 0", lanes[2], lanes[3]));
+            return true;
+        }
+        const auto entry = std::ranges::find(entries, name, &Entry::name);
+        if (entry == entries.end())
+            return false;
+        needsProcess = true;
+        needsMemory = true;
+        std::string values;
+        for (unsigned i = 0; i < entry->arguments; ++i)
+            values += (i ? ", " : "") + reg(arguments[i]).pair();
+        assign(depth, 0, 8, std::format("libc.{}({})", entry->target, values));
+        return true;
+    }
+
+    // C runtime helpers shared by every platform.
+    bool emitRuntimeImport(unsigned depth, std::string_view name) {
+        if (emitFormatImport(depth, name) || emitProcessImport(depth, name) || emitLibraryImport(depth, name))
+            return true;
+        const auto arguments = argumentRegisters(arm, convention);
+        const auto arg = [&](unsigned index) { return reg(arguments[index]); };
+        if (name == "__stack_chk_fail" || name == "__stack_chk_fail_local") {
+            trap(depth, "guest stack protector detected corruption");
+            return true;
+        }
+        if (name == "abort") {
+            trap(depth, "guest called abort");
+            return true;
+        }
+        if (name == "__memcpy_chk" || name == "__memmove_chk") {
+            needsMemory = true;
+            line(depth, std::format("if {} > {} or ({} == {} and {} > {}) then error(\"guest buffer overflow detected\", 0) end",
+                arg(2).hi, arg(3).hi, arg(2).hi, arg(3).hi, arg(2).lo, arg(3).lo));
+            assign(depth, 0, 8, std::format("copyMemory({}, {}, {})", arg(0).pair(), arg(1).pair(), arg(2).pair()));
+            return true;
+        }
+        if (name == "__memset_chk") {
+            needsMemory = true;
+            line(depth, std::format("if {} > {} or ({} == {} and {} > {}) then error(\"guest buffer overflow detected\", 0) end",
+                arg(2).hi, arg(3).hi, arg(2).hi, arg(3).hi, arg(2).lo, arg(3).lo));
+            assign(depth, 0, 8, std::format("fillMemory({}, {}, {})", arg(0).pair(), arg(1).lo, arg(2).pair()));
+            return true;
+        }
+        if (name == "calloc") {
+            needsMemory = true;
+            needsHeap = true;
+            line(depth, "do");
+            line(depth + 1, std::format("local count, size = address({}), address({})", arg(0).pair(), arg(1).pair()));
+            line(depth + 1, "local pointer = if count * size > 0 then resize(0, 0, count * size, 0) else resize(0, 0, 1, 0)");
+            line(depth + 1, "if pointer ~= 0 then fillMemory(pointer, 0, 0, count * size, 0) end");
+            assign(depth + 1, 0, 8, "pointer, 0");
+            line(depth, "end");
+            return true;
+        }
+        if (name == "_errno" || name == "__errno_location" || name == "__error" || name == "__errno") {
+            needsMemory = true;
+            needsHeap = true;
+            assign(depth, 0, 8, "errnoAddress(), 0");
+            return true;
+        }
+        if (name == "__udivti3" || name == "__umodti3" || name == "__divti3" || name == "__modti3") {
+            needsDivision = true;
+            const bool sign = name == "__divti3" || name == "__modti3";
+            const bool remainder = name == "__umodti3" || name == "__modti3";
+            const auto result = arm ? std::pair{reg(0), reg(1)} : std::pair{reg(0), reg(2)};
+            line(depth, std::format("{}, {} = divide128({}, {}, {}, {}, {}, {})", result.first.pair(), result.second.pair(),
+                sign, remainder, arg(0).pair(), arg(1).pair(), arg(2).pair(), arg(3).pair()));
+            return true;
+        }
+        if (name == "strchr" || name == "strrchr") {
+            needsMemory = true;
+            line(depth, "do");
+            line(depth + 1, "local at = address(" + arg(0).pair() + ")");
+            line(depth + 1, "local needle = bit32.band(" + arg(1).lo + ", 255)");
+            line(depth + 1, "local found = 0");
+            line(depth + 1, "while true do");
+            line(depth + 2, "local byte = read(1, at)");
+            line(depth + 2, std::format("if byte == needle then found = at{} end", name == "strchr" ? "; break" : ""));
+            line(depth + 2, "if byte == 0 then break end");
+            line(depth + 2, "at += 1");
+            line(depth + 1, "end");
+            assign(depth + 1, 0, 8, "found, 0");
+            line(depth, "end");
+            return true;
+        }
+        if (name == "strncmp") {
+            needsMemory = true;
+            line(depth, "do");
+            line(depth + 1, std::format("local a, b, count = address({}), address({}), address({})", arg(0).pair(),
+                arg(1).pair(), arg(2).pair()));
+            line(depth + 1, "local result = 0");
+            line(depth + 1, "for i = 0, count - 1 do");
+            line(depth + 2, "local left, right = read(1, a + i), read(1, b + i)");
+            line(depth + 2, "if left ~= right then result = (left - right) % 4294967296; break end");
+            line(depth + 2, "if left == 0 then break end");
+            line(depth + 1, "end");
+            assign(depth + 1, 0, 8, "result, 0");
+            line(depth, "end");
+            return true;
+        }
+        if (name == "strcpy" || name == "stpcpy" || name == "strcat") {
+            needsMemory = true;
+            line(depth, "do");
+            line(depth + 1, std::format("local to, from = address({}), address({})", arg(0).pair(), arg(1).pair()));
+            line(depth + 1, "local start = to");
+            if (name == "strcat")
+                line(depth + 1, "to += stringLength(to, 0)");
+            line(depth + 1, "local length = stringLength(from, 0)");
+            line(depth + 1, "copyMemory(to, 0, from, 0, length + 1, 0)");
+            assign(depth + 1, 0, 8, name == "stpcpy" ? "to + length, 0" : "start, 0");
+            line(depth, "end");
+            return true;
+        }
+        if (name == "_tlv_bootstrap" || name == "tlv_bootstrap") {
+            // The loader stores each thread-local template's address in the descriptor's key word.
+            needsMemory = true;
+            const auto descriptor = arg(0);
+            line(depth, "do");
+            line(depth + 1, std::format("local descriptor = address({})", descriptor.pair()));
+            line(depth + 1, "local base = address(read(8, descriptor + 8))");
+            assign(depth + 1, 0, 8, "base + address(read(8, descriptor + 16)), 0");
+            line(depth, "end");
+            return true;
+        }
+        if (program.darwin && (name == "newlocale" || name == "uselocale" || name == "duplocale" || name == "freelocale" ||
+            name == "querylocale")) {
+            needsProcess = true;
+            if (name == "newlocale" || name == "duplocale")
+                assign(depth, 0, 8, "libc.newlocale()");
+            else if (name == "uselocale")
+                assign(depth, 0, 8, "libc.uselocale()");
+            else if (name == "querylocale")
+                assign(depth, 0, 8, "cachedString(\"C\"), 0");
+            return true;
+        }
+        if (name == "toupper" || name == "tolower") {
+            const auto value = arg(0).lo;
+            const auto [low, high, delta] = name == "toupper" ? std::tuple{97, 122, -32} : std::tuple{65, 90, 32};
+            assign(depth, 0, 4, std::format("if {0} >= {1} and {0} <= {2} then {0} + {3} else {0}", value, low, high, delta));
+            return true;
+        }
+        return false;
+    }
+
     std::optional<Address> resolveTarget(const Value& target, const Constants& constants) const {
         if (const auto* direct = std::get_if<Immediate>(&target))
             return Address(direct->value);
@@ -2438,10 +3647,14 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     Architecture architecture, std::span<const GuestExport> exports,
     std::span<const GuestRegion> regions, std::span<const GuestImport> imports,
     std::span<const GuestObject> objects, std::span<const std::size_t> initializers,
-    std::span<const std::uint8_t> image, std::span<const ir::CodeRange> code, CallingConvention convention) {
+    std::span<const std::uint8_t> image, std::span<const ir::CodeRange> code, CallingConvention convention,
+    const ProgramOptions& program) {
     const bool arm = architecture == Architecture::Arm64;
     const auto loops = recoverLoops(graph);
     Data data{image, regions, imports, code, objects, {}};
+    // Mapped images embed all of their data: references through computed pointers are common.
+    if (!regions.empty())
+        data.materializeAll();
     for (const auto address : references.data)
         data.materializeAddress(address);
     for (const auto& table : references.tables)
@@ -2459,15 +3672,20 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     bool structured = false;
     bool decimal = false;
     bool jumpFrames = false;
+    bool vector = false;
+    bool process = false;
+    bool x87 = false;
     std::map<Address, std::string> functions;
     const auto lower = [&](Address entry) {
         if (functions.contains(entry))
             return;
-        if (auto direct = initializers.empty() ? lowerDirect(graph, entry, arm, convention) : std::nullopt) {
+        if (auto direct = initializers.empty() && program.startup == Startup::Library ?
+            lowerDirect(graph, entry, arm, convention) : std::nullopt) {
             functions.emplace(entry, std::move(*direct));
         } else {
             structured = true;
-            StructuredFunction emitter(graph, references.functions, loops, data, entry, arm, convention, initializers);
+            StructuredFunction emitter(graph, references.functions, loops, data, entry, arm, convention, initializers,
+                program);
             auto body = emitter.lower();
             memory |= emitter.usesMemory();
             flags |= emitter.usesFlags();
@@ -2480,6 +3698,9 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
             prime |= emitter.usesPrime();
             decimal |= emitter.usesDecimal();
             jumpFrames |= emitter.usesJumpFrames();
+            vector |= emitter.usesVector();
+            process |= emitter.usesProcess();
+            x87 |= emitter.usesX87();
             functions.emplace(entry, std::move(body));
         }
     };
@@ -2488,8 +3709,12 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     for (const auto& entry : exports)
         lower(entry.offset);
 
+    if (process)
+        memory = heap = floating = true;
+    if (x87)
+        memory = floating = vector = true;
     const RuntimeFeatures runtime{flags, shifts, division, multiply, jumpFrames, memory, stackGuard, heap, floating, prime,
-        structured, decimal};
-    return printModule(functions, exports, runtime, data);
+        structured, decimal, vector, process, x87};
+    return printModule(functions, exports, runtime, data, program);
 }
 }

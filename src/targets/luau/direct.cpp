@@ -37,7 +37,7 @@ std::optional<std::string> lowerDirect(const Graph& graph, Address entry, bool a
     const auto argumentRegs = argumentRegisters(arm, convention);
     const auto argCount = unsigned(argumentRegs.size());
     const auto usesStack = [&](unsigned reg) { return arm ? reg == 30 || reg == 31 : reg == 4; };
-    std::array<LocalWord, 33> registers{};
+    std::array<LocalWord, RegisterCount> registers{};
     std::array<std::string, MaxOperations> definitions;
     for (unsigned i = 0; i < argCount; ++i) {
         registers[argumentRegs[i]] = {

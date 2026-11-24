@@ -126,7 +126,18 @@ bool observesExitFlags(const Block& block, bool calls) {
     return indirect || (calls && (std::holds_alternative<Call>(block.end) || std::holds_alternative<Return>(block.end)));
 }
 
+static bool x87WritesFlags(const Effect& effect) {
+    const auto* op = std::get_if<X87>(&effect);
+    return op && !op->memory && (op->opcode == 0xdb || op->opcode == 0xdf) && op->modrm >= 0xe8 && op->modrm < 0xf8;
+}
+
+static bool x87ReadsFlags(const Effect& effect) {
+    const auto* op = std::get_if<X87>(&effect);
+    return op && !op->memory && (op->opcode == 0xda || op->opcode == 0xdb) && op->modrm < 0xe0;
+}
+
 bool writesFlags(const Effect& effect) {
+    const auto* byte = std::get_if<ByteBinary>(&effect);
     const auto* binary = std::get_if<Binary>(&effect);
     const auto* multiply = std::get_if<Multiply>(&effect);
     const auto* shift = std::get_if<ShiftRegister>(&effect);
@@ -135,11 +146,12 @@ bool writesFlags(const Effect& effect) {
     const auto* scan = std::get_if<BitScan>(&effect);
     return (binary && binary->flags) || (multiply && multiply->flags) ||
         (shift && shift->flags) || (exchange && exchange->add) ||
-        std::holds_alternative<ByteBinary>(effect) || std::holds_alternative<ByteShift>(effect) ||
+        (byte && byte->flags) || std::holds_alternative<ByteShift>(effect) ||
         std::holds_alternative<Shift>(effect) ||
         (memory && memory->flags) || std::holds_alternative<FloatCompare>(effect) ||
         std::holds_alternative<ConditionalCompare>(effect) || std::holds_alternative<BitTest>(effect) ||
-        (scan && !scan->leadingCount);
+        std::holds_alternative<CompareExchange>(effect) || std::holds_alternative<FloatConditionalCompare>(effect) ||
+        x87WritesFlags(effect) || (scan && !scan->leadingCount);
 }
 
 bool readsFlags(const Effect& effect) {
@@ -153,7 +165,9 @@ bool readsFlags(const Effect& effect) {
         (binary && (binary->keepCarry || binary->withCarry)) || (byte && byte->keepCarry) || (shift && shift->flags) ||
         std::holds_alternative<ByteShift>(effect) ||
         (immediateShift && immediateShift->op >= ShiftOp::RotateRight) ||
-        (registerBinary && registerBinary->withCarry) || std::holds_alternative<BitTest>(effect);
+        (registerBinary && registerBinary->withCarry) || std::holds_alternative<BitTest>(effect) ||
+        std::holds_alternative<FloatSelect>(effect) || std::holds_alternative<FloatConditionalCompare>(effect) ||
+        x87ReadsFlags(effect);
 }
 
 bool overwritesFlags(const Effect& effect) {
@@ -162,8 +176,10 @@ bool overwritesFlags(const Effect& effect) {
     const auto* byte = std::get_if<ByteBinary>(&effect);
     const auto* exchange = std::get_if<Exchange>(&effect);
     return (binary && binary->flags) || (memory && memory->flags && !memory->keepCarry) ||
-        (byte && !byte->keepCarry) || (exchange && exchange->add) ||
-        std::holds_alternative<FloatCompare>(effect) || std::holds_alternative<ConditionalCompare>(effect);
+        (byte && byte->flags && !byte->keepCarry) || (exchange && exchange->add) ||
+        std::holds_alternative<FloatCompare>(effect) || std::holds_alternative<ConditionalCompare>(effect) ||
+        std::holds_alternative<CompareExchange>(effect) || std::holds_alternative<FloatConditionalCompare>(effect) ||
+        x87WritesFlags(effect);
 }
 
 static bool readsIncomingFlags(const Block& block, bool calls) {
@@ -196,6 +212,64 @@ std::set<Address> liveFlagsAtEntry(const Graph& graph, bool calls) {
         for (const auto predecessor : predecessors[work[i]])
             mark(predecessor);
     return live;
+}
+
+bool writesRegister(const Effect& effect, unsigned reg) {
+    if (reg == Zero)
+        return false;
+    const auto registerValue = [reg](const Value& value) {
+        const auto* target = std::get_if<Register>(&value);
+        return target && target->index == reg;
+    };
+    return std::visit(Visit{
+        [](const Nop&) { return false; },
+        [&](const Move& op) { return op.dst == reg || (reg == 4 && std::holds_alternative<StackTop>(op.src)); },
+        [&](const ByteMove& op) { return registerValue(op.dst); },
+        [&](const Exchange& op) { return op.src.index == reg || registerValue(op.dst); },
+        [&](const AtomicAdd& op) { return op.dst == reg; },
+        [&](const Extend& op) { return op.dst == reg; },
+        [&](const ConditionalMove& op) { return op.dst == reg; },
+        [&](const Select& op) { return op.dst == reg; },
+        [](const ConditionalCompare&) { return false; },
+        [&](const Divide&) { return reg == 0 || reg == 2; },
+        [&](const DivideWord& op) { return op.dst == reg; },
+        [&](const Multiply& op) {
+            const bool wide = op.operands == MultiplyOperands::SignedWide || op.operands == MultiplyOperands::UnsignedWide;
+            return op.dst == reg || (wide && reg == 2);
+        },
+        [&](const SetCondition& op) { return registerValue(op.dst); },
+        [&](const Binary& op) { return op.dst == reg; },
+        [&](const MemoryBinary& op) { return op.writeBack && registerValue(op.dst); },
+        [](const Store&) { return false; },
+        [&](const PairTransfer& op) {
+            return (op.load && !op.vector && (op.first == reg || op.second == reg)) ||
+                (op.writeback && op.address.base == reg);
+        },
+        [&](const Push&) { return reg == 4; },
+        [&](const KeepBits& op) { return op.dst == reg; },
+        [&](const ByteBinary& op) { return op.writeBack && registerValue(op.lhs); },
+        [&](const ByteShift& op) { return registerValue(op.dst); },
+        [&](const Shift& op) { return op.dst.index == reg; },
+        [&](const ShiftRegister& op) { return op.dst == reg; },
+        [&](const Extract& op) { return op.dst == reg; },
+        [&](const DoubleShift& op) { return op.dst == reg; },
+        [&](const X87& op) { return reg == 0 && op.opcode == 0xdf && op.modrm == 0xe0; },
+        [&](const Bitfield& op) { return op.dst == reg; },
+        [&](const BitTest& op) { return op.action != BitAction::Test && registerValue(op.target); },
+        [&](const BitScan& op) { return op.dst == reg; },
+        [&](const ByteSwap& op) { return op.dst == reg; },
+        [](const StringDirection&) { return false; },
+        [&](const RepeatStore&) { return reg == 1 || reg == 7; },
+        [&](const StringMove&) { return reg == 1 || reg == 6 || reg == 7; },
+        [&](const CompareExchange&) { return reg == 0; },
+        [&](const CpuId&) { return reg <= 3; },
+        [&](const VectorTransfer& op) { return !op.toXmm && op.gp.index == reg; },
+        [&](const VectorSignMask& op) { return op.dst == reg; },
+        [&](const VectorReduce& op) { return op.gp == reg; },
+        [&](const FloatToInteger& op) { return op.dst == reg; },
+        [&](const InterleavedLoad4&) { return false; },
+        [](const auto&) { return false; },
+    }, effect);
 }
 
 std::optional<std::uint64_t> knownAddress(const EffectiveAddress& address, const Constants& constants) {
@@ -255,12 +329,16 @@ static bool touchesStack(const Effect& effect, unsigned sp) {
         [sp](const Shift& shift) { return shift.dst.index == sp; },
         [sp](const ShiftRegister& shift) { return shift.dst == sp || shift.src.index == sp || shift.count.index == sp; },
         [](const Extract&) { return false; },
+        [sp](const DoubleShift& op) { return op.dst == sp || op.src.index == sp; },
+        [&](const X87& op) { return op.memory && stackAddress(*op.memory); },
         [sp](const Bitfield& field) { return field.dst == sp || field.src.index == sp; },
         [&](const BitTest& op) { return value(op.target) || value(op.index); },
         [&](const BitScan& op) { return op.dst == sp || value(op.src); },
         [sp](const ByteSwap& op) { return op.dst == sp || op.src.index == sp; },
         [](const StringDirection&) { return false; },
         [](const RepeatStore&) { return true; },
+        [](const StringMove&) { return true; },
+        [&](const CompareExchange& op) { return stackAddress(op.address) || op.src.index == sp; },
         [](const CpuId&) { return false; },
         [&](const VectorBinary& b) { return xmm(b.src); },
         [&](const VectorMove& m) { return xmm(m.src) || xmm(m.dst); },
@@ -281,6 +359,19 @@ static bool touchesStack(const Effect& effect, unsigned sp) {
         [&](const IntegerToFloat& c) { return value(c.src); },
         [&](const FloatToInteger& c) { return c.dst == sp || xmm(c.src); },
         [&](const FloatingControl& c) { return stackAddress(c.address); },
+        [&](const VectorLanes& v) { return xmm(v.rhs); },
+        [&](const VectorFloatLanes& v) { return xmm(v.rhs); },
+        [&](const VectorShiftLanes& v) { return v.countOperand && xmm(*v.countOperand); },
+        [&](const VectorPermute& v) { return xmm(v.first) || xmm(v.second); },
+        [&](const VectorConvert& v) { return xmm(v.src); },
+        [sp](const VectorReduce& v) { return v.gp == sp; },
+        [&](const VectorBlend& v) { return xmm(v.yes) || xmm(v.no); },
+        [&](const ScalarFloat& v) { return xmm(v.src); },
+        [](const FusedMultiply&) { return false; },
+        [](const FloatSelect&) { return false; },
+        [](const FloatConditionalCompare&) { return false; },
+        [](const VectorLaneMove&) { return false; },
+        [&](const VectorLaneLoad& v) { return stackAddress(v.address); },
     }, effect);
 }
 
@@ -312,9 +403,11 @@ Features detectFeatures(const Graph& graph, Address entry, bool arm,
         const auto& block = graph.at(work[i]);
         for (const auto& effect : block.effects) {
             features.stack |= touchesStack(effect, sp);
-            features.flags |= std::holds_alternative<Select>(effect) || std::holds_alternative<ConditionalCompare>(effect);
+            features.flags |= std::holds_alternative<Select>(effect) || std::holds_alternative<ConditionalCompare>(effect) ||
+                std::holds_alternative<FloatSelect>(effect) || std::holds_alternative<FloatConditionalCompare>(effect);
             if (const auto* op = std::get_if<Binary>(&effect))
                 features.flags |= op->withCarry;
+            features.flags |= x87ReadsFlags(effect);
             if (const auto* op = std::get_if<MemoryBinary>(&effect))
                 features.flags |= op->withCarry;
             if (const auto* move = std::get_if<ConditionalMove>(&effect)) {

@@ -2,6 +2,8 @@
 #include "formats.h"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <optional>
 
@@ -22,6 +24,10 @@ struct MachUnit {
     Symbols exports;
     std::vector<std::string_view> dependencies;
     std::vector<InitSection> initializers;
+    std::optional<std::uint64_t> entry = {};
+    // Thread-local templates and the descriptors that address them.
+    std::optional<std::size_t> threadTemplate = {};
+    std::vector<std::pair<std::size_t, std::size_t>> threadDescriptors = {};
 };
 
 Symbols definedSymbols(Bytes table, Bytes strings, bool external = false) {
@@ -80,6 +86,13 @@ std::optional<std::uint64_t> findBinding(std::span<const MachUnit> units, const 
             if (symbol != candidate.exports.end() && symbol->second >= candidate.base)
                 return candidate.offset + symbol->second - candidate.base;
         }
+    // Libraries re-export symbols from their own dependencies, as libc++ does for libc++abi.
+    if (!library.empty())
+        for (const auto& candidate : units.subspan(1)) {
+            const auto symbol = candidate.exports.find(name);
+            if (symbol != candidate.exports.end() && symbol->second >= candidate.base)
+                return candidate.offset + symbol->second - candidate.base;
+        }
     return {};
 }
 
@@ -122,9 +135,24 @@ std::size_t addDefaultRuneLocale(Image& image) {
     return at;
 }
 
+// Darwin's __stdinp, __stdoutp, and __stderrp variables, each pointing at a synthetic FILE object.
+std::size_t addStandardStreams(Image& image, ProgramOptions& program) {
+    const auto at = (image.bytes.size() + 15) & ~std::size_t(15);
+    std::vector<std::uint8_t> data(3 * StreamObjectSize + 3 * 8);
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto object = at + i * StreamObjectSize;
+        program.streams[i] = object;
+        for (unsigned byte = 0; byte < 8; ++byte)
+            data[3 * StreamObjectSize + i * 8 + byte] = std::uint8_t(std::uint64_t(object) >> (8 * byte));
+    }
+    image.add(at, data.size(), data, true, true, false);
+    return at;
+}
+
 void applyFixups(Image& image, std::span<const MachUnit> units, const MachUnit& unit,
     std::vector<GuestImport>& imports, std::vector<std::size_t>& functionPointers,
-    std::vector<GuestBinding>& bindings, std::optional<std::size_t>& stackGuard, std::optional<std::size_t>& runeLocale) {
+    std::vector<GuestBinding>& bindings, std::optional<std::size_t>& stackGuard, std::optional<std::size_t>& runeLocale,
+    std::optional<std::size_t>& streams, ProgramOptions& program) {
     const auto fixups = unit.fixups;
     if (read(fixups, 0, 4) != 0 || read(fixups, 20, 4) != 1 || read(fixups, 24, 4) != 0)
         throw std::runtime_error("unsupported Mach-O chained fixup header");
@@ -174,6 +202,12 @@ void applyFixups(Image& image, std::span<const MachUnit> units, const MachUnit& 
                         if (!runeLocale)
                             runeLocale = addDefaultRuneLocale(image);
                         target = *runeLocale;
+                    } else if ((name == "___stdinp" || name == "___stdoutp" || name == "___stderrp") &&
+                        (value & 0xff000000) == 0) {
+                        if (!streams)
+                            streams = addStandardStreams(image, program);
+                        const auto index = name == "___stdinp" ? 0 : name == "___stdoutp" ? 1 : 2;
+                        target = *streams + 3 * StreamObjectSize + index * 8;
                     } else if (name == "___stack_chk_guard" && (value & 0xff000000) == 0) {
                         if (!stackGuard) {
                             constexpr std::array<std::uint8_t, 8> guard{0, 0xa5, 0xa5, 0xa5, 0x5a, 0x5a, 0x5a, 0x5a};
@@ -219,6 +253,7 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
     std::vector<Bytes> segments;
     std::vector<std::string_view> dependencies;
     std::string_view name;
+    std::optional<std::uint64_t> entry;
     Bytes symbols, strings, fixups;
     std::optional<std::uint64_t> base;
     std::size_t offset = 0;
@@ -242,6 +277,9 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
             case 0x0d:
                 name = stringAt(command, read(command, 8, 4));
                 break;
+            case 0x80000028:
+                entry = read(command, 8, 8);
+                break;
             case 0x0c:
             case 0x80000018:
             case 0x8000001f:
@@ -262,6 +300,8 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
 
     const auto firstRegion = image.regions.size();
     std::vector<MachUnit::InitSection> initSections;
+    std::optional<std::size_t> threadTemplate;
+    std::vector<std::pair<std::size_t, std::size_t>> threadDescriptors;
     for (const auto segment : segments) {
         const auto permissions = read(segment, 60, 4);
         const bool writable = (permissions & 2) && !(read(segment, 68, 4) & 0x10);
@@ -280,12 +320,16 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
             image.add(mappedBase + address - *base, length, data, permissions & 1, writable, executable);
             if (type == 9 || type == 0x16)
                 initSections.push_back({mappedBase + address - *base, length, type == 9 ? 8u : 4u});
+            if ((type == 0x11 || type == 0x12) && !threadTemplate)
+                threadTemplate = mappedBase + address - *base;
+            if (type == 0x13)
+                threadDescriptors.emplace_back(mappedBase + address - *base, length);
         }
     }
 
     return {*base, mappedBase, firstRegion, image.regions.size() - firstRegion, name, fixups,
         definedSymbols(symbols, strings), definedSymbols(symbols, strings, true),
-        std::move(dependencies), std::move(initSections)};
+        std::move(dependencies), std::move(initSections), entry, threadTemplate, std::move(threadDescriptors)};
 }
 
 void appendInitializers(const Image& image, const MachUnit& unit, std::vector<std::size_t>& initializers) {
@@ -309,7 +353,11 @@ void appendInitializers(const Image& image, const MachUnit& unit, std::vector<st
 }
 
 std::string binary::recompileMachO(Architecture architecture, Bytes file,
-    std::span<const GuestExport> exports, bool initialize, std::span<const Bytes> libraries) {
+    std::span<const GuestExport> exports, bool initialize, std::span<const Bytes> libraries,
+    const ProgramOptions& options) {
+    auto program = options;
+    program.darwin = true;
+    std::optional<std::size_t> streams;
     Image image;
     std::vector<MachUnit> units{mapMachO(image, architecture, file, 0)};
     for (const auto library : libraries) {
@@ -321,6 +369,10 @@ std::string binary::recompileMachO(Architecture architecture, Bytes file,
             throw std::runtime_error("duplicate Mach-O dependency install name");
         units.push_back(std::move(unit));
     }
+    if (std::getenv("LUFT_DEBUG"))
+        for (const auto& unit : units)
+            std::fprintf(stderr, "Luft: Mach-O %s at guest %#zx (vm base %#llx)\n",
+                std::string(unit.name.empty() ? "main" : unit.name).c_str(), unit.offset, (unsigned long long)unit.base);
     std::vector<GuestImport> imports;
     std::vector<std::size_t> functionPointers;
     std::vector<GuestBinding> bindings;
@@ -330,19 +382,37 @@ std::string binary::recompileMachO(Architecture architecture, Bytes file,
     std::optional<std::size_t> runeLocale;
     for (const auto& unit : units) {
         if (!unit.fixups.empty())
-            applyFixups(image, units, unit, imports, functionPointers, bindings, stackGuard, runeLocale);
+            applyFixups(image, units, unit, imports, functionPointers, bindings, stackGuard, runeLocale, streams, program);
         auto unitObjects = dataObjects(image, unit);
         objects.insert(objects.end(), unitObjects.begin(), unitObjects.end());
+        // A single guest thread keeps each thread-local variable in its template. The descriptor's key word,
+        // which dyld fills with a pthread key, instead records where the template starts.
+        if (unit.threadTemplate)
+            for (const auto& [start, size] : unit.threadDescriptors)
+                for (std::size_t at = start; at + 24 <= start + size; at += 24)
+                    image.relocate(at + 8, *unit.threadTemplate);
     }
     if (runeLocale)
         objects.push_back({*runeLocale, RuneLocaleSize});
-    if (initialize)
+    if (initialize) {
+        // Programs initialize their libraries before the executable itself.
+        if (program.startup != Startup::Library)
+            for (std::size_t i = 1; i < units.size(); ++i)
+                appendInitializers(image, units[i], initializers);
         appendInitializers(image, units.front(), initializers);
+    }
+    if (streams)
+        objects.push_back({*streams, 3 * StreamObjectSize + 3 * 8});
     const auto& main = units.front();
     std::vector<GuestExport> mapped(exports.begin(), exports.end());
     for (auto& entry : mapped) {
         auto address = std::uint64_t(entry.offset);
-        if (!entry.symbol.empty()) {
+        if (entry.symbol == EntrySymbol) {
+            // LC_MAIN stores the entry point as an offset into the __TEXT segment, which maps at the image base.
+            if (!main.entry)
+                throw std::runtime_error("Mach-O has no LC_MAIN entry point");
+            address = main.base + *main.entry;
+        } else if (!entry.symbol.empty()) {
             const auto symbol = main.definitions.find(entry.symbol);
             if (symbol == main.definitions.end())
                 throw std::runtime_error("Mach-O symbol not found: " + entry.symbol);
@@ -351,5 +421,5 @@ std::string binary::recompileMachO(Architecture architecture, Bytes file,
         entry.offset = address >= main.base ? address - main.base : address;
     }
     return recompileMapped(architecture, image.bytes, mapped, image.regions, imports,
-        objects, initializers, CallingConvention::Native, bindings, functionPointers);
+        objects, initializers, CallingConvention::Native, bindings, functionPointers, {}, program);
 }

@@ -25,7 +25,7 @@ struct Instruction {
     std::optional<Terminator> end = {};
     std::optional<Address> addressTaken = {};
     Address next = 0;
-    std::optional<Effect> after = {};
+    std::vector<Effect> after = {};
 };
 
 inline Address signExtend(std::uint32_t value, unsigned bits) {

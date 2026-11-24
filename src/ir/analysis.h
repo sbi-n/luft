@@ -6,7 +6,7 @@
 
 namespace ir {
 std::optional<Address> jumpTarget(const Block& block);
-using Constants = std::array<std::optional<std::uint64_t>, 33>;
+using Constants = std::array<std::optional<std::uint64_t>, RegisterCount>;
 
 void visitEdges(const Block& block, const auto& visit) {
     if (const auto target = jumpTarget(block)) {
@@ -31,6 +31,8 @@ struct Features {
 
 LoopExits recoverLoops(const Graph& graph);
 bool readsFlags(const Effect& effect);
+// Whether the effect may change a general-purpose register (conservatively true for unknown cases).
+bool writesRegister(const Effect& effect, unsigned reg);
 bool writesFlags(const Effect& effect);
 bool overwritesFlags(const Effect& effect);
 bool observesExitFlags(const Block& block, bool calls);

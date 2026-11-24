@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
@@ -76,7 +77,11 @@ int main(int argc, char** argv) {
         "Pass --emit to print standalone Luau source, or --module to print a callable module.\n"
         "Module exports use decimal or hex file offsets and default to entry=0.\n"
         "Arguments are {lo, hi} words passed in the input ABI's integer argument registers.\n"
-        "Mach-O and PE accept symbol names, virtual addresses, or image-relative addresses.\n";
+        "Mach-O and PE accept symbol names, virtual addresses, or image-relative addresses.\n"
+        "Pass --program with an executable format to translate the whole program: the module exports\n"
+        "run({args = {...}, stdin = text, files = {[path] = bytes}}) returning {exitCode, stdout, stderr, files}.\n"
+        "Pass --instruction-limit N to bound guest basic blocks per call (0 disables the check).\n"
+        "Pass --trace to report the most recently executed guest blocks with runtime errors.\n";
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << usage;
         return 0;
@@ -94,6 +99,9 @@ int main(int argc, char** argv) {
 
         bool emit = false;
         bool module = false;
+        bool program = false;
+        bool trace = false;
+        std::optional<std::uint64_t> instructionLimit;
         auto format = Format::Raw;
         bool elfInit = false;
         bool machoInit = false;
@@ -128,9 +136,38 @@ int main(int argc, char** argv) {
                 machoLibraries.push_back(argv[++i]);
             else if (option == "--export" && i + 1 < argc)
                 exports.push_back(parseExport(argv[++i]));
+            else if (option == "--program" && !program)
+                program = true;
+            else if (option == "--trace" && !trace)
+                trace = true;
+            else if (option == "--instruction-limit" && i + 1 < argc && !instructionLimit) {
+                const std::string_view text = argv[++i];
+                std::uint64_t limit = 0;
+                const auto parsed = std::from_chars(text.data(), text.data() + text.size(), limit);
+                if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+                    throw std::runtime_error("invalid --instruction-limit");
+                instructionLimit = limit;
+            }
             else
                 throw std::runtime_error("invalid option: " + std::string(option));
         }
+        ProgramOptions options;
+        if (program) {
+            if (format == Format::Raw || module || emit || !exports.empty())
+                throw std::runtime_error("--program requires --elf, --macho, or --pe without --module, --emit, or --export");
+            module = true;
+            exports.push_back({"run", 0, std::string(EntrySymbol)});
+            options.startup = format == Format::Elf ? Startup::ElfStack :
+                format == Format::MachO ? Startup::MainArguments : Startup::WindowsProcess;
+            options.instructionLimit = 0;
+            if (format == Format::Elf)
+                elfInit = true;
+            else if (format == Format::MachO)
+                machoInit = true;
+        }
+        if (instructionLimit)
+            options.instructionLimit = *instructionLimit;
+        options.trace = trace;
         if (emit && module)
             throw std::runtime_error("choose either --emit or --module");
         if (format != Format::Raw && (!module || exports.empty()))
@@ -163,9 +200,13 @@ int main(int argc, char** argv) {
         std::string source;
         switch (format) {
             case Format::Raw: source = recompile(architecture, image, exports); break;
-            case Format::Elf: source = recompileElf(architecture, image, exports, elfInit, libraries); break;
-            case Format::MachO: source = binary::recompileMachO(architecture, image, exports, machoInit, libraries); break;
-            case Format::Pe: source = binary::recompilePe(architecture, image, exports, peInitializers, peInitRanges); break;
+            case Format::Elf: source = recompileElf(architecture, image, exports, elfInit, libraries, options); break;
+            case Format::MachO:
+                source = binary::recompileMachO(architecture, image, exports, machoInit, libraries, options);
+                break;
+            case Format::Pe:
+                source = binary::recompilePe(architecture, image, exports, peInitializers, peInitRanges, options);
+                break;
         }
         if (emit || module) {
             std::cout << source;

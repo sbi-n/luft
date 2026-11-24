@@ -2,6 +2,7 @@
 
 #include <array>
 #include <bit>
+#include <format>
 #include <utility>
 
 namespace ir::decode {
@@ -13,8 +14,422 @@ unsigned armReg(unsigned index) {
 Instruction transfer(Effect effect, unsigned base, Address writeback) {
     Instruction instruction{std::move(effect)};
     if (writeback)
-        instruction.after = Binary{BinaryOp::Add, 8, base, base, immediate(writeback), false};
+        instruction.after = {Binary{BinaryOp::Add, 8, base, base, immediate(writeback), false}};
     return instruction;
+}
+}
+
+namespace {
+std::uint64_t expandFloatImmediate(unsigned imm8, unsigned size) {
+    const std::uint64_t sign = imm8 >> 7;
+    const std::uint64_t b6 = (imm8 >> 6) & 1;
+    const std::uint64_t exponent = (imm8 >> 4) & 3;
+    const std::uint64_t fraction = imm8 & 15;
+    if (size == 4)
+        return sign << 31 | (b6 ^ 1) << 30 | (b6 ? 0x1full : 0) << 25 | exponent << 23 | fraction << 19;
+    return sign << 63 | (b6 ^ 1) << 62 | (b6 ? 0xffull : 0) << 54 | exponent << 52 | fraction << 48;
+}
+
+std::array<std::uint32_t, 4> splitLanes(std::uint64_t value, bool both) {
+    const auto lo = std::uint32_t(value), hi = std::uint32_t(value >> 32);
+    return {lo, hi, both ? lo : 0, both ? hi : 0};
+}
+
+// AdvSIMD and floating-point encodings beyond the forms decodeArm matches directly.
+std::optional<Instruction> decodeArmSimd(std::uint32_t word) {
+    const unsigned rd = word & 31;
+    const unsigned rn = (word >> 5) & 31;
+    const unsigned rm = (word >> 16) & 31;
+    const bool q = word & 0x40000000;
+    const bool u = word & 0x20000000;
+    const unsigned width = q ? 16 : 8;
+    const VectorRegister vd{rd}, vn{rn}, vm{rm}, temp{VectorTemp};
+    const unsigned type = (word >> 22) & 3;
+    const unsigned scalar = type == 1 ? 8 : 4;
+    const auto withTemp = [](Effect first, std::vector<Effect> rest) {
+        Instruction instruction{std::move(first)};
+        instruction.after = std::move(rest);
+        return instruction;
+    };
+
+    if ((word & 0xff201fe0) == 0x1e201000) {
+        if (type > 1)
+            unsupported();
+        const auto bits = expandFloatImmediate((word >> 13) & 0xff, scalar);
+        return Instruction{VectorImmediate{vd, splitLanes(bits, false)}};
+    }
+    if ((word & 0xff207c00) == 0x1e204000 && type <= 1) {
+        switch ((word >> 15) & 0x3f) {
+            case 0: return Instruction{VectorMove{vd, vn, scalar}};
+            case 2: return Instruction{ScalarFloat{ScalarFloatOp::Negate, scalar, vd, vn}};
+            case 8: case 14: case 15: return Instruction{ScalarFloat{ScalarFloatOp::RoundNearestEven, scalar, vd, vn}};
+            case 9: return Instruction{ScalarFloat{ScalarFloatOp::Ceil, scalar, vd, vn}};
+            case 10: return Instruction{ScalarFloat{ScalarFloatOp::Floor, scalar, vd, vn}};
+            case 11: return Instruction{ScalarFloat{ScalarFloatOp::Truncate, scalar, vd, vn}};
+            case 12: return Instruction{ScalarFloat{ScalarFloatOp::RoundAway, scalar, vd, vn}};
+            default: return std::nullopt;
+        }
+    }
+    if ((word & 0xff200c00) == 0x1e200800 && type <= 1) {
+        constexpr std::array ops{ScalarFloatOp::ArmMax, ScalarFloatOp::ArmMin, ScalarFloatOp::MaxNumber,
+            ScalarFloatOp::MinNumber, ScalarFloatOp::NegateMultiply};
+        const auto opcode = (word >> 12) & 15;
+        if (opcode >= 4 && opcode <= 8)
+            return Instruction{ScalarFloat{ops[opcode - 4], scalar, vd, vm, vn}};
+        return std::nullopt;
+    }
+    if ((word & 0xff000000) == 0x1f000000) {
+        if (type > 1)
+            unsupported();
+        const bool o1 = word & 0x00200000;
+        const bool o0 = word & 0x8000;
+        return Instruction{FusedMultiply{scalar, vd, vn, vm, VectorRegister{(word >> 10) & 31}, o0 != o1, o1}};
+    }
+    if ((word & 0xff200c00) == 0x1e200c00 && type <= 1)
+        return Instruction{FloatSelect{scalar, vd, vn, vm, (word >> 12) & 15}};
+    if ((word & 0xff200c00) == 0x1e200400 && type <= 1)
+        return Instruction{FloatConditionalCompare{scalar, vn, vm, (word >> 12) & 15, word & 15}};
+
+    const unsigned integerSize = word >> 31 ? 8 : 4;
+    const auto convert = word & 0x7fbffc00;
+    if (convert == 0x1e200000 || convert == 0x1e210000 || convert == 0x1e240000 || convert == 0x1e250000)
+        return Instruction{FloatToInteger{integerSize, rd == 31 ? Zero : rd, scalar, vn, !(convert & 0x10000),
+            convert & 0x40000 ? Rounding::Away : Rounding::NearestEven}};
+    const auto fixed = word & 0x7f3f0000;
+    if ((fixed == 0x1e020000 || fixed == 0x1e030000 || fixed == 0x1e180000 || fixed == 0x1e190000) && type <= 1) {
+        const auto fraction = 64 - ((word >> 10) & 63);
+        if (fraction > integerSize * 8)
+            unsupported();
+        if (fixed <= 0x1e030000)
+            return Instruction{IntegerToFloat{scalar, vd, integerSize, Register{rn == 31 ? Zero : rn}, fixed == 0x1e020000,
+                fraction}};
+        return Instruction{FloatToInteger{integerSize, rd == 31 ? Zero : rd, scalar, vn, fixed == 0x1e180000,
+            Rounding::Truncate, fraction}};
+    }
+    if ((word & 0xdfbffc00) == 0x5e21d800) {
+        const unsigned size = word & 0x00400000 ? 8 : 4;
+        return withTemp(VectorTransfer{Register{Temp}, vn, false, size},
+            {IntegerToFloat{size, vd, size, Register{Temp}, !u}});
+    }
+    if ((word & 0xdfbffc00) == 0x5ea1b800) {
+        const unsigned size = word & 0x00400000 ? 8 : 4;
+        return withTemp(FloatToInteger{size, Temp, size, vn, !u}, {VectorTransfer{Register{Temp}, vd, true, size}});
+    }
+    if ((word & 0xfffefc00) == 0x9eae0000) {
+        // FMOV between a general register and the upper half of a vector register.
+        const bool toVector = word & 0x10000;
+        return Instruction{VectorTransfer{Register{toVector ? (rn == 31 ? Zero : rn) : (rd == 31 ? Zero : rd)},
+            toVector ? vd : vn, toVector, 8, 1}};
+    }
+
+    if ((word & 0x9ff80400) == 0x0f000400) {
+        const bool op = u;
+        const auto cmode = (word >> 12) & 15;
+        const std::uint64_t imm8 = ((word >> 11) & 0xe0) | ((word >> 5) & 0x1f);
+        std::uint64_t value = 0;
+        enum { MoveImmediate, OrImmediate, ClearImmediate } kind = MoveImmediate;
+        bool invert = false;
+        if (cmode < 8) {
+            value = (imm8 << (8 * (cmode >> 1))) * 0x0000000100000001ull;
+            kind = cmode & 1 ? (op ? ClearImmediate : OrImmediate) : MoveImmediate;
+            invert = op && !(cmode & 1);
+        } else if (cmode < 12) {
+            value = (imm8 << (8 * ((cmode >> 1) & 1))) * 0x0001000100010001ull;
+            kind = cmode & 1 ? (op ? ClearImmediate : OrImmediate) : MoveImmediate;
+            invert = op && !(cmode & 1);
+        } else if (cmode < 14) {
+            const auto word32 = cmode == 12 ? (imm8 << 8) | 0xff : (imm8 << 16) | 0xffff;
+            value = word32 * 0x0000000100000001ull;
+            invert = op;
+        } else if (cmode == 14) {
+            if (!op) {
+                value = imm8 * 0x0101010101010101ull;
+            } else {
+                for (unsigned bit = 0; bit < 8; ++bit)
+                    if (imm8 & (1u << bit))
+                        value |= 0xffull << (bit * 8);
+            }
+        } else {
+            if (op && !q)
+                unsupported();
+            value = op ? expandFloatImmediate(unsigned(imm8), 8) :
+                expandFloatImmediate(unsigned(imm8), 4) * 0x0000000100000001ull;
+        }
+        if (invert)
+            value = ~value;
+        const auto lanes = splitLanes(value, q);
+        if (kind == MoveImmediate)
+            return Instruction{VectorImmediate{vd, lanes}};
+        if (kind == OrImmediate)
+            return withTemp(VectorImmediate{temp, lanes}, {VectorBinary{VectorOp::Or, vd, temp, vd, width}});
+        return withTemp(VectorImmediate{temp, lanes}, {VectorBinary{VectorOp::AndNot, vd, vd, temp, width}});
+    }
+
+    const auto elementOf = [](unsigned imm5) -> std::pair<unsigned, unsigned> {
+        const auto shift = unsigned(std::countr_zero(imm5));
+        if (shift > 3)
+            unsupported();
+        return {1u << shift, imm5 >> (shift + 1)};
+    };
+    if ((word & 0xbfe0fc00) == 0x0e000400 || (word & 0xffe0fc00) == 0x5e000400) {
+        const bool scalarForm = (word & 0xffe0fc00) == 0x5e000400;
+        const auto [element, index] = elementOf((word >> 16) & 31);
+        std::array<std::uint8_t, 16> bytes;
+        bytes.fill(255);
+        const unsigned length = scalarForm ? element : width;
+        for (unsigned i = 0; i < length; ++i)
+            bytes[i] = std::uint8_t(index * element + i % element);
+        return Instruction{VectorPermute{vd, vn, vn, bytes}};
+    }
+    if ((word & 0xffe08400) == 0x6e000400) {
+        const auto imm5 = (word >> 16) & 31;
+        const auto [element, dstIndex] = elementOf(imm5);
+        const auto srcIndex = ((word >> 11) & 15) >> std::countr_zero(imm5);
+        return Instruction{VectorLaneMove{element, vd, dstIndex, vn, srcIndex}};
+    }
+    if ((word & 0xbfe0fc00) == 0x0e003c00 || (word & 0xbfe0fc00) == 0x0e002c00) {
+        const auto [element, index] = elementOf((word >> 16) & 31);
+        const auto target = rd == 31 ? Zero : rd;
+        if ((word & 0xbfe0fc00) == 0x0e003c00)
+            return Instruction{VectorTransfer{Register{target}, vn, false, element, index}};
+        return withTemp(VectorTransfer{Register{Temp}, vn, false, element, index},
+            {Extend{q ? 8u : 4u, target, Register{Temp}, element * 8, 0, true}});
+    }
+    if ((word & 0xffe0fc00) == 0x4e001c00) {
+        const auto [element, index] = elementOf((word >> 16) & 31);
+        return Instruction{VectorTransfer{Register{rn == 31 ? Zero : rn}, vd, true, element, index}};
+    }
+    if ((word & 0xbfe08400) == 0x2e000000) {
+        const auto start = (word >> 11) & 15;
+        std::array<std::uint8_t, 16> bytes;
+        bytes.fill(255);
+        for (unsigned i = 0; i < width; ++i) {
+            const auto index = start + i;
+            bytes[i] = std::uint8_t(index < width ? index : 16 + index - width);
+        }
+        return Instruction{VectorPermute{vd, vn, vm, bytes}};
+    }
+    if ((word & 0xbf208c00) == 0x0e000800) {
+        const auto opcode = (word >> 12) & 7;
+        const unsigned element = 1u << ((word >> 22) & 3);
+        const unsigned count = width / element;
+        std::array<std::uint8_t, 16> bytes;
+        bytes.fill(255);
+        for (unsigned i = 0; i < count; ++i) {
+            unsigned source = 0, lane = 0;
+            switch (opcode) {
+                case 1: case 5: source = i < count / 2 ? 0 : 1; lane = 2 * (i % (count / 2)) + (opcode == 5); break;
+                case 2: case 6: source = i % 2; lane = (i & ~1u) + (opcode == 6); break;
+                case 3: case 7: source = i % 2; lane = i / 2 + (opcode == 7 ? count / 2 : 0); break;
+                default: unsupported();
+            }
+            for (unsigned b = 0; b < element; ++b)
+                bytes[i * element + b] = std::uint8_t(source * 16 + lane * element + b);
+        }
+        return Instruction{VectorPermute{vd, vn, vm, bytes}};
+    }
+
+    if ((word & 0x9f3e0c00) == 0x0e200800) {
+        const auto opcode = (word >> 12) & 0x1f;
+        const unsigned size = (word >> 22) & 3;
+        const unsigned element = 1u << size;
+        const unsigned floatElement = size & 1 ? 8 : 4;
+        const bool high = size & 2;
+        if (opcode <= 1) {
+            const unsigned container = opcode == 1 ? 2 : u ? 4 : 8;
+            if (element >= container)
+                unsupported();
+            std::array<std::uint8_t, 16> bytes;
+            bytes.fill(255);
+            for (unsigned at = 0; at < width; at += element) {
+                const auto base = at - at % container;
+                const auto mirrored = base + container - element - (at - base);
+                for (unsigned b = 0; b < element; ++b)
+                    bytes[at + b] = std::uint8_t(mirrored + b);
+            }
+            return Instruction{VectorPermute{vd, vn, vn, bytes}};
+        }
+        if (opcode == 0x0f && high)
+            return Instruction{VectorFloatLanes{u ? FloatLaneOp::Negate : FloatLaneOp::Absolute, floatElement, vd, vn,
+                std::nullopt, width}};
+        if (opcode == 0x1f && high && u)
+            return Instruction{VectorFloatLanes{FloatLaneOp::Sqrt, floatElement, vd, vn, std::nullopt, width}};
+        if (opcode == 0x17 && !u && !high && (size & 1))
+            return Instruction{VectorConvert{LaneConversion::FloatToDouble, vd, vn, 4, q}};
+        if (opcode == 0x16 && !u && !high && (size & 1))
+            return Instruction{VectorConvert{LaneConversion::DoubleToFloat, vd, vn, 8, q}};
+        if (opcode == 0x1d && !high)
+            return Instruction{VectorConvert{u ? LaneConversion::UnsignedToFloat : LaneConversion::SignedToFloat, vd, vn,
+                floatElement, false, 0, width}};
+        if (opcode == 0x1b && high)
+            return Instruction{VectorConvert{u ? LaneConversion::FloatToUnsigned : LaneConversion::FloatToSigned, vd, vn,
+                floatElement, false, 0, width}};
+        if (opcode == 0x12 && !u && size < 3)
+            return Instruction{VectorConvert{LaneConversion::Narrow, vd, vn, element * 2, q}};
+        if (opcode == 0x05 && u && size == 0) {
+            return withTemp(VectorImmediate{temp, {~0u, ~0u, ~0u, ~0u}},
+                {VectorBinary{VectorOp::Xor, vd, temp, vn, width}});
+        }
+        const auto zeroCompare = [&](LaneOp op, bool zeroFirst) {
+            const auto other = zeroFirst ? vn : temp;
+            return withTemp(VectorImmediate{temp, {0, 0, 0, 0}},
+                {VectorLanes{op, element, vd, other, zeroFirst ? temp : vn, width}});
+        };
+        if (opcode == 0x09 && !u) return zeroCompare(LaneOp::Equal, false);
+        if (opcode == 0x08) return zeroCompare(u ? LaneOp::GreaterEqualSigned : LaneOp::GreaterSigned, false);
+        if (opcode == 0x09 && u) return zeroCompare(LaneOp::GreaterEqualSigned, true);
+        if (opcode == 0x0a && !u) return zeroCompare(LaneOp::GreaterSigned, true);
+        if (opcode == 0x0b && u) return zeroCompare(LaneOp::Sub, true);
+        return std::nullopt;
+    }
+    if ((word & 0x9f3e0c00) == 0x0e300800) {
+        const auto opcode = (word >> 12) & 0x1f;
+        const unsigned element = 1u << ((word >> 22) & 3);
+        std::optional<ReduceOp> op;
+        if (opcode == 0x1b && !u) op = ReduceOp::Add;
+        else if (opcode == 0x03 && u) op = ReduceOp::AddLong;
+        else if (opcode == 0x0a) op = u ? ReduceOp::MaxUnsigned : ReduceOp::MaxSigned;
+        else if (opcode == 0x1a) op = u ? ReduceOp::MinUnsigned : ReduceOp::MinSigned;
+        if (op)
+            return Instruction{VectorReduce{*op, element, vd, vn, width}};
+        return std::nullopt;
+    }
+    if ((word & 0x9f200400) == 0x0e200400) {
+        const auto opcode = (word >> 11) & 0x1f;
+        const unsigned size = (word >> 22) & 3;
+        const unsigned element = 1u << size;
+        if (opcode >= 0x18) {
+            const bool a = size & 2;
+            const unsigned floatElement = size & 1 ? 8 : 4;
+            std::optional<FloatLaneOp> op;
+            if (opcode == 0x1a && !u) op = a ? FloatLaneOp::Sub : FloatLaneOp::Add;
+            else if (opcode == 0x1b && u && !a) op = FloatLaneOp::Mul;
+            else if (opcode == 0x1f && u && !a) op = FloatLaneOp::Div;
+            else if (opcode == 0x1e && !u) op = a ? FloatLaneOp::ArmMin : FloatLaneOp::ArmMax;
+            else if (opcode == 0x18 && !u) op = a ? FloatLaneOp::MinNumber : FloatLaneOp::MaxNumber;
+            else if (opcode == 0x1c && !u && !a) op = FloatLaneOp::Equal;
+            else if (opcode == 0x1c && u) op = a ? FloatLaneOp::Greater : FloatLaneOp::GreaterEqual;
+            if (op)
+                return Instruction{VectorFloatLanes{*op, floatElement, vd, vm, vn, width}};
+            if (opcode == 0x19 && !u)
+                return withTemp(VectorFloatLanes{FloatLaneOp::Mul, floatElement, temp, vm, vn, width},
+                    {VectorFloatLanes{a ? FloatLaneOp::Sub : FloatLaneOp::Add, floatElement, vd, temp, vd, width}});
+            return std::nullopt;
+        }
+        if (opcode == 0x03) {
+            if (!u && size == 1)
+                return Instruction{VectorBinary{VectorOp::AndNot, vd, vn, vm, width}};
+            if (u && size == 1)
+                return Instruction{VectorBlend{vd, vn, vm, vd}};
+            if (u && size == 2)
+                return Instruction{VectorBlend{vd, vn, vd, vm}};
+            if (u && size == 3)
+                return Instruction{VectorBlend{vd, vd, vn, vm}};
+            return std::nullopt;
+        }
+        std::optional<LaneOp> op;
+        switch (opcode) {
+            case 0x10: op = u ? LaneOp::Sub : LaneOp::Add; break;
+            case 0x06: op = u ? LaneOp::Higher : LaneOp::GreaterSigned; break;
+            case 0x07: op = u ? LaneOp::HigherSame : LaneOp::GreaterEqualSigned; break;
+            case 0x11: if (u) op = LaneOp::Equal; break;
+            case 0x0c: op = u ? LaneOp::MaxUnsigned : LaneOp::MaxSigned; break;
+            case 0x0d: op = u ? LaneOp::MinUnsigned : LaneOp::MinSigned; break;
+            case 0x0e: if (u) op = LaneOp::AbsoluteDifference; break;
+            case 0x13: if (!u) op = LaneOp::Mul; break;
+            case 0x01: op = u ? LaneOp::AddSaturateUnsigned : LaneOp::AddSaturateSigned; break;
+            case 0x05: op = u ? LaneOp::SubSaturateUnsigned : LaneOp::SubSaturateSigned; break;
+            case 0x02: if (u) op = LaneOp::AverageUnsigned; break;
+            case 0x12:
+                return withTemp(VectorLanes{LaneOp::Mul, element, temp, vm, vn, width},
+                    {VectorLanes{u ? LaneOp::Sub : LaneOp::Add, element, vd, temp, vd, width}});
+        }
+        if (op)
+            return Instruction{VectorLanes{*op, element, vd, vm, vn, width}};
+        return std::nullopt;
+    }
+    if ((word & 0x9f800400) == 0x0f000400 && ((word >> 19) & 15) != 0) {
+        const auto immh = (word >> 19) & 15;
+        const auto immediate = (word >> 16) & 0x7f;
+        const unsigned element = immh >= 8 ? 8 : immh >= 4 ? 4 : immh >= 2 ? 2 : 1;
+        const unsigned bits = element * 8;
+        const auto opcode = (word >> 11) & 0x1f;
+        const auto right = 2 * bits - immediate;
+        const auto left = immediate - bits;
+        if (opcode == 0x00)
+            return Instruction{VectorShiftLanes{u ? ShiftOp::LogicalRight : ShiftOp::ArithmeticRight, element, vd, vn,
+                right, std::nullopt, width}};
+        if (opcode == 0x02)
+            return withTemp(VectorShiftLanes{u ? ShiftOp::LogicalRight : ShiftOp::ArithmeticRight, element, temp, vn,
+                right, std::nullopt, width}, {VectorLanes{LaneOp::Add, element, vd, temp, vd, width}});
+        if (opcode == 0x0a && !u)
+            return Instruction{VectorShiftLanes{ShiftOp::Left, element, vd, vn, left, std::nullopt, width}};
+        if (opcode == 0x14 && element < 8)
+            return Instruction{VectorConvert{u ? LaneConversion::WidenUnsigned : LaneConversion::WidenSigned, vd, vn,
+                element, q, left}};
+        if (opcode == 0x10 && !u && element < 8)
+            return withTemp(VectorShiftLanes{ShiftOp::LogicalRight, element * 2, temp, vn, right, std::nullopt, 16},
+                {VectorConvert{LaneConversion::Narrow, vd, temp, element * 2, q}});
+        return std::nullopt;
+    }
+    if ((word & 0xbf9f0000) == 0x0d000000 || (word & 0xbf800000) == 0x0d800000) {
+        // LD1 (single structure) and LD1R, with optional post-index.
+        const bool load = word & 0x00400000;
+        const bool replicate = (word >> 13 & 7) == 6;
+        if (!load || (word & 0x00200000))
+            return std::nullopt;
+        const auto opcode = (word >> 13) & 7;
+        const auto size = (word >> 10) & 3;
+        const bool s = word & 0x1000;
+        unsigned element = 0, lane = 0;
+        if (replicate) {
+            element = 1u << size;
+        } else if (opcode == 0) {
+            element = 1; lane = (q << 3) | (s << 2) | size;
+        } else if (opcode == 2) {
+            element = 2; lane = (q << 2) | (s << 1) | (size >> 1);
+        } else if (opcode == 4 && size == 0) {
+            element = 4; lane = (q << 1) | s;
+        } else if (opcode == 4 && size == 1 && !s) {
+            element = 8; lane = q;
+        } else {
+            unsupported();
+        }
+        Instruction instruction{VectorLaneLoad{element, vd, lane, {rn, 0}, replicate, width}};
+        if (word & 0x00800000) {
+            if (rm == 31)
+                instruction.after.push_back(Binary{BinaryOp::Add, 8, rn, rn, immediate(element), false});
+            else
+                instruction.after.push_back(Binary{BinaryOp::Add, 8, rn, rn, Register{rm}, false});
+        }
+        return instruction;
+    }
+    if ((word & 0xbfbf0000) == 0x0c000000 || (word & 0xbfa00000) == 0x0c800000) {
+        // LD1/ST1 (multiple structures) with one to four consecutive registers.
+        const bool load = word & 0x00400000;
+        const auto opcode = (word >> 12) & 15;
+        const unsigned count = opcode == 7 ? 1 : opcode == 10 ? 2 : opcode == 6 ? 3 : opcode == 2 ? 4 : 0;
+        if (!count)
+            return std::nullopt;
+        Instruction instruction;
+        for (unsigned i = 0; i < count; ++i) {
+            const VectorRegister reg{(rd + i) % 32};
+            const VectorMemory memory{{rn, Address(i * width)}, false};
+            Effect effect = load ? Effect(VectorMove{reg, memory, width}) : Effect(VectorMove{memory, reg, width});
+            if (i == 0)
+                instruction.effect = effect;
+            else
+                instruction.after.push_back(effect);
+        }
+        if (word & 0x00800000) {
+            if (rm == 31)
+                instruction.after.push_back(Binary{BinaryOp::Add, 8, rn, rn, immediate(count * width), false});
+            else
+                instruction.after.push_back(Binary{BinaryOp::Add, 8, rn, rn, Register{rm}, false});
+        }
+        return instruction;
+    }
+    return std::nullopt;
 }
 }
 
@@ -32,8 +447,10 @@ Instruction decodeArm(Reader& reader) {
     const auto arithmetic = operation & 2 ? BinaryOp::Sub : BinaryOp::Add;
     const auto next = reader.pc;
 
-    if (word == 0xd503201f)
-        return {};
+    if ((word & 0xfffff01f) == 0xd503201f || (word & 0xfffff09f) == 0xd503309f)
+        return {}; // Hints (NOP, BTI, PAC) and barriers have no single-threaded effect.
+    if ((word & 0xffe0001f) == 0xd4200000 || (word & 0xffe0001f) == 0xd4400000 || (word >> 16) == 0)
+        return {.end = Trap{std::format("guest trap instruction at guest offset {}", pc)}};
     if ((word & 0xfffffc1f) == 0xd65f0000)
         return {.end = Return{Register{armReg(rn)}}};
     if ((word & 0xfffffc1f) == 0xd61f0000)
@@ -204,7 +621,8 @@ Instruction decodeArm(Reader& reader) {
     if (floatBinary == 0x1e200800 || floatBinary == 0x1e201800 ||
         floatBinary == 0x1e202800 || floatBinary == 0x1e203800) {
         constexpr std::array operations{FloatOp::Mul, FloatOp::Div, FloatOp::Add, FloatOp::Sub};
-        return {FloatBinary{operations[(word >> 12) & 3], floatSize, floatSize, VectorRegister{rd}, VectorRegister{rm}}};
+        return {FloatBinary{operations[(word >> 12) & 3], floatSize, floatSize, VectorRegister{rd}, VectorRegister{rm},
+            VectorRegister{rn}}};
     }
     if ((word & 0xffa0fc07) == 0x1e202000) {
         const auto rhs = word & 8 ? std::optional<VectorOperand>{} : VectorOperand(VectorRegister{rm});
@@ -315,6 +733,8 @@ Instruction decodeArm(Reader& reader) {
         const auto upper = word & 0x40000000 ? lane : 0;
         return {VectorImmediate{VectorRegister{rd}, {lane, lane, upper, upper}}};
     }
+    if (auto simd = decodeArmSimd(word))
+        return std::move(*simd);
     const auto pairOpcode = word & 0x3e000000;
     if (pairOpcode == 0x28000000 || pairOpcode == 0x2c000000) {
         const bool vector = pairOpcode == 0x2c000000;
@@ -338,7 +758,7 @@ Instruction decodeArm(Reader& reader) {
     const bool vectorIndexed = (word & 0x3f200c00) == 0x3c200800;
     if (vectorScaled || vectorIndexed || (word & 0x3f200000) == 0x3c000000) {
         const unsigned width = word & 0x00800000 ? 16 : 1u << (word >> 30);
-        if (width < 4 || (width == 16 && (word >> 30) != 0))
+        if (width == 16 && (word >> 30) != 0)
             unsupported();
         const auto offset = vectorScaled ? Address(((word >> 10) & 0xfff) * width)
                                         : signExtend((word >> 12) & 0x1ff, 9);

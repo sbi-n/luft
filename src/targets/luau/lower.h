@@ -32,7 +32,9 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     Architecture architecture, std::span<const GuestExport> exports,
     std::span<const GuestRegion> regions, std::span<const GuestImport> imports,
     std::span<const GuestObject> objects, std::span<const std::size_t> initializers,
-    std::span<const std::uint8_t> image, std::span<const ir::CodeRange> code, CallingConvention convention);
+    std::span<const std::uint8_t> image, std::span<const ir::CodeRange> code, CallingConvention convention,
+    const ProgramOptions& program = {});
 std::string printModule(const std::map<ir::Address, std::string>& functions,
-    std::span<const GuestExport> exports, const RuntimeFeatures& runtime, const Data& data);
+    std::span<const GuestExport> exports, const RuntimeFeatures& runtime, const Data& data,
+    const ProgramOptions& program = {});
 }

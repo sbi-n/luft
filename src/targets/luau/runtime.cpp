@@ -178,6 +178,15 @@ local function bitfieldWord(size: number, start: number, width: number, position
     return lo, if size == 8 then hi else 0
 end
 
+local function doubleShift(left: boolean, size: number, count: number, dlo: number, dhi: number,
+    slo: number, shi: number): (number, number)
+    count %= if size == 8 then 64 else 32
+    if count == 0 then return dlo, if size == 8 then dhi else 0 end
+    local alo, ahi = shiftParts(if left then 0 else 1, size, count, dlo, dhi)
+    local blo, bhi = shiftParts(if left then 1 else 0, size, size * 8 - count, slo, shi)
+    return bit32.bor(alo, blo), if size == 8 then bit32.bor(ahi, bhi) else 0
+end
+
 local function shiftRegister(op: number, size: number, count: number, lo: number, hi: number): (number, number)
     count %= size * 8
     if count == 0 then return lo, if size == 8 then hi else 0 end
@@ -270,6 +279,648 @@ local function truncateFloat(size: number, arm: boolean, signed: boolean, value:
     return n % 4294967296, if size == 8 then math.floor(n / 4294967296) % 4294967296 else 0
 end
 )";
+
+// Vector lanes are four little-endian 32-bit words. Element access goes through scratch buffers.
+constexpr std::string_view VectorOperators = R"(
+local laneA, laneB, laneR = buffer.create(16), buffer.create(16), buffer.create(16)
+
+local function storeLanes(target: buffer, a: number, b: number, c: number, d: number)
+    buffer.writeu32(target, 0, a)
+    buffer.writeu32(target, 4, b)
+    buffer.writeu32(target, 8, c)
+    buffer.writeu32(target, 12, d)
+end
+
+local function loadLanes(source: buffer, size: number): (number, number, number, number)
+    if size == 8 then
+        return buffer.readu32(source, 0), buffer.readu32(source, 4), 0, 0
+    end
+    return buffer.readu32(source, 0), buffer.readu32(source, 4), buffer.readu32(source, 8), buffer.readu32(source, 12)
+end
+
+local function readLane(source: buffer, at: number, element: number, signed: boolean): number
+    if element == 1 then
+        return if signed then buffer.readi8(source, at) else buffer.readu8(source, at)
+    elseif element == 2 then
+        return if signed then buffer.readi16(source, at) else buffer.readu16(source, at)
+    end
+    return if signed then buffer.readi32(source, at) else buffer.readu32(source, at)
+end
+
+local function writeLane(target: buffer, at: number, element: number, value: number)
+    if element == 1 then
+        buffer.writeu8(target, at, value % 256)
+    elseif element == 2 then
+        buffer.writeu16(target, at, value % 65536)
+    else
+        buffer.writeu32(target, at, value % 4294967296)
+    end
+end
+
+local function multiplyLow32(a: number, b: number): number
+    local al, ah = a % 65536, math.floor(a / 65536)
+    return ((ah * (b % 65536) + al * math.floor(b / 65536)) % 65536 * 65536 + al * (b % 65536)) % 4294967296
+end
+
+-- LaneOp order matches the IR enumeration.
+local signedLaneOps = {[4] = true, [5] = true, [8] = true, [9] = true, [13] = true, [15] = true, [18] = true}
+
+local function wideLanes(op: number, alo: number, ahi: number, blo: number, bhi: number): (number, number)
+    if op == 0 or op == 1 then
+        local sum = if op == 0 then alo + blo else alo - blo
+        local high = if op == 0 then ahi + bhi else ahi - bhi
+        return sum % 4294967296, (high + math.floor(sum / 4294967296)) % 4294967296
+    elseif op == 20 then
+        local al, ah = alo % 65536, math.floor(alo / 65536)
+        local bl, bh = blo % 65536, math.floor(blo / 65536)
+        local cross = al * bh + ah * bl
+        local lower = al * bl + cross % 65536 * 65536
+        local upper = ah * bh + math.floor(cross / 65536) + math.floor(lower / 4294967296)
+        return lower % 4294967296, upper % 4294967296
+    end
+    local sa, sb = ahi, bhi
+    if signedLaneOps[op] then
+        sa = if ahi >= 2147483648 then ahi - 4294967296 else ahi
+        sb = if bhi >= 2147483648 then bhi - 4294967296 else bhi
+    end
+    local greater = sa > sb or (sa == sb and alo > blo)
+    local equal = sa == sb and alo == blo
+    local result
+    if op == 3 then result = equal
+    elseif op == 4 or op == 6 then result = greater
+    elseif op == 5 or op == 7 then result = greater or equal
+    elseif op == 8 or op == 10 then return if greater then blo else alo, if greater then bhi else ahi
+    elseif op == 9 or op == 11 then return if greater then alo else blo, if greater then ahi else bhi
+    else error("unsupported 64-bit vector lane operation " .. op, 0) end
+    return if result then 4294967295 else 0, if result then 4294967295 else 0
+end
+
+local function laneOperation(op: number, element: number, size: number, a0: number, a1: number, a2: number, a3: number,
+    b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+    if element == 8 then
+        local r0, r1 = wideLanes(op, a0, a1, b0, b1)
+        if size == 8 then return r0, r1, 0, 0 end
+        local r2, r3 = wideLanes(op, a2, a3, b2, b3)
+        return r0, r1, r2, r3
+    end
+    storeLanes(laneA, a0, a1, a2, a3)
+    storeLanes(laneB, b0, b1, b2, b3)
+    if op == 23 then
+        for i = 0, 15 do
+            local control = buffer.readu8(laneB, i)
+            buffer.writeu8(laneR, i, if control >= 128 then 0 else buffer.readu8(laneA, control % 16))
+        end
+        return loadLanes(laneR, 16)
+    end
+    if op == 21 or op == 22 then
+        local target = element / 2
+        local bits = target * 8
+        local low = if op == 21 then -2 ^ (bits - 1) else 0
+        local high = if op == 21 then 2 ^ (bits - 1) - 1 else 2 ^ bits - 1
+        local count = 16 / element
+        for i = 0, count - 1 do
+            writeLane(laneR, i * target, target, math.clamp(readLane(laneA, i * element, element, true), low, high))
+            writeLane(laneR, (count + i) * target, target, math.clamp(readLane(laneB, i * element, element, true), low, high))
+        end
+        return loadLanes(laneR, 16)
+    end
+    local signed = signedLaneOps[op] == true
+    local bits = element * 8
+    local mask = 2 ^ bits - 1
+    local low, high = if signed then -2 ^ (bits - 1) else 0, if signed then 2 ^ (bits - 1) - 1 else mask
+    for at = 0, size - element, element do
+        local x, y = readLane(laneA, at, element, signed), readLane(laneB, at, element, signed)
+        local r
+        if op == 0 then r = x + y
+        elseif op == 1 then r = x - y
+        elseif op == 2 then r = if element == 4 then multiplyLow32(x % 4294967296, y % 4294967296) else x * y
+        elseif op == 3 then r = if x == y then mask else 0
+        elseif op == 4 or op == 6 then r = if x > y then mask else 0
+        elseif op == 5 or op == 7 then r = if x >= y then mask else 0
+        elseif op == 8 or op == 10 then r = math.min(x, y)
+        elseif op == 9 or op == 11 then r = math.max(x, y)
+        elseif op == 12 or op == 13 then r = math.clamp(x + y, low, high)
+        elseif op == 14 or op == 15 then r = math.clamp(x - y, low, high)
+        elseif op == 16 then r = math.floor((x + y + 1) / 2)
+        elseif op == 17 or op == 18 then r = math.floor(x * y / 2 ^ bits)
+        elseif op == 19 then r = math.abs(x - y)
+        else error("unsupported vector lane operation " .. op, 0) end
+        writeLane(laneR, at, element, r)
+    end
+    return loadLanes(laneR, size)
+end
+
+local function readFloatLane(source: buffer, at: number, element: number): number
+    return if element == 4 then buffer.readf32(source, at) else buffer.readf64(source, at)
+end
+
+local function writeFloatLane(target: buffer, at: number, element: number, value: number)
+    if element == 4 then buffer.writef32(target, at, value) else buffer.writef64(target, at, value) end
+end
+
+local function writeMaskLane(target: buffer, at: number, element: number, set: boolean)
+    local word = if set then 4294967295 else 0
+    buffer.writeu32(target, at, word)
+    if element == 8 then buffer.writeu32(target, at + 4, word) end
+end
+
+local function vectorFloatLanes(op: number, element: number, size: number, a0: number, a1: number, a2: number, a3: number,
+    b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+    storeLanes(laneA, a0, a1, a2, a3)
+    storeLanes(laneB, b0, b1, b2, b3)
+    for at = 0, size - element, element do
+        if op == 17 or op == 18 then
+            -- Sign-bit operations keep NaN payloads intact.
+            local top = at + element - 4
+            for i = at, at + element - 4, 4 do buffer.writeu32(laneR, i, buffer.readu32(laneB, i)) end
+            local word = buffer.readu32(laneB, top)
+            buffer.writeu32(laneR, top, if op == 17 then bit32.bxor(word, 0x80000000) else bit32.band(word, 0x7fffffff))
+            continue
+        end
+        local x, y = readFloatLane(laneA, at, element), readFloatLane(laneB, at, element)
+        local unordered = x ~= x or y ~= y
+        if op <= 3 then
+            writeFloatLane(laneR, at, element, if op == 0 then x + y elseif op == 1 then x - y elseif op == 2 then x * y else x / y)
+        elseif op == 4 or op == 5 then
+            -- SSE MIN/MAX return the second operand when either input is NaN or both are zero.
+            writeFloatLane(laneR, at, element, if (if op == 4 then x < y else x > y) then x else y)
+        elseif op == 6 then
+            writeFloatLane(laneR, at, element, math.sqrt(y))
+        elseif op >= 7 and op <= 16 then
+            local set
+            if op == 7 then set = x == y
+            elseif op == 8 then set = x < y
+            elseif op == 9 then set = x <= y
+            elseif op == 10 then set = unordered
+            elseif op == 11 then set = not (x == y)
+            elseif op == 12 then set = not (x < y)
+            elseif op == 13 then set = not (x <= y)
+            elseif op == 14 then set = not unordered
+            elseif op == 15 then set = x > y
+            else set = x >= y end
+            writeMaskLane(laneR, at, element, set)
+        else
+            local result
+            if op == 19 or op == 20 then
+                if x ~= x then result = y elseif y ~= y then result = x
+                elseif op == 19 then result = if x < y or (x == y and 1 / x < 0) then x else y
+                else result = if x > y or (x == y and 1 / x > 0) then x else y end
+            else
+                if unordered then result = 0 / 0
+                elseif op == 21 then result = if x < y or (x == y and 1 / x < 0) then x else y
+                else result = if x > y or (x == y and 1 / x > 0) then x else y end
+            end
+            writeFloatLane(laneR, at, element, result)
+        end
+    end
+    return loadLanes(laneR, size)
+end
+
+local function vectorShift(op: number, element: number, size: number, count: number, a0: number, a1: number,
+    a2: number, a3: number): (number, number, number, number)
+    local bits = element * 8
+    if count >= bits then
+        if op ~= 2 then return 0, 0, 0, 0 end
+        count = bits - 1
+    end
+    if element == 8 then
+        local function shift(lo: number, hi: number): (number, number)
+            if count == 0 then return lo, hi end
+            if op == 0 then
+                if count >= 32 then return 0, bit32.lshift(lo, count - 32) end
+                return bit32.lshift(lo, count), bit32.bor(bit32.lshift(hi, count), bit32.rshift(lo, 32 - count))
+            end
+            local fill = if op == 2 and hi >= 2147483648 then 4294967295 else 0
+            if count >= 32 then
+                return if op == 2 then bit32.arshift(hi, count - 32) else bit32.rshift(hi, count - 32), fill
+            end
+            return bit32.bor(bit32.rshift(lo, count), bit32.lshift(hi, 32 - count)),
+                if op == 2 then bit32.arshift(hi, count) else bit32.rshift(hi, count)
+        end
+        local r0, r1 = shift(a0, a1)
+        if size == 8 then return r0, r1, 0, 0 end
+        local r2, r3 = shift(a2, a3)
+        return r0, r1, r2, r3
+    end
+    storeLanes(laneA, a0, a1, a2, a3)
+    local scale = 2 ^ count
+    for at = 0, size - element, element do
+        local x = readLane(laneA, at, element, op == 2)
+        writeLane(laneR, at, element, if op == 0 then x * scale else math.floor(x / scale))
+    end
+    return loadLanes(laneR, size)
+end
+
+local function truncateLane(value: number, bits: number, signed: boolean, saturate: boolean): number
+    local low, high = if signed then -2 ^ (bits - 1) else 0, if signed then 2 ^ (bits - 1) - 1 else 2 ^ bits - 1
+    if value ~= value then return if saturate then 0 else 2 ^ (bits - 1) end
+    local n = if value < 0 then math.ceil(value) else math.floor(value)
+    if n < low or n > high then
+        if not saturate then return 2 ^ (bits - 1) end
+        n = math.clamp(n, low, high)
+    end
+    return n
+end
+
+-- LaneConversion order matches the IR enumeration.
+local function vectorConvert(kind: number, element: number, upper: boolean, shift: number, size: number,
+    d0: number, d1: number, d2: number, d3: number, s0: number, s1: number, s2: number, s3: number): (number, number, number, number)
+    storeLanes(laneA, s0, s1, s2, s3)
+    storeLanes(laneR, 0, 0, 0, 0)
+    local half = if upper then 8 else 0
+    if kind == 0 then
+        for i = 0, 1 do buffer.writef64(laneR, i * 8, buffer.readf32(laneA, half + i * 4)) end
+    elseif kind == 1 or kind == 2 then
+        if upper then storeLanes(laneR, d0, d1, 0, 0) end
+        for i = 0, 1 do
+            local value = buffer.readf64(laneA, i * 8)
+            if kind == 1 then
+                buffer.writef32(laneR, half + i * 4, value)
+            else
+                buffer.writeu32(laneR, i * 4, truncateLane(value, 32, true, false) % 4294967296)
+            end
+        end
+    elseif kind == 3 then
+        for i = 0, 3 do buffer.writef32(laneR, i * 4, buffer.readi32(laneA, i * 4)) end
+    elseif kind == 4 then
+        for i = 0, 3 do buffer.writeu32(laneR, i * 4, truncateLane(buffer.readf32(laneA, i * 4), 32, true, false) % 4294967296) end
+    elseif kind == 5 or kind == 6 then
+        local scale = 2 ^ shift
+        for at = 0, size - element, element do
+            local value
+            if element == 8 then
+                local lo, hi = buffer.readu32(laneA, at), buffer.readu32(laneA, at + 4)
+                if kind == 5 and hi >= 2147483648 then hi -= 4294967296 end
+                value = hi * 4294967296 + lo
+            else
+                value = readLane(laneA, at, element, kind == 5)
+            end
+            writeFloatLane(laneR, at, element, value / scale)
+        end
+    elseif kind == 7 or kind == 8 then
+        local scale = 2 ^ shift
+        for at = 0, size - element, element do
+            local value = truncateLane(readFloatLane(laneA, at, element) * scale, element * 8, kind == 7, true)
+            if element == 8 then
+                value %= 18446744073709551616
+                buffer.writeu32(laneR, at, value % 4294967296)
+                buffer.writeu32(laneR, at + 4, math.floor(value / 4294967296) % 4294967296)
+            else
+                writeLane(laneR, at, element, value)
+            end
+        end
+    elseif kind == 9 or kind == 10 then
+        local scale = 2 ^ shift
+        for i = 0, 8 / element - 1 do
+            local value = readLane(laneA, half + i * element, element, kind == 9) * scale
+            if element == 4 then
+                buffer.writeu32(laneR, i * 8, value % 4294967296)
+                buffer.writeu32(laneR, i * 8 + 4, if value < 0 then 4294967295 else math.floor(value / 4294967296))
+            else
+                writeLane(laneR, i * element * 2, element * 2, value)
+            end
+        end
+    elseif kind == 11 then
+        if upper then storeLanes(laneR, d0, d1, 0, 0) end
+        local target = element / 2
+        for i = 0, 8 / target - 1 do
+            local value = if element == 8 then buffer.readu32(laneA, i * 8) else readLane(laneA, i * element, element, false)
+            writeLane(laneR, half + i * target, target, value)
+        end
+    elseif kind == 12 then
+        for i = 0, 1 do buffer.writef64(laneR, i * 8, buffer.readi32(laneA, i * 4)) end
+    else
+        error("unsupported vector conversion " .. kind, 0)
+    end
+    return loadLanes(laneR, if kind == 1 or kind == 11 then (if upper then 16 else 8) else size)
+end
+
+local function roundEven(x: number): number
+    if x ~= x or x == math.huge or x == -math.huge then return x end
+    local floor = math.floor(x)
+    local fraction = x - floor
+    local result = if fraction > 0.5 or (fraction == 0.5 and floor % 2 ~= 0) then floor + 1 else floor
+    return if result == 0 and (x < 0 or 1 / x < 0) then -0.0 else result
+end
+
+local function roundAway(x: number): number
+    if x ~= x or x == math.huge or x == -math.huge then return x end
+    local magnitude = math.abs(x)
+    local floor = math.floor(magnitude)
+    local result = if magnitude - floor >= 0.5 then floor + 1 else floor
+    return if x < 0 or 1 / x < 0 then -result else result
+end
+
+local function roundTruncate(x: number): number
+    return if x < 0 then math.ceil(x) else math.floor(x)
+end
+
+-- Kinds: 0 FMINNM, 1 FMAXNM, 2 FMIN, 3 FMAX.
+local function scalarMinMax(kind: number, x: number, y: number): number
+    if kind <= 1 then
+        if x ~= x then return y end
+        if y ~= y then return x end
+    elseif x ~= x or y ~= y then
+        return 0 / 0
+    end
+    if x == y then
+        local negative = 1 / x < 0 or 1 / y < 0
+        if kind % 2 == 0 then return if negative then -math.abs(x) else x end
+        return if (1 / x > 0 or 1 / y > 0) then math.abs(x) else x
+    end
+    if kind % 2 == 0 then return math.min(x, y) end
+    return math.max(x, y)
+end
+
+-- ReduceOp order matches the IR enumeration.
+local function vectorReduce(op: number, element: number, size: number, s0: number, s1: number, s2: number, s3: number): (number, number)
+    if op == 7 then
+        local sum = s0 + s2
+        return sum % 4294967296, (s1 + s3 + math.floor(sum / 4294967296)) % 4294967296
+    end
+    storeLanes(laneA, s0, s1, s2, s3)
+    local signed = op == 4 or op == 5
+    local result = readLane(laneA, 0, element, signed)
+    if op == 6 then result = 0 end
+    for at = (if op == 6 then 0 else element), size - element, element do
+        local x = readLane(laneA, at, element, signed)
+        if op == 0 or op == 1 then result += x
+        elseif op == 2 or op == 4 then result = math.max(result, x)
+        elseif op == 3 or op == 5 then result = math.min(result, x)
+        else result += if x >= 2 ^ (element * 8 - 1) then 2 ^ (at / element) else 0 end
+    end
+    if op == 0 or op == 2 or op == 3 or op == 4 or op == 5 then
+        result %= 2 ^ (element * 8)
+    end
+    return result % 4294967296, 0
+end
+)";
+
+// The x87 FPU: an eight-register stack of doubles (extended precision is not modeled), a status word for
+// the condition codes, and the control word's rounding mode.
+constexpr std::string_view X87Operators = R"luau(
+local fpu = {stack = table.create(8, 0), top = 0, status = 0, control = 0x037f}
+
+local function fpuGet(i: number): number
+    return fpu.stack[(fpu.top + i) % 8 + 1]
+end
+
+local function fpuSet(i: number, value: number)
+    fpu.stack[(fpu.top + i) % 8 + 1] = value
+end
+
+local function fpuPush(value: number)
+    fpu.top = (fpu.top + 7) % 8
+    fpu.stack[fpu.top + 1] = value
+end
+
+local function fpuPop(): number
+    local value = fpu.stack[fpu.top + 1]
+    fpu.top = (fpu.top + 1) % 8
+    return value
+end
+
+local function fpuRound(value: number): number
+    local mode = bit32.extract(fpu.control, 10, 2)
+    if mode == 0 then return roundEven(value) elseif mode == 1 then return math.floor(value)
+    elseif mode == 2 then return math.ceil(value) end
+    return roundTruncate(value)
+end
+
+local function fpuCompare(a: number, b: number)
+    local bits = if a ~= a or b ~= b then 0x4500 elseif a > b then 0 elseif a < b then 0x0100 else 0x4000
+    fpu.status = bit32.bor(bit32.band(fpu.status, bit32.bnot(0x4700)), bits)
+end
+
+local function decodeExtended(at: number): number
+    local lo, hi = read(4, at), read(4, at + 4)
+    local top = read(2, at + 8)
+    local sign = if top >= 32768 then -1 else 1
+    local exponent = top % 32768
+    if exponent == 32767 then
+        return if hi % 2147483648 == 0 and lo == 0 then sign * math.huge else 0 / 0
+    end
+    if exponent == 0 and hi == 0 and lo == 0 then return sign * 0 end
+    return sign * math.ldexp(hi * 4294967296 + lo, exponent - 16383 - 63)
+end
+
+local function encodeExtended(at: number, value: number)
+    local sign = if value < 0 or (value == 0 and 1 / value < 0) then 32768 else 0
+    local magnitude = math.abs(value)
+    if magnitude ~= magnitude then
+        write(4, at, 0, 0)
+        write(4, at + 4, 0xc0000000, 0)
+        write(2, at + 8, 32767 + sign, 0)
+    elseif magnitude == math.huge or magnitude == 0 then
+        write(4, at, 0, 0)
+        write(4, at + 4, if magnitude == 0 then 0 else 0x80000000, 0)
+        write(2, at + 8, (if magnitude == 0 then 0 else 32767) + sign, 0)
+    else
+        local mantissa, exponent = math.frexp(magnitude)
+        local scaled = mantissa * 2 ^ 64
+        local hi = math.floor(scaled / 4294967296)
+        write(4, at, scaled - hi * 4294967296, 0)
+        write(4, at + 4, hi, 0)
+        write(2, at + 8, exponent - 1 + 16383 + sign, 0)
+    end
+end
+
+local function loadInteger(at: number, size: number): number
+    if size == 8 then
+        local lo, hi = read(8, at)
+        return if hi >= 2147483648 then (hi - 4294967296) * 4294967296 + lo else hi * 4294967296 + lo
+    end
+    local value = read(size, at)
+    local bound = 2 ^ (size * 8)
+    return if value >= bound / 2 then value - bound else value
+end
+
+local function storeInteger(at: number, size: number, value: number)
+    local bits = size * 8
+    if value ~= value or value >= 2 ^ (bits - 1) or value < -2 ^ (bits - 1) then
+        -- The integer indefinite value.
+        if size == 8 then write(8, at, 0, 0x80000000) else write(size, at, 2 ^ (bits - 1), 0) end
+    elseif size == 8 then
+        local wrapped = value % 18446744073709551616
+        local hi = math.floor(wrapped / 4294967296)
+        write(8, at, wrapped - hi * 4294967296, hi)
+    else
+        write(size, at, value % 2 ^ bits, 0)
+    end
+end
+
+-- Intel's operand order: op 0 add, 1 mul, 4 sub, 5 subr, 6 div, 7 divr on (a, b) = (destination, source).
+local function fpuArithmetic(op: number, a: number, b: number): number
+    if op == 0 then return a + b elseif op == 1 then return a * b elseif op == 4 then return a - b
+    elseif op == 5 then return b - a elseif op == 6 then return a / b end
+    return b / a
+end
+
+local function fpuStatus(): number
+    return bit32.bor(bit32.band(fpu.status, 0xc7ff), fpu.top * 2048)
+end
+
+-- Executes an x87 instruction. Compares into EFLAGS return (zero, parity, carry); FNSTSW AX returns the status.
+local function x87Execute(opcode: number, modrm: number, at: number): ...any
+    local group = bit32.extract(modrm, 3, 3)
+    if modrm < 0xc0 then
+        if opcode == 0xd8 or opcode == 0xdc or opcode == 0xda or opcode == 0xde then
+            local value
+            if opcode == 0xd8 then value = decodeFloat(4, read(4, at), 0)
+            elseif opcode == 0xdc then value = decodeFloat(8, read(8, at))
+            elseif opcode == 0xda then value = loadInteger(at, 4)
+            else value = loadInteger(at, 2) end
+            if group == 2 or group == 3 then
+                fpuCompare(fpuGet(0), value)
+                if group == 3 then fpuPop() end
+            else
+                fpuSet(0, fpuArithmetic(group, fpuGet(0), value))
+            end
+        elseif opcode == 0xd9 then
+            if group == 0 then fpuPush(decodeFloat(4, read(4, at), 0))
+            elseif group == 2 or group == 3 then
+                write(4, at, encodeFloat(4, fpuGet(0)))
+                if group == 3 then fpuPop() end
+            end
+        elseif opcode == 0xdb then
+            if group == 0 then fpuPush(loadInteger(at, 4))
+            elseif group == 1 then storeInteger(at, 4, roundTruncate(fpuPop()))
+            elseif group == 2 or group == 3 then
+                storeInteger(at, 4, fpuRound(fpuGet(0)))
+                if group == 3 then fpuPop() end
+            elseif group == 5 then fpuPush(decodeExtended(at))
+            elseif group == 7 then encodeExtended(at, fpuPop()) end
+        elseif opcode == 0xdd then
+            if group == 0 then fpuPush(decodeFloat(8, read(8, at)))
+            elseif group == 1 then storeInteger(at, 8, roundTruncate(fpuPop()))
+            elseif group == 2 or group == 3 then
+                write(8, at, encodeFloat(8, fpuGet(0)))
+                if group == 3 then fpuPop() end
+            elseif group == 7 then write(2, at, fpuStatus(), 0) end
+        elseif opcode == 0xdf then
+            if group == 0 then fpuPush(loadInteger(at, 2))
+            elseif group == 1 then storeInteger(at, 2, roundTruncate(fpuPop()))
+            elseif group == 2 or group == 3 then
+                storeInteger(at, 2, fpuRound(fpuGet(0)))
+                if group == 3 then fpuPop() end
+            elseif group == 5 then fpuPush(loadInteger(at, 8))
+            elseif group == 7 then storeInteger(at, 8, fpuRound(fpuPop())) end
+        end
+        return nil
+    end
+    local i = modrm % 8
+    if opcode == 0xd8 then
+        if group == 2 or group == 3 then
+            fpuCompare(fpuGet(0), fpuGet(i))
+            if group == 3 then fpuPop() end
+        else
+            fpuSet(0, fpuArithmetic(group, fpuGet(0), fpuGet(i)))
+        end
+    elseif opcode == 0xdc or opcode == 0xde then
+        if opcode == 0xde and modrm == 0xd9 then
+            fpuCompare(fpuGet(0), fpuGet(1))
+            fpuPop()
+            fpuPop()
+        elseif group == 2 or group == 3 then
+            fpuCompare(fpuGet(0), fpuGet(i))
+            if group == 3 then fpuPop() end
+        else
+            -- ST(i) is the destination; the SUB/SUBR and DIV/DIVR encodings swap relative to D8.
+            local swapped = if group == 4 then 5 elseif group == 5 then 4 elseif group == 6 then 7 elseif group == 7 then 6 else group
+            fpuSet(i, fpuArithmetic(swapped, fpuGet(i), fpuGet(0)))
+            if opcode == 0xde then fpuPop() end
+        end
+    elseif opcode == 0xd9 then
+        if group == 0 then
+            fpuPush(fpuGet(i))
+        elseif group == 1 then
+            local a, b = fpuGet(0), fpuGet(i)
+            fpuSet(0, b)
+            fpuSet(i, a)
+        elseif modrm == 0xe0 then fpuSet(0, -fpuGet(0))
+        elseif modrm == 0xe1 then fpuSet(0, math.abs(fpuGet(0)))
+        elseif modrm == 0xe4 then fpuCompare(fpuGet(0), 0)
+        elseif modrm == 0xe5 then
+            local v = fpuGet(0)
+            local class = if v ~= v then 0x0100 elseif v == math.huge or v == -math.huge then 0x0500
+                elseif v == 0 then 0x4000 else 0x0400
+            local sign = if v < 0 or (v == 0 and 1 / v < 0) then 0x0200 else 0
+            fpu.status = bit32.bor(bit32.band(fpu.status, bit32.bnot(0x4700)), class, sign)
+        elseif modrm == 0xe8 then fpuPush(1)
+        elseif modrm == 0xe9 then fpuPush(math.log(10, 2))
+        elseif modrm == 0xea then fpuPush(1 / math.log(2))
+        elseif modrm == 0xeb then fpuPush(math.pi)
+        elseif modrm == 0xec then fpuPush(math.log10(2))
+        elseif modrm == 0xed then fpuPush(math.log(2))
+        elseif modrm == 0xee then fpuPush(0)
+        elseif modrm == 0xf0 then fpuSet(0, 2 ^ fpuGet(0) - 1)
+        elseif modrm == 0xf1 then
+            local x = fpuPop()
+            fpuSet(0, fpuGet(0) * math.log(x, 2))
+        elseif modrm == 0xf2 then
+            fpuSet(0, math.tan(fpuGet(0)))
+            fpuPush(1)
+        elseif modrm == 0xf3 then
+            local x = fpuPop()
+            fpuSet(0, math.atan2(fpuGet(0), x))
+        elseif modrm == 0xf5 or modrm == 0xf8 then
+            local a, b = fpuGet(0), fpuGet(1)
+            fpuSet(0, if modrm == 0xf8 then math.fmod(a, b) else a - roundEven(a / b) * b)
+            fpu.status = bit32.band(fpu.status, bit32.bnot(0x0400))
+        elseif modrm == 0xf6 then fpu.top = (fpu.top + 7) % 8
+        elseif modrm == 0xf7 then fpu.top = (fpu.top + 1) % 8
+        elseif modrm == 0xf9 then
+            local x = fpuPop()
+            fpuSet(0, fpuGet(0) * math.log(x + 1, 2))
+        elseif modrm == 0xfa then fpuSet(0, math.sqrt(fpuGet(0)))
+        elseif modrm == 0xfb then
+            local v = fpuGet(0)
+            fpuSet(0, math.sin(v))
+            fpuPush(math.cos(v))
+        elseif modrm == 0xfc then fpuSet(0, fpuRound(fpuGet(0)))
+        elseif modrm == 0xfd then fpuSet(0, fpuGet(0) * 2 ^ roundTruncate(fpuGet(1)))
+        elseif modrm == 0xfe then fpuSet(0, math.sin(fpuGet(0)))
+        elseif modrm == 0xff then fpuSet(0, math.cos(fpuGet(0))) end
+    elseif opcode == 0xdd then
+        if group == 2 or group == 3 then
+            fpuSet(i, fpuGet(0))
+            if group == 3 then fpuPop() end
+        elseif group == 4 or group == 5 then
+            fpuCompare(fpuGet(0), fpuGet(i))
+            if group == 5 then fpuPop() end
+        end
+    elseif opcode == 0xda then
+        if modrm == 0xe9 then
+            fpuCompare(fpuGet(0), fpuGet(1))
+            fpuPop()
+            fpuPop()
+        else
+            fpuSet(0, fpuGet(i))
+        end
+    elseif opcode == 0xdb then
+        if modrm == 0xe2 then
+            fpu.status = bit32.band(fpu.status, 0x7f00)
+        elseif modrm == 0xe3 then
+            fpu.top, fpu.status, fpu.control = 0, 0, 0x037f
+        elseif group == 5 or group == 6 then
+            local a, b = fpuGet(0), fpuGet(i)
+            local unordered = a ~= a or b ~= b
+            return unordered or a == b, unordered, unordered or a < b
+        else
+            fpuSet(0, fpuGet(i))
+        end
+    elseif opcode == 0xdf then
+        if modrm == 0xe0 then return fpuStatus() end
+        if group == 5 or group == 6 then
+            local a, b = fpuGet(0), fpuGet(i)
+            fpuPop()
+            local unordered = a ~= a or b ~= b
+            return unordered or a == b, unordered, unordered or a < b
+        end
+    end
+    return nil
+end
+)luau";
 
 constexpr std::string_view PrimeOperators = R"(
 local function addMod(alo: number, ahi: number, blo: number, bhi: number,
@@ -406,6 +1057,97 @@ local function unsignedDivide(size: number, alo: number, ahi: number, dlo: numbe
     return quotientLo, quotientHi, remLo, remHi
 end
 
+local function negateWords(a: number, b: number, c: number, d: number): (number, number, number, number)
+    a, b, c, d = bit32.bnot(a) + 1, bit32.bnot(b), bit32.bnot(c), bit32.bnot(d)
+    if a == 4294967296 then
+        a, b = 0, b + 1
+        if b == 4294967296 then
+            b, c = 0, c + 1
+            if c == 4294967296 then c, d = 0, (d + 1) % 4294967296 end
+        end
+    end
+    return a, b, c, d
+end
+
+-- IDIV divides RDX:RAX (EDX:EAX for 32-bit operands) by a signed divisor.
+local function signedDivide(size: number, alo: number, ahi: number, dlo: number, dhi: number,
+    blo: number, bhi: number): (number, number, number, number)
+    local wide = size == 8
+    if not wide then ahi, dhi, bhi = 0, 0, 0 end
+    -- The dividend's words from low to high, and the divisor's.
+    local w0, w1, w2, w3 = alo, if wide then ahi else dlo, if wide then dlo else 0, if wide then dhi else 0
+    local negativeDividend = (if wide then w3 else w1) >= 2147483648
+    local negativeDivisor = (if wide then bhi else blo) >= 2147483648
+    if negativeDividend then
+        w0, w1, w2, w3 = negateWords(w0, w1, w2, w3)
+        if not wide then w2, w3 = 0, 0 end
+    end
+    if negativeDivisor then
+        blo, bhi = (-blo) % 4294967296, (-bhi - (if blo == 0 then 0 else 1)) % 4294967296
+        if not wide then bhi = 0 end
+    end
+    if blo == 0 and bhi == 0 then
+        error("guest division by zero", 0)
+    end
+    local qlo, qhi, rlo, rhi
+    if wide then
+        qlo, qhi, rlo, rhi = unsignedDivide(8, w0, w1, w2, w3, blo, bhi)
+    else
+        qlo, qhi, rlo, rhi = unsignedDivide(4, w0, 0, w1, 0, blo, 0)
+    end
+    local top = if wide then qhi else qlo
+    local negativeQuotient = negativeDividend ~= negativeDivisor
+    if top > 2147483648 or (top == 2147483648 and (not negativeQuotient or (if wide then qlo ~= 0 else false))) then
+        error("guest division overflow", 0)
+    end
+    if negativeQuotient then
+        qlo, qhi = (-qlo) % 4294967296, (-qhi - (if qlo == 0 then 0 else 1)) % 4294967296
+    end
+    if negativeDividend then
+        rlo, rhi = (-rlo) % 4294967296, (-rhi - (if rlo == 0 then 0 else 1)) % 4294967296
+    end
+    if not wide then qhi, rhi = 0, 0 end
+    return qlo, qhi, rlo, rhi
+end
+
+-- 128-bit division for the compiler runtime helpers (__udivti3 and friends).
+local function divide128(signed: boolean, wantRemainder: boolean, a0: number, a1: number, a2: number, a3: number,
+    b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+    local negativeA = signed and a3 >= 2147483648
+    local negativeB = signed and b3 >= 2147483648
+    if negativeA then a0, a1, a2, a3 = negateWords(a0, a1, a2, a3) end
+    if negativeB then b0, b1, b2, b3 = negateWords(b0, b1, b2, b3) end
+    if b0 == 0 and b1 == 0 and b2 == 0 and b3 == 0 then
+        error("guest division by zero", 0)
+    end
+    local dividend = {a0, a1, a2, a3}
+    local quotient = {0, 0, 0, 0}
+    local r0, r1, r2, r3 = 0, 0, 0, 0
+    for bit = 127, 0, -1 do
+        local overflow = r3 >= 2147483648
+        r3 = bit32.bor(bit32.lshift(r3, 1), bit32.rshift(r2, 31))
+        r2 = bit32.bor(bit32.lshift(r2, 1), bit32.rshift(r1, 31))
+        r1 = bit32.bor(bit32.lshift(r1, 1), bit32.rshift(r0, 31))
+        r0 = bit32.bor(bit32.lshift(r0, 1), bit32.extract(dividend[bit // 32 + 1], bit % 32))
+        if overflow or r3 > b3 or (r3 == b3 and (r2 > b2 or (r2 == b2 and (r1 > b1 or (r1 == b1 and r0 >= b0))))) then
+            local d0 = r0 - b0
+            local d1 = r1 - b1 - (if d0 < 0 then 1 else 0)
+            local d2 = r2 - b2 - (if d1 < 0 then 1 else 0)
+            local d3 = r3 - b3 - (if d2 < 0 then 1 else 0)
+            r0, r1, r2, r3 = d0 % 4294967296, d1 % 4294967296, d2 % 4294967296, d3 % 4294967296
+            local word = bit // 32 + 1
+            quotient[word] += 2 ^ (bit % 32)
+        end
+    end
+    if wantRemainder then
+        if negativeA then r0, r1, r2, r3 = negateWords(r0, r1, r2, r3) end
+        return r0, r1, r2, r3
+    end
+    local q0, q1, q2, q3 = quotient[1], quotient[2], quotient[3], quotient[4]
+    if negativeA ~= negativeB then q0, q1, q2, q3 = negateWords(q0, q1, q2, q3) end
+    return q0, q1, q2, q3
+end
+
 local function divideWord(size: number, signed: boolean, alo: number, ahi: number,
     blo: number, bhi: number): (number, number)
     local an = signed and (if size == 8 then ahi else alo) >= 2147483648
@@ -530,15 +1272,16 @@ end
 
 type DataRange = {first: number, last: number, bytes: string, mode: number}
 
-local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boolean, mapped: boolean)
-    local stackSize = if mapped then 262144 else 65536
+local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boolean, mapped: boolean, stackSize: number)
     local heapLimit = if mapped then 67108864 else 16777216
     local stackBottom = math.ceil(imageSize / 16) * 16
     local stackTop = stackBottom + stackSize
     local stackData: buffer? = nil
     local stackInUse = false
     local contents: {buffer?} = {}
+    -- Heap blocks get 16-byte-rounded storage: word-at-a-time string routines read past the requested size.
     local heap: {[number]: buffer} = {}
+    local heapSizes: {[number]: number} = {}
     local heapStarts: {number} = {}
     local heapPages: {number} = {}
     local criticalSections: {[number]: number} = {}
@@ -550,30 +1293,12 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     local lastHeapStart = 0
     local classicLocale = 0
     local useGlobalLocale = true
+    -- Guest memory belongs to the module: data, heap, and locks persist across export calls.
     local function reset(stack: boolean)
-        stackInUse = stack
-        if stack then
-            local bytes = stackData
-            if bytes then
-                buffer.fill(bytes, 0, 0)
-            else
-                stackData = buffer.create(stackSize)
-            end
+        if stack and not stackData then
+            stackData = buffer.create(stackSize)
         end
-        table.clear(contents)
-        table.clear(criticalSections)
-        table.clear(pthreadLocks)
-        table.clear(srwLocks)
-        table.clear(pageProtection)
-        if heapEnabled then
-            table.clear(heap)
-            table.clear(heapStarts)
-            table.clear(heapPages)
-            nextAllocation = heapStart
-            lastHeapStart = 0
-            classicLocale = 0
-            useGlobalLocale = true
-        end
+        stackInUse = stackInUse or stack
     end
     local function locate(at: number, size: number, write: boolean): (buffer, number)
         local limit = at + size
@@ -626,7 +1351,8 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
                     if bytes then
                         return bytes, at - range.first
                     end
-                    local initialized = buffer.fromstring(range.bytes)
+                    local initialized = buffer.create(range.last - range.first)
+                    buffer.writestring(initialized, 0, range.bytes)
                     contents[index] = initialized
                     return initialized, at - range.first
                 else
@@ -659,6 +1385,16 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             end
         end
     end
+    local function readString(at: number, count: number): string
+        if count <= 0 then return "" end
+        local bytes, index = locate(at, count, false)
+        return buffer.readstring(bytes, index, count)
+    end
+    local function writeString(at: number, text: string)
+        if #text == 0 then return end
+        local bytes, index = locate(at, #text, true)
+        buffer.writestring(bytes, index, text)
+    end
     local function locateXmm(at: number, aligned: boolean, writeAccess: boolean): (buffer, number)
         if aligned and at % 16 ~= 0 then
             error("unaligned XMM memory operand", 0)
@@ -688,22 +1424,28 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         end
         if size == 0 then
             heap[at] = nil
+            heapSizes[at] = nil
             return 0, 0
         end
-        if previous and buffer.len(previous) == size then
+        if previous and size <= buffer.len(previous) and size * 2 > buffer.len(previous) then
+            -- Shrinking or growing within the rounded block keeps the allocation.
+            if size > heapSizes[at] then buffer.fill(previous, heapSizes[at], 0, size - heapSizes[at]) end
+            heapSizes[at] = size
             return at, 0
         end
         local length = math.ceil(size / 16) * 16
         if nextAllocation + length - heapStart > heapLimit then
             return 0, 0
         end
-        local bytes = buffer.create(size)
+        local bytes = buffer.create(length)
         if previous then
-            buffer.copy(bytes, 0, previous, 0, math.min(size, buffer.len(previous)))
+            buffer.copy(bytes, 0, previous, 0, math.min(size, heapSizes[at]))
             heap[at] = nil
+            heapSizes[at] = nil
         end
         local start = nextAllocation
         heap[start] = bytes
+        heapSizes[start] = size
         local index = #heapStarts + 1
         heapStarts[index] = start
         nextAllocation += length
@@ -719,6 +1461,14 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             error("guest C++ allocation failed", 0)
         end
         return pointer, 0
+    end
+    local errnoCell = 0
+    local function errnoAddress(): number
+        if errnoCell == 0 then
+            errnoCell = resize(0, 0, 8, 0)
+            write(8, errnoCell, 0, 0)
+        end
+        return errnoCell
     end
     local function cLocale(): (number, number)
         if classicLocale ~= 0 then return classicLocale, 0 end
@@ -796,9 +1546,10 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         if op == "HeapFree" then
             if not previous then return 0, 0 end
             heap[pointer] = nil
+            heapSizes[pointer] = nil
             return 1, 0
         elseif op == "HeapSize" then
-            if previous then return buffer.len(previous), 0 end
+            if previous then return heapSizes[pointer], 0 end
             return 4294967295, 4294967295
         end
         local result = 0
@@ -807,10 +1558,9 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         elseif previous and size and sizeHi == 0 then
             if bit32.band(flags, 16) == 0 then
                 result = resize(pointer, 0, math.max(size, 1), 0)
-            elseif size <= math.ceil(buffer.len(previous) / 16) * 16 then
-                local bytes = buffer.create(math.max(size, 1))
-                buffer.copy(bytes, 0, previous, 0, math.min(buffer.len(bytes), buffer.len(previous)))
-                heap[pointer] = bytes
+            elseif size <= buffer.len(previous) then
+                if size > heapSizes[pointer] then buffer.fill(previous, heapSizes[pointer], 0, size - heapSizes[pointer]) end
+                heapSizes[pointer] = math.max(size, 1)
                 result = pointer
             end
         end
@@ -827,8 +1577,11 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             locate(at, 40, true)
             if depth then error("guest critical section is already initialized", 0) end
             criticalSections[at] = 0
+        elseif depth == nil and op == "leave" then
+            error("cannot release an unowned guest critical section", 0)
         elseif depth == nil then
-            error("uninitialized guest critical section", 0)
+            -- Zero-filled critical sections inside runtime structures work without explicit initialization.
+            criticalSections[at] = if op == "delete" then nil else 1
         elseif op == "delete" then
             if depth ~= 0 then error("cannot delete an owned guest critical section", 0) end
             criticalSections[at] = nil
@@ -948,9 +1701,1560 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     end
     return read, write, stackTop, reset, resize, readXmm, writeXmm, compareStrings, stringLength, copyMemory,
         fillMemory, processHeap, allocateCpp, compareMemory, criticalSection, protectMemory, cLocale, useCLocale,
-        wideClass, testWideClass, pthreadMutex, srwLock
+        wideClass, testWideClass, pthreadMutex, srwLock, errnoAddress, readString, writeString
 end
 )";
+
+// Host services for translated programs: arguments, standard streams, a file system, and C library I/O.
+// Each libc entry takes and returns guest words as (lo, hi) pairs.
+constexpr std::string_view ProcessOperators = R"luau(
+type HostFile = {path: string, data: buffer, size: number, at: number, writable: boolean, readable: boolean}
+
+local host = {
+    args = {"program"} :: {string},
+    env = {} :: {string},
+    stdin = "",
+    stdinAt = 1,
+    output = {{}, {}} :: {{string}},
+    writers = {} :: {[number]: ((string) -> ())?},
+    files = {} :: {[string]: string},
+    descriptors = {} :: {[number]: HostFile?},
+    nextDescriptor = 3,
+    streams = {} :: {[number]: number},
+    eof = {} :: {[number]: boolean},
+    pushback = {} :: {[number]: number},
+    environment = 0,
+    strings = {} :: {[string]: number},
+}
+
+local function exitProcess(status: number, callbacks: boolean)
+    if callbacks then
+        while #process.exitCallbacks > 0 do
+            local callback = table.remove(process.exitCallbacks)
+            if callback then callback() end
+        end
+    end
+    error({luftExit = status % 256}, 0)
+end
+
+local function hostWrite(fd: number, text: string): boolean
+    if fd == 1 or fd == 2 then
+        local writer = host.writers[fd]
+        if writer then writer(text) else table.insert(host.output[fd], text) end
+        return true
+    end
+    local file = host.descriptors[fd]
+    if not file or not file.writable then return false end
+    local finish = file.at + #text
+    if finish > buffer.len(file.data) then
+        local grown = buffer.create(math.max(finish, buffer.len(file.data) * 2, 64))
+        buffer.copy(grown, 0, file.data, 0, file.size)
+        file.data = grown
+    end
+    buffer.writestring(file.data, file.at, text)
+    file.at = finish
+    file.size = math.max(file.size, finish)
+    return true
+end
+
+local function hostRead(fd: number, count: number): string?
+    if fd == 0 then
+        local text = string.sub(host.stdin, host.stdinAt, host.stdinAt + count - 1)
+        host.stdinAt += #text
+        return text
+    end
+    local file = host.descriptors[fd]
+    if not file or not file.readable then return nil end
+    local available = math.max(0, math.min(count, file.size - file.at))
+    local text = buffer.readstring(file.data, file.at, available)
+    file.at += available
+    return text
+end
+
+local function hostOpen(path: string, readable: boolean, writable: boolean, create: boolean, truncate: boolean,
+    append: boolean): number?
+    local existing = host.files[path]
+    if not existing and not create then return nil end
+    local text = if truncate or not existing then "" else existing
+    local data = buffer.create(math.max(#text, 64))
+    buffer.writestring(data, 0, text)
+    local fd = host.nextDescriptor
+    host.nextDescriptor += 1
+    host.descriptors[fd] = {path = path, data = data, size = #text, at = if append then #text else 0,
+        writable = writable, readable = readable}
+    if writable then host.files[path] = text end
+    return fd
+end
+
+local function hostClose(fd: number): boolean
+    local file = host.descriptors[fd]
+    if not file then return fd >= 0 and fd <= 2 end
+    if file.writable then host.files[file.path] = buffer.readstring(file.data, 0, file.size) end
+    host.descriptors[fd] = nil
+    return true
+end
+
+local function hostSeek(fd: number, offset: number, whence: number): number?
+    local file = host.descriptors[fd]
+    if not file then return nil end
+    local base = if whence == 0 then 0 elseif whence == 1 then file.at else file.size
+    local position = base + offset
+    if position < 0 then return nil end
+    file.at = position
+    return position
+end
+
+local function signed32(lo: number): number
+    return if lo >= 2147483648 then lo - 4294967296 else lo
+end
+
+local function signed64(lo: number, hi: number): number
+    return if hi >= 2147483648 then (hi - 4294967296) * 4294967296 + lo else hi * 4294967296 + lo
+end
+
+local function guestString(at: number, limit: number?): string
+    local length = stringLength(at, 0)
+    if limit then length = math.min(length, limit) end
+    return readString(at, length)
+end
+
+local function newGuestString(text: string): number
+    local at = resize(0, 0, #text + 1, 0)
+    if at == 0 then error("guest heap exhausted", 0) end
+    writeString(at, text)
+    write(1, at + #text, 0, 0)
+    return at
+end
+
+local function cachedString(text: string): number
+    local at = host.strings[text]
+    if not at then
+        at = newGuestString(text)
+        host.strings[text] = at
+    end
+    return at
+end
+
+local function digitsOf(lo: number, hi: number, base: number, upper: boolean): string
+    if hi == 0 then
+        if base == 10 then return string.format("%d", lo) end
+        if base == 16 then return string.format(if upper then "%X" else "%x", lo) end
+        if base == 8 then return string.format("%o", lo) end
+    end
+    local alphabet = if upper then "0123456789ABCDEF" else "0123456789abcdef"
+    local digits = {}
+    while hi ~= 0 or lo ~= 0 do
+        local high = hi % base
+        hi = (hi - high) / base
+        local value = high * 4294967296 + lo
+        local digit = value % base
+        lo = (value - digit) / base
+        table.insert(digits, string.sub(alphabet, digit + 1, digit + 1))
+    end
+    if #digits == 0 then return "0" end
+    local text = table.concat(digits)
+    return string.reverse(text)
+end
+
+local function padded(text: string, width: number?, left: boolean, zero: boolean, prefix: string): string
+    width = width or 0
+    local length = #text + #prefix
+    if length >= width then return prefix .. text end
+    if left then return prefix .. text .. string.rep(" ", width - length) end
+    if zero then return prefix .. string.rep("0", width - length) .. text end
+    return string.rep(" ", width - length) .. prefix .. text
+end
+
+type Arguments = {nextInt: () -> (number, number), nextFloat: () -> number}
+
+-- Formats a C format string. `long` is 32 bits wide on Windows.
+local function formatGuest(format: string, arguments: Arguments, windows: boolean): string
+    local out = {}
+    local i, n = 1, #format
+    local written = 0
+    while i <= n do
+        local percent = string.find(format, "%", i, true)
+        if not percent then
+            table.insert(out, string.sub(format, i))
+            break
+        end
+        if percent > i then
+            table.insert(out, string.sub(format, i, percent - 1))
+            written += percent - i
+        end
+        local j = percent + 1
+        local flags = ""
+        while j <= n do
+            local c = string.sub(format, j, j)
+            if c == "-" or c == "+" or c == " " or c == "#" or c == "0" or c == "'" then
+                flags ..= c
+                j += 1
+            else
+                break
+            end
+        end
+        local width: number? = nil
+        if string.sub(format, j, j) == "*" then
+            local w = signed32((arguments.nextInt()))
+            if w < 0 then flags ..= "-"; w = -w end
+            width = w
+            j += 1
+        else
+            local digits = string.match(format, "^%d+", j)
+            if digits then width = tonumber(digits); j += #digits end
+        end
+        local precision: number? = nil
+        if string.sub(format, j, j) == "." then
+            j += 1
+            if string.sub(format, j, j) == "*" then
+                local p = signed32((arguments.nextInt()))
+                precision = if p >= 0 then p else nil
+                j += 1
+            else
+                local digits = string.match(format, "^%d+", j) or ""
+                precision = tonumber(digits) or 0
+                j += #digits
+            end
+        end
+        local length = ""
+        if string.sub(format, j, j + 2) == "I64" then length = "ll"; j += 3
+        elseif string.sub(format, j, j + 2) == "I32" then j += 3
+        else
+            length = string.match(format, "^hh", j) or string.match(format, "^ll", j) or string.match(format, "^[hljztLqI]", j) or ""
+            j += #length
+        end
+        local conversion = string.sub(format, j, j)
+        j += 1
+        local left = string.find(flags, "-", 1, true) ~= nil
+        local zero = string.find(flags, "0", 1, true) ~= nil and not left
+        local text = ""
+        if conversion == "%" then
+            text = "%"
+        elseif conversion == "d" or conversion == "i" or conversion == "u" or conversion == "x" or conversion == "X" or
+            conversion == "o" then
+            local lo, hi = arguments.nextInt()
+            local wide = length == "ll" or length == "j" or length == "z" or length == "t" or length == "q" or
+                (length == "l" and not windows) or length == "I"
+            local signed = conversion == "d" or conversion == "i"
+            if not wide then
+                if length == "hh" then lo = lo % 256 elseif length == "h" then lo = lo % 65536 end
+                local bits = if length == "hh" then 8 elseif length == "h" then 16 else 32
+                hi = 0
+                if signed and lo >= 2 ^ (bits - 1) then
+                    lo = (lo - 2 ^ bits) % 4294967296
+                    hi = 4294967295
+                end
+            end
+            local negative = signed and hi >= 2147483648
+            if negative then
+                lo, hi = (-lo) % 4294967296, (-hi - (if lo == 0 then 0 else 1)) % 4294967296
+            end
+            local base = if conversion == "x" or conversion == "X" then 16 elseif conversion == "o" then 8 else 10
+            local digits = digitsOf(lo, hi, base, conversion == "X")
+            if precision then
+                if precision == 0 and digits == "0" then digits = "" end
+                if #digits < precision then digits = string.rep("0", precision - #digits) .. digits end
+                zero = false
+            end
+            local prefix = if negative then "-" elseif signed and string.find(flags, "+", 1, true) then "+"
+                elseif signed and string.find(flags, " ", 1, true) then " " else ""
+            if string.find(flags, "#", 1, true) and (lo ~= 0 or hi ~= 0) then
+                if base == 16 then prefix = if conversion == "X" then "0X" else "0x"
+                elseif base == 8 and string.sub(digits, 1, 1) ~= "0" then digits = "0" .. digits end
+            end
+            text = padded(digits, width, left, zero, prefix)
+        elseif conversion == "c" then
+            local lo = arguments.nextInt()
+            text = padded(string.char(lo % 256), width, left, false, "")
+        elseif conversion == "s" then
+            local lo, hi = arguments.nextInt()
+            local value = if lo == 0 and hi == 0 then "(null)" else guestString(address(lo, hi), precision)
+            text = padded(value, width, left, false, "")
+        elseif conversion == "p" then
+            local lo, hi = arguments.nextInt()
+            text = padded(digitsOf(lo, hi, 16, false), width, left, false, "0x")
+        elseif conversion == "n" then
+            local lo, hi = arguments.nextInt()
+            write(4, address(lo, hi), written % 4294967296, 0)
+        elseif string.find("fFeEgGaA", conversion, 1, true) then
+            local value = arguments.nextFloat()
+            if value ~= value or value == math.huge or value == -math.huge then
+                local word = if value ~= value then "nan" else "inf"
+                if string.find("FEGA", conversion, 1, true) then word = string.upper(word) end
+                local sign = if value == -math.huge or (value ~= value and 1 / value < 0) then "-"
+                    elseif string.find(flags, "+", 1, true) then "+" elseif string.find(flags, " ", 1, true) then " " else ""
+                text = padded(word, width, left, false, sign)
+            elseif conversion == "a" or conversion == "A" then
+                local mantissa, exponent = math.frexp(math.abs(value))
+                local digits = string.format("%x", math.floor(mantissa * 2 ^ 53))
+                text = padded(string.format("0x%s.%sp%+d", string.sub(digits, 1, 1), string.sub(digits, 2), exponent - 1),
+                    width, left, zero, if value < 0 then "-" else "")
+            else
+                local spec = "%" .. string.gsub(flags, "'", "") .. (if width then tostring(width) else "") ..
+                    (if precision then "." .. precision else "") .. (if conversion == "F" then "f" else conversion)
+                text = string.format(spec, value)
+            end
+        else
+            text = string.sub(format, percent, j - 1)
+        end
+        table.insert(out, text)
+        written += #text
+        i = j
+    end
+    return table.concat(out)
+end
+
+-- Variadic arguments. Kinds: 0 System V x86-64, 1 AAPCS64, 2 Darwin arm64, 3 Windows x64.
+local function registerArguments(kind: number, sp: number, ints: {number}, intIndex: number, floats: {number},
+    floatIndex: number): Arguments
+    local stack = sp
+    local function fromStack(): (number, number)
+        local lo, hi = read(8, stack)
+        stack += 8
+        return lo, hi
+    end
+    local function nextInt(): (number, number)
+        if kind == 2 then return fromStack() end
+        if kind == 3 then
+            local index = intIndex
+            intIndex += 1
+            if index < 4 then return ints[index * 2 + 1], ints[index * 2 + 2] end
+            local lo, hi = read(8, sp + 32 + (index - 4) * 8)
+            return lo, hi
+        end
+        if intIndex * 2 < #ints then
+            local index = intIndex
+            intIndex += 1
+            return ints[index * 2 + 1], ints[index * 2 + 2]
+        end
+        return fromStack()
+    end
+    local function nextFloat(): number
+        if kind == 2 then return decodeFloat(8, fromStack()) end
+        if kind == 3 then return decodeFloat(8, nextInt()) end
+        if floatIndex < 8 then
+            local index = floatIndex
+            floatIndex += 1
+            return decodeFloat(8, floats[index * 2 + 1], floats[index * 2 + 2])
+        end
+        return decodeFloat(8, fromStack())
+    end
+    return {nextInt = nextInt, nextFloat = nextFloat}
+end
+
+-- A va_list argument for the same ABI kinds.
+local function listArguments(kind: number, lo: number, hi: number): Arguments
+    local at = address(lo, hi)
+    if kind == 0 then
+        local gp, fp = read(4, at), read(4, at + 4)
+        local overflow = address(read(8, at + 8))
+        local save = address(read(8, at + 16))
+        local function nextInt(): (number, number)
+            if gp < 48 then
+                local a, b = read(8, save + gp)
+                gp += 8
+                return a, b
+            end
+            local a, b = read(8, overflow)
+            overflow += 8
+            return a, b
+        end
+        local function nextFloat(): number
+            if fp < 176 then
+                local a, b = read(8, save + fp)
+                fp += 16
+                return decodeFloat(8, a, b)
+            end
+            local a, b = read(8, overflow)
+            overflow += 8
+            return decodeFloat(8, a, b)
+        end
+        return {nextInt = nextInt, nextFloat = nextFloat}
+    elseif kind == 1 then
+        local stack = address(read(8, at))
+        local grTop, vrTop = address(read(8, at + 8)), address(read(8, at + 16))
+        local grOffs, vrOffs = signed32((read(4, at + 24))), signed32((read(4, at + 28)))
+        local function nextInt(): (number, number)
+            if grOffs < 0 then
+                local a, b = read(8, grTop + grOffs)
+                grOffs += 8
+                return a, b
+            end
+            local a, b = read(8, stack)
+            stack += 8
+            return a, b
+        end
+        local function nextFloat(): number
+            if vrOffs < 0 then
+                local a, b = read(8, vrTop + vrOffs)
+                vrOffs += 16
+                return decodeFloat(8, a, b)
+            end
+            local a, b = read(8, stack)
+            stack += 8
+            return decodeFloat(8, a, b)
+        end
+        return {nextInt = nextInt, nextFloat = nextFloat}
+    end
+    local cursor = at
+    local function nextInt(): (number, number)
+        local a, b = read(8, cursor)
+        cursor += 8
+        return a, b
+    end
+    return {nextInt = nextInt, nextFloat = function(): number return decodeFloat(8, nextInt()) end}
+end
+
+-- Places the program's arguments and environment in guest memory.
+local function processArguments(): (number, number, number)
+    local function vector(strings: {string}): number
+        local at = resize(0, 0, (#strings + 1) * 8, 0)
+        for i, text in strings do
+            write(8, at + (i - 1) * 8, newGuestString(text), 0)
+        end
+        write(8, at + #strings * 8, 0, 0)
+        return at
+    end
+    local argv = vector(host.args)
+    host.environment = vector(host.env)
+    return #host.args, argv, host.environment
+end
+
+-- Builds the System V initial stack below `top`: argc, argv, NULL, envp, NULL, and an empty auxiliary vector.
+local function processStack(top: number, argc: number, argv: number, envp: number): number
+    local words = 1 + (argc + 1) + (#host.env + 1) + 2
+    local sp = top - 256 - words * 8
+    sp -= sp % 16
+    local at = sp
+    write(8, at, argc, 0)
+    at += 8
+    for i = 0, argc do
+        write(8, at, read(8, argv + i * 8))
+        at += 8
+    end
+    for i = 0, #host.env do
+        write(8, at, read(8, envp + i * 8))
+        at += 8
+    end
+    write(8, at, 0, 0)
+    write(8, at + 8, 0, 0)
+    return sp
+end
+
+local libc = {}
+-- Platform details: Darwin and Linux differ in open() flags and struct stat.
+libc.darwin = false
+libc.arm = false
+
+local function streamDescriptor(lo: number, hi: number): number
+    local fd = host.streams[address(lo, hi)]
+    if fd == nil then error("unknown guest FILE stream", 0) end
+    return fd
+end
+
+local function result(value: number): (number, number)
+    if value < 0 then return value % 4294967296, 4294967295 end
+    return value % 4294967296, math.floor(value / 4294967296)
+end
+
+local function setErrno(code: number)
+    write(4, errnoAddress(), code, 0)
+end
+
+function libc.write(fdLo, fdHi, bufLo, bufHi, countLo, countHi)
+    local text = readString(address(bufLo, bufHi), address(countLo, countHi))
+    if not hostWrite(signed32(fdLo), text) then setErrno(9); return result(-1) end
+    return result(#text)
+end
+
+function libc.read(fdLo, fdHi, bufLo, bufHi, countLo, countHi)
+    local text = hostRead(signed32(fdLo), address(countLo, countHi))
+    if not text then setErrno(9); return result(-1) end
+    writeString(address(bufLo, bufHi), text)
+    return result(#text)
+end
+
+local function openFlags(flags: number): (boolean, boolean, boolean, boolean, boolean)
+    local access = flags % 4
+    local create = bit32.btest(flags, if libc.darwin then 0x200 else 0x40)
+    local truncate = bit32.btest(flags, if libc.darwin then 0x400 else 0x200)
+    local append = bit32.btest(flags, if libc.darwin then 0x8 else 0x400)
+    return access ~= 1, access ~= 0, create, truncate, append
+end
+
+function libc.open(pathLo, pathHi, flagsLo, flagsHi)
+    local fd = hostOpen(guestString(address(pathLo, pathHi)), openFlags(flagsLo))
+    if not fd then setErrno(2); return result(-1) end
+    return result(fd)
+end
+
+function libc.openat(dirLo, dirHi, pathLo, pathHi, flagsLo, flagsHi)
+    return libc.open(pathLo, pathHi, flagsLo, flagsHi)
+end
+
+function libc.close(fdLo, fdHi)
+    return result(if hostClose(signed32(fdLo)) then 0 else -1)
+end
+
+function libc.lseek(fdLo, fdHi, offsetLo, offsetHi, whenceLo, whenceHi)
+    local position = hostSeek(signed32(fdLo), signed64(offsetLo, offsetHi), whenceLo)
+    if not position then setErrno(29); return result(-1) end
+    return result(position)
+end
+
+local function writeStat(at: number, fd: number?)
+    local file = if fd then host.descriptors[fd] else nil
+    local size = if file then file.size else 0
+    local mode = if file then 0x81a4 else 0x2190
+    fillMemory(at, 0, 0, 144, 0)
+    if libc.darwin then
+        write(2, at + 4, mode, 0)
+        write(8, at + 96, result(size))
+        write(4, at + 112, 4096, 0)
+    else
+        write(4, at + (if libc.arm then 16 else 24), mode, 0)
+        write(8, at + 48, result(size))
+        write(4, at + 56, 4096, 0)
+    end
+end
+
+function libc.fstat(fdLo, fdHi, statLo, statHi)
+    local fd = signed32(fdLo)
+    if fd > 2 and not host.descriptors[fd] then setErrno(9); return result(-1) end
+    writeStat(address(statLo, statHi), if fd > 2 then fd else nil)
+    return result(0)
+end
+
+function libc.stat(pathLo, pathHi, statLo, statHi)
+    local path = guestString(address(pathLo, pathHi))
+    if not host.files[path] then setErrno(2); return result(-1) end
+    local fd = hostOpen(path, true, false, false, false, false)
+    writeStat(address(statLo, statHi), fd)
+    if fd then hostClose(fd) end
+    return result(0)
+end
+
+function libc.isatty()
+    return result(0)
+end
+
+local function streamMode(mode: string): (boolean, boolean, boolean, boolean, boolean)
+    local first = string.sub(mode, 1, 1)
+    local plus = string.find(mode, "+", 1, true) ~= nil
+    return first == "r" or plus, first ~= "r" or plus, first ~= "r", first == "w", first == "a"
+end
+
+local function newStream(fd: number): number
+    local at = resize(0, 0, 256, 0)
+    fillMemory(at, 0, 0, 256, 0)
+    host.streams[at] = fd
+    return at
+end
+
+function libc.fopen(pathLo, pathHi, modeLo, modeHi)
+    local fd = hostOpen(guestString(address(pathLo, pathHi)), streamMode(guestString(address(modeLo, modeHi))))
+    if not fd then setErrno(2); return 0, 0 end
+    return newStream(fd), 0
+end
+
+function libc.fdopen(fdLo, fdHi)
+    return newStream(signed32(fdLo)), 0
+end
+
+function libc.fclose(lo, hi)
+    local fd = streamDescriptor(lo, hi)
+    host.streams[address(lo, hi)] = nil
+    return result(if hostClose(fd) then 0 else -1)
+end
+
+function libc.fileno(lo, hi)
+    return result(streamDescriptor(lo, hi))
+end
+
+function libc.fwrite(ptrLo, ptrHi, sizeLo, sizeHi, countLo, countHi, streamLo, streamHi)
+    local size, count = address(sizeLo, sizeHi), address(countLo, countHi)
+    if size == 0 or count == 0 then return 0, 0 end
+    local text = readString(address(ptrLo, ptrHi), size * count)
+    if not hostWrite(streamDescriptor(streamLo, streamHi), text) then return 0, 0 end
+    return result(count)
+end
+
+function libc.fread(ptrLo, ptrHi, sizeLo, sizeHi, countLo, countHi, streamLo, streamHi)
+    local size, count = address(sizeLo, sizeHi), address(countLo, countHi)
+    if size == 0 or count == 0 then return 0, 0 end
+    local fd = streamDescriptor(streamLo, streamHi)
+    local text = hostRead(fd, size * count) or ""
+    if #text < size * count then host.eof[fd] = true end
+    writeString(address(ptrLo, ptrHi), text)
+    return result(#text // size)
+end
+
+function libc.fputc(c, cHi, streamLo, streamHi)
+    hostWrite(streamDescriptor(streamLo, streamHi), string.char(c % 256))
+    return result(c % 256)
+end
+
+function libc.fputs(sLo, sHi, streamLo, streamHi)
+    hostWrite(streamDescriptor(streamLo, streamHi), guestString(address(sLo, sHi)))
+    return result(1)
+end
+
+function libc.puts(sLo, sHi)
+    hostWrite(1, guestString(address(sLo, sHi)) .. "\n")
+    return result(1)
+end
+
+function libc.putchar(c)
+    hostWrite(1, string.char(c % 256))
+    return result(c % 256)
+end
+
+local function getByte(fd: number): number
+    local pushed = host.pushback[fd]
+    if pushed then
+        host.pushback[fd] = nil
+        return pushed
+    end
+    local text = hostRead(fd, 1)
+    if not text or #text == 0 then
+        host.eof[fd] = true
+        return -1
+    end
+    return string.byte(text)
+end
+
+function libc.fgetc(lo, hi)
+    return result(getByte(streamDescriptor(lo, hi)))
+end
+
+function libc.getchar()
+    return result(getByte(0))
+end
+
+function libc.ungetc(c, cHi, lo, hi)
+    if signed32(c) == -1 then return result(-1) end
+    local fd = streamDescriptor(lo, hi)
+    host.pushback[fd] = c % 256
+    host.eof[fd] = nil
+    return result(c % 256)
+end
+
+function libc.fgets(bufLo, bufHi, countLo, countHi, lo, hi)
+    local fd = streamDescriptor(lo, hi)
+    local limit = signed32(countLo) - 1
+    local bytes = {}
+    while #bytes < limit do
+        local byte = getByte(fd)
+        if byte < 0 then break end
+        table.insert(bytes, string.char(byte))
+        if byte == 10 then break end
+    end
+    if #bytes == 0 and limit > 0 then return 0, 0 end
+    local text = table.concat(bytes)
+    writeString(address(bufLo, bufHi), text)
+    write(1, address(bufLo, bufHi) + #text, 0, 0)
+    return bufLo, bufHi
+end
+
+function libc.fflush()
+    return 0, 0
+end
+
+function libc.setvbuf()
+    return 0, 0
+end
+
+function libc.fseek(lo, hi, offsetLo, offsetHi, whenceLo, whenceHi)
+    local fd = streamDescriptor(lo, hi)
+    host.pushback[fd] = nil
+    host.eof[fd] = nil
+    return result(if hostSeek(fd, signed64(offsetLo, offsetHi), whenceLo) then 0 else -1)
+end
+
+function libc.ftell(lo, hi)
+    local file = host.descriptors[streamDescriptor(lo, hi)]
+    return result(if file then file.at else -1)
+end
+
+function libc.rewind(lo, hi)
+    libc.fseek(lo, hi, 0, 0, 0, 0)
+    return 0, 0
+end
+
+function libc.feof(lo, hi)
+    return result(if host.eof[streamDescriptor(lo, hi)] then 1 else 0)
+end
+
+function libc.ferror()
+    return 0, 0
+end
+
+function libc.clearerr(lo, hi)
+    host.eof[streamDescriptor(lo, hi)] = nil
+    return 0, 0
+end
+
+-- glibc's getc/putc macros fall back to these when the FILE buffers are empty.
+function libc.__uflow(lo, hi)
+    return libc.fgetc(lo, hi)
+end
+
+function libc.__overflow(lo, hi, c, cHi)
+    return libc.fputc(c, cHi, lo, hi)
+end
+
+-- Darwin's __sgetc/__sputc macros refill through these; keep the buffer counts at zero.
+function libc.__srget(lo, hi)
+    write(4, address(lo, hi) + 8, 0, 0)
+    return libc.fgetc(lo, hi)
+end
+
+function libc.__swbuf(c, cHi, lo, hi)
+    write(4, address(lo, hi) + 12, 0, 0)
+    return libc.fputc(c, cHi, lo, hi)
+end
+
+function libc.getenv(nameLo, nameHi)
+    local name = guestString(address(nameLo, nameHi))
+    for _, entry in host.env do
+        local key, value = string.match(entry, "^([^=]*)=(.*)$")
+        if key == name then return cachedString(value :: string), 0 end
+    end
+    return 0, 0
+end
+
+local function parseInteger(textLo: number, textHi: number, endLo: number, endHi: number, base: number,
+    unsigned: boolean): (number, number)
+    local start = address(textLo, textHi)
+    local at = start
+    local byte = read(1, at)
+    while byte == 32 or (byte >= 9 and byte <= 13) do at += 1; byte = read(1, at) end
+    local negative = false
+    if byte == 43 or byte == 45 then negative = byte == 45; at += 1; byte = read(1, at) end
+    if (base == 0 or base == 16) and byte == 48 and (read(1, at + 1) == 120 or read(1, at + 1) == 88) then
+        local next = read(1, at + 2)
+        if (next >= 48 and next <= 57) or (next >= 97 and next <= 102) or (next >= 65 and next <= 70) then
+            at += 2
+            base = 16
+        end
+    elseif base == 0 then
+        base = if byte == 48 then 8 else 10
+    end
+    local lo, hi, any = 0, 0, false
+    local overflow = false
+    while true do
+        byte = read(1, at)
+        local digit = if byte >= 48 and byte <= 57 then byte - 48 elseif byte >= 97 and byte <= 122 then byte - 87
+            elseif byte >= 65 and byte <= 90 then byte - 55 else 99
+        if digit >= base then break end
+        any = true
+        local low = lo * base + digit
+        local high = hi * base + math.floor(low / 4294967296)
+        lo, hi = low % 4294967296, high
+        if hi >= 4294967296 then overflow = true; hi %= 4294967296 end
+        at += 1
+    end
+    if endLo ~= 0 or endHi ~= 0 then
+        write(8, address(endLo, endHi), if any then at else start, 0)
+    end
+    if overflow then
+        setErrno(34)
+        if unsigned then return 4294967295, 4294967295 end
+        return if negative then 0 else 4294967295, if negative then 2147483648 else 2147483647
+    end
+    if not unsigned and not negative and hi >= 2147483648 then setErrno(34); return 4294967295, 2147483647 end
+    if not unsigned and negative and (hi > 2147483648 or (hi == 2147483648 and lo > 0)) then
+        setErrno(34)
+        return 0, 2147483648
+    end
+    if negative then
+        lo, hi = (-lo) % 4294967296, (-hi - (if lo == 0 then 0 else 1)) % 4294967296
+    end
+    return lo, hi
+end
+
+function libc.strtol(sLo, sHi, endLo, endHi, baseLo)
+    return parseInteger(sLo, sHi, endLo, endHi, baseLo, false)
+end
+
+function libc.strtoul(sLo, sHi, endLo, endHi, baseLo)
+    return parseInteger(sLo, sHi, endLo, endHi, baseLo, true)
+end
+
+function libc.atoi(sLo, sHi)
+    local lo = parseInteger(sLo, sHi, 0, 0, 10, false)
+    return lo, 0
+end
+
+function libc.atol(sLo, sHi)
+    return parseInteger(sLo, sHi, 0, 0, 10, false)
+end
+
+-- Returns the double and the number of bytes parsed.
+local function parseDouble(text: string): (number, number)
+    local leading = #(string.match(text, "^%s*") :: string)
+    local rest = string.sub(text, leading + 1)
+    local lowered = string.lower(rest)
+    local sign = 1
+    local signLength = 0
+    if string.sub(lowered, 1, 1) == "-" or string.sub(lowered, 1, 1) == "+" then
+        if string.sub(lowered, 1, 1) == "-" then sign = -1 end
+        signLength = 1
+        lowered = string.sub(lowered, 2)
+    end
+    if string.sub(lowered, 1, 8) == "infinity" then return sign * math.huge, leading + signLength + 8 end
+    if string.sub(lowered, 1, 3) == "inf" then return sign * math.huge, leading + signLength + 3 end
+    if string.sub(lowered, 1, 3) == "nan" then return 0 / 0, leading + signLength + 3 end
+    local hex = string.match(lowered, "^0x[%x]*%.?[%x]*p?[+-]?%d*")
+    if hex and #hex > 2 then
+        local mantissa, exponent = string.match(hex, "^0x([%x]*%.?[%x]*)p?([+-]?%d*)$")
+        local whole, fraction = string.match(mantissa :: string, "^(%x*)%.?(%x*)$")
+        local value = tonumber((whole :: string) .. (fraction :: string), 16) or 0
+        value = value * 2 ^ ((tonumber(exponent) or 0) - 4 * #(fraction :: string))
+        return sign * value, leading + signLength + #hex
+    end
+    local number = string.match(lowered, "^%d*%.?%d*")
+    if not number or number == "" or number == "." then return 0, 0 end
+    local exponent = string.match(lowered, "^e[+-]?%d+", #number + 1)
+    local literal = number .. (exponent or "")
+    return sign * (tonumber(literal) or 0), leading + signLength + #literal
+end
+
+function libc.strtod(sLo, sHi, endLo, endHi)
+    local start = address(sLo, sHi)
+    local value, used = parseDouble(guestString(start, 512))
+    if endLo ~= 0 or endHi ~= 0 then write(8, address(endLo, endHi), start + used, 0) end
+    return value
+end
+
+function libc.time(lo, hi)
+    local now = os.time()
+    if lo ~= 0 or hi ~= 0 then write(8, address(lo, hi), now, 0) end
+    return now, 0
+end
+
+function libc.clock()
+    return result(math.floor(os.clock() * 1000000))
+end
+
+function libc.clock_gettime(clockLo, clockHi, lo, hi)
+    local now = os.clock()
+    local at = address(lo, hi)
+    write(8, at, math.floor(now), 0)
+    write(8, at + 8, math.floor((now % 1) * 1e9), 0)
+    return 0, 0
+end
+
+function libc.gettimeofday(lo, hi)
+    local now = os.time()
+    local at = address(lo, hi)
+    write(8, at, now, 0)
+    write(8, at + 8, 0, 0)
+    return 0, 0
+end
+
+function libc.setlocale()
+    return cachedString("C"), 0
+end
+
+function libc.getpid()
+    return 4096, 0
+end
+
+function libc.sysconf(nameLo)
+    -- _SC_PAGESIZE and _SC_NPROCESSORS_ONLN are the common queries.
+    if nameLo == 30 or nameLo == 29 then return 4096, 0 end
+    return 1, 0
+end
+
+function libc.signal()
+    return 0, 0
+end
+
+function libc.success()
+    return 0, 0
+end
+
+-- The guest runs on a single thread.
+function libc.pthread_self()
+    return 0x1000, 0
+end
+
+function libc.pthread_mach_thread_np()
+    return 0x1003, 0
+end
+
+function libc.pthread_equal(alo, ahi, blo, bhi)
+    return if alo == blo and ahi == bhi then 1 else 0, 0
+end
+
+local threadKeys: {[number]: {lo: number, hi: number}} = {}
+local nextThreadKey = 1
+
+function libc.pthread_key_create(keyLo, keyHi)
+    write(4, address(keyLo, keyHi), nextThreadKey, 0)
+    threadKeys[nextThreadKey] = {lo = 0, hi = 0}
+    nextThreadKey += 1
+    return 0, 0
+end
+
+function libc.pthread_getspecific(key)
+    local slot = threadKeys[key]
+    if not slot then return 0, 0 end
+    return slot.lo, slot.hi
+end
+
+function libc.pthread_setspecific(key, keyHi, lo, hi)
+    threadKeys[key] = {lo = lo, hi = hi}
+    return 0, 0
+end
+
+function libc.pthread_cond_wait()
+    error("guest waits on a condition variable that no other thread can signal", 0)
+end
+
+-- C locale character classes in Darwin's rune type bits.
+local function runeType(c: number): number
+    if c < 0 or c > 255 then return 0 end
+    local upper, lower = c >= 65 and c <= 90, c >= 97 and c <= 122
+    local digit = c >= 48 and c <= 57
+    local hex = digit or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
+    local space = c == 32 or (c >= 9 and c <= 13)
+    local print = c >= 32 and c <= 126
+    local graph = c >= 33 and c <= 126
+    local bits = 0
+    if upper or lower then bits += 0x100 end
+    if c < 32 or c == 127 then bits += 0x200 end
+    if digit then bits += 0x400 + (c - 48) end
+    if graph then bits += 0x800 end
+    if lower then bits += 0x1000 end
+    if graph and not (upper or lower or digit) then bits += 0x2000 end
+    if space then bits += 0x4000 end
+    if upper then bits += 0x8000 end
+    if hex then bits += 0x10000 end
+    if c == 9 or c == 32 then bits += 0x20000 end
+    if print then bits += 0x40000 end
+    return bits
+end
+
+function libc.__maskrune(c, cHi, mask)
+    return bit32.band(runeType(signed32(c)), mask), 0
+end
+
+function libc.__toupper(c)
+    return if c >= 97 and c <= 122 then c - 32 else c, 0
+end
+
+function libc.__tolower(c)
+    return if c >= 65 and c <= 90 then c + 32 else c, 0
+end
+
+function libc.__mb_cur_max_l()
+    return 1, 0
+end
+
+function libc.wctob(c)
+    return if c < 128 then c else 4294967295, 0
+end
+
+function libc.btowc(c)
+    return if c < 128 then c else 4294967295, 0
+end
+
+function libc.mbtowc(pwcLo, pwcHi, sLo, sHi, nLo, nHi)
+    if sLo == 0 and sHi == 0 then return 0, 0 end
+    if nLo == 0 and nHi == 0 then return 4294967295, 4294967295 end
+    local byte = read(1, address(sLo, sHi))
+    if pwcLo ~= 0 or pwcHi ~= 0 then write(4, address(pwcLo, pwcHi), byte, 0) end
+    return if byte == 0 then 0 else 1, 0
+end
+
+function libc.mbrtowc(pwcLo, pwcHi, sLo, sHi, nLo, nHi)
+    return libc.mbtowc(pwcLo, pwcHi, sLo, sHi, nLo, nHi)
+end
+
+function libc.mbrlen(sLo, sHi, nLo, nHi)
+    if nLo == 0 and nHi == 0 then return 4294967294, 4294967295 end
+    return if read(1, address(sLo, sHi)) == 0 then 0 else 1, 0
+end
+
+function libc.wcrtomb(sLo, sHi, wc)
+    if sLo == 0 and sHi == 0 then return 1, 0 end
+    if wc > 255 then setErrno(92); return 4294967295, 4294967295 end
+    write(1, address(sLo, sHi), wc, 0)
+    return 1, 0
+end
+
+-- mbsrtowcs and mbsnrtowcs: `limit` bounds the source bytes for the n variant.
+local function toWide(dstLo: number, dstHi: number, srcLo: number, srcHi: number, limit: number?, count: number): (number, number)
+    local holder = address(srcLo, srcHi)
+    local src = address(read(8, holder))
+    local dst = address(dstLo, dstHi)
+    local converted = 0
+    while (dst == 0 or converted < count) and (limit == nil or converted < limit) do
+        local byte = read(1, src + converted)
+        if dst ~= 0 then write(4, dst + converted * 4, byte, 0) end
+        if byte == 0 then
+            if dst ~= 0 then write(8, holder, 0, 0) end
+            return result(converted)
+        end
+        converted += 1
+    end
+    if dst ~= 0 then write(8, holder, src + converted, 0) end
+    return result(converted)
+end
+
+function libc.mbsrtowcs(dstLo, dstHi, srcLo, srcHi, countLo, countHi)
+    return toWide(dstLo, dstHi, srcLo, srcHi, nil, address(countLo, countHi))
+end
+
+function libc.mbsnrtowcs(dstLo, dstHi, srcLo, srcHi, limitLo, limitHi, countLo, countHi)
+    return toWide(dstLo, dstHi, srcLo, srcHi, address(limitLo, limitHi), address(countLo, countHi))
+end
+
+function libc.wcsnrtombs(dstLo, dstHi, srcLo, srcHi, limitLo, limitHi, countLo, countHi)
+    local holder = address(srcLo, srcHi)
+    local src = address(read(8, holder))
+    local dst = address(dstLo, dstHi)
+    local limit, count = address(limitLo, limitHi), address(countLo, countHi)
+    local converted = 0
+    while (dst == 0 or converted < count) and converted < limit do
+        local wc = read(4, src + converted * 4)
+        if wc > 255 then setErrno(92); return 4294967295, 4294967295 end
+        if dst ~= 0 then write(1, dst + converted, wc, 0) end
+        if wc == 0 then
+            if dst ~= 0 then write(8, holder, 0, 0) end
+            return result(converted)
+        end
+        converted += 1
+    end
+    if dst ~= 0 then write(8, holder, src + converted * 4, 0) end
+    return result(converted)
+end
+
+function libc.wcslen(lo, hi)
+    local at = address(lo, hi)
+    local count = 0
+    while read(4, at + count * 4) ~= 0 do count += 1 end
+    return result(count)
+end
+
+local localeHandle = 0
+function libc.newlocale()
+    if localeHandle == 0 then
+        localeHandle = resize(0, 0, 16, 0)
+        fillMemory(localeHandle, 0, 0, 16, 0)
+    end
+    return localeHandle, 0
+end
+
+function libc.uselocale()
+    return 4294967295, 4294967295
+end
+
+local conventions = 0
+function libc.localeconv()
+    if conventions == 0 then
+        conventions = resize(0, 0, 96, 0)
+        fillMemory(conventions, 0, 127, 96, 0)
+        local empty = cachedString("")
+        for field = 0, 9 do write(8, conventions + field * 8, empty, 0) end
+        write(8, conventions, cachedString("."), 0)
+    end
+    return conventions, 0
+end
+
+local function span(sLo: number, sHi: number, setLo: number, setHi: number, inside: boolean): number
+    local text = guestString(address(sLo, sHi))
+    local set = guestString(address(setLo, setHi))
+    for i = 1, #text do
+        local found = string.find(set, string.sub(text, i, i), 1, true) ~= nil
+        if found ~= inside then return i - 1 end
+    end
+    return #text
+end
+
+function libc.strspn(sLo, sHi, setLo, setHi)
+    return result(span(sLo, sHi, setLo, setHi, true))
+end
+
+function libc.strcspn(sLo, sHi, setLo, setHi)
+    return result(span(sLo, sHi, setLo, setHi, false))
+end
+
+function libc.strpbrk(sLo, sHi, setLo, setHi)
+    local length = span(sLo, sHi, setLo, setHi, false)
+    local at = address(sLo, sHi) + length
+    return if read(1, at) == 0 then 0 else at, 0
+end
+
+function libc.strncpy(dstLo, dstHi, srcLo, srcHi, countLo, countHi)
+    local count = address(countLo, countHi)
+    local text = guestString(address(srcLo, srcHi), count)
+    writeString(address(dstLo, dstHi), text)
+    if #text < count then fillMemory(address(dstLo, dstHi) + #text, 0, 0, count - #text, 0) end
+    return dstLo, dstHi
+end
+
+function libc.strncat(dstLo, dstHi, srcLo, srcHi, countLo, countHi)
+    local dst = address(dstLo, dstHi)
+    local text = guestString(address(srcLo, srcHi), address(countLo, countHi))
+    local at = dst + stringLength(dst, 0)
+    writeString(at, text)
+    write(1, at + #text, 0, 0)
+    return dstLo, dstHi
+end
+
+function libc.strdup(sLo, sHi)
+    return newGuestString(guestString(address(sLo, sHi))), 0
+end
+
+function libc.strerror(code)
+    return cachedString("guest error " .. signed32(code)), 0
+end
+
+function libc.strerror_r(code, codeHi, bufLo, bufHi, sizeLo, sizeHi)
+    local text = string.sub("guest error " .. signed32(code), 1, math.max(address(sizeLo, sizeHi) - 1, 0))
+    writeString(address(bufLo, bufHi), text)
+    write(1, address(bufLo, bufHi) + #text, 0, 0)
+    return 0, 0
+end
+
+function libc.aligned_alloc(alignLo, alignHi, sizeLo, sizeHi)
+    -- Heap allocations are 16-byte aligned; larger alignments are not available.
+    if address(alignLo, alignHi) > 16 then return 0, 0 end
+    return resize(0, 0, math.max(address(sizeLo, sizeHi), 1), 0), 0
+end
+
+function libc.posix_memalign(pointerLo, pointerHi, alignLo, alignHi, sizeLo, sizeHi)
+    if address(alignLo, alignHi) > 16 then return 12, 0 end
+    write(8, address(pointerLo, pointerHi), resize(0, 0, math.max(address(sizeLo, sizeHi), 1), 0), 0)
+    return 0, 0
+end
+
+function libc.mach_absolute_time()
+    return result(math.floor(os.clock() * 1e9))
+end
+
+function libc.mach_timebase_info(lo, hi)
+    write(4, address(lo, hi), 1, 0)
+    write(4, address(lo, hi) + 4, 1, 0)
+    return 0, 0
+end
+
+function libc.failure()
+    return 0, 0
+end
+
+-- KERNEL32 for programs built against the Windows CRT. Every entry receives the four register arguments as
+-- (lo, hi) pairs followed by the stack pointer; later arguments live above the 32-byte shadow space.
+local win32 = {}
+local windowsHandles: {[number]: number} = {[0x10] = 0, [0x14] = 1, [0x18] = 2}
+local nextWindowsHandle = 0x100
+local windowsTls: {[number]: {lo: number, hi: number}} = {}
+local nextWindowsTls = 1
+
+local function stackArgument(sp: number, index: number): (number, number)
+    return read(8, sp + 32 + (index - 4) * 8)
+end
+
+local function readWide(at: number, count: number?): string
+    local chars = {}
+    local i = 0
+    while count == nil or i < count do
+        local unit = read(2, at + i * 2)
+        if count == nil and unit == 0 then break end
+        table.insert(chars, if unit < 256 then string.char(unit) else "?")
+        i += 1
+    end
+    return table.concat(chars)
+end
+
+local function writeWide(at: number, text: string, terminate: boolean)
+    for i = 1, #text do write(2, at + (i - 1) * 2, string.byte(text, i), 0) end
+    if terminate then write(2, at + #text * 2, 0, 0) end
+end
+
+local function newGuestWide(text: string): number
+    local at = resize(0, 0, (#text + 1) * 2, 0)
+    writeWide(at, text, true)
+    return at
+end
+
+local function commandLine(): string
+    local parts = {}
+    for i, argument in host.args do
+        if i == 1 or string.find(argument, "[ \t\"]") or argument == "" then
+            table.insert(parts, '"' .. string.gsub(argument, '"', '\\"') .. '"')
+        else
+            table.insert(parts, argument)
+        end
+    end
+    return table.concat(parts, " ")
+end
+
+local function handleDescriptor(lo: number, hi: number): number?
+    return if hi == 0 then windowsHandles[lo] else nil
+end
+
+function win32.GetStdHandle(lo)
+    local index = signed32(lo)
+    if index == -10 then return 0x10, 0 elseif index == -11 then return 0x14, 0 elseif index == -12 then return 0x18, 0 end
+    return 4294967295, 4294967295
+end
+
+function win32.GetFileType(lo, hi)
+    local fd = handleDescriptor(lo, hi)
+    if fd == nil then return 0, 0 end
+    -- Standard handles report pipes so the CRT uses byte I/O rather than the console API.
+    return if fd <= 2 then 3 else 1, 0
+end
+
+function win32.WriteFile(hLo, hHi, bufLo, bufHi, countLo, countHi, writtenLo, writtenHi)
+    local fd = handleDescriptor(hLo, hHi)
+    local text = readString(address(bufLo, bufHi), countLo)
+    if fd == nil or not hostWrite(fd, text) then process.lastError = 6; return 0, 0 end
+    if writtenLo ~= 0 or writtenHi ~= 0 then write(4, address(writtenLo, writtenHi), #text, 0) end
+    return 1, 0
+end
+
+function win32.ReadFile(hLo, hHi, bufLo, bufHi, countLo, countHi, readLo, readHi)
+    local fd = handleDescriptor(hLo, hHi)
+    local text = if fd ~= nil then hostRead(fd, countLo) else nil
+    if text == nil then process.lastError = 6; return 0, 0 end
+    writeString(address(bufLo, bufHi), text)
+    if readLo ~= 0 or readHi ~= 0 then write(4, address(readLo, readHi), #text, 0) end
+    return 1, 0
+end
+
+function win32.WriteConsoleW(hLo, hHi, bufLo, bufHi, countLo, countHi, writtenLo, writtenHi)
+    local fd = handleDescriptor(hLo, hHi)
+    if fd == nil then return 0, 0 end
+    hostWrite(fd, readWide(address(bufLo, bufHi), countLo))
+    if writtenLo ~= 0 or writtenHi ~= 0 then write(4, address(writtenLo, writtenHi), countLo, 0) end
+    return 1, 0
+end
+
+function win32.CreateFileW(nameLo, nameHi, accessLo, accessHi, shareLo, shareHi, securityLo, securityHi, sp)
+    local path = string.gsub(readWide(address(nameLo, nameHi)), "\\", "/")
+    local disposition = stackArgument(sp, 4)
+    local readable = bit32.btest(accessLo, 0x80000000) or bit32.btest(accessLo, 0x10000000)
+    local writable = bit32.btest(accessLo, 0x40000000) or bit32.btest(accessLo, 0x10000000)
+    local exists = host.files[path] ~= nil
+    if (disposition == 1 and exists) or ((disposition == 3 or disposition == 5) and not exists) then
+        process.lastError = if exists then 80 else 2
+        return 4294967295, 4294967295
+    end
+    local fd = hostOpen(path, readable, writable, disposition ~= 3 and disposition ~= 5,
+        disposition == 2 or disposition == 5, false)
+    if not fd then process.lastError = 2; return 4294967295, 4294967295 end
+    local handle = nextWindowsHandle
+    nextWindowsHandle += 4
+    windowsHandles[handle] = fd
+    process.lastError = if exists and (disposition == 2 or disposition == 4) then 183 else 0
+    return handle, 0
+end
+
+function win32.CloseHandle(lo, hi)
+    local fd = handleDescriptor(lo, hi)
+    if fd and fd > 2 then
+        hostClose(fd)
+        windowsHandles[lo] = nil
+    end
+    return 1, 0
+end
+
+function win32.GetFileSizeEx(hLo, hHi, sizeLo, sizeHi)
+    local fd = handleDescriptor(hLo, hHi)
+    local file = if fd then host.descriptors[fd] else nil
+    if not file then process.lastError = 6; return 0, 0 end
+    write(8, address(sizeLo, sizeHi), result(file.size))
+    return 1, 0
+end
+
+function win32.SetFilePointerEx(hLo, hHi, distanceLo, distanceHi, newLo, newHi, methodLo)
+    local fd = handleDescriptor(hLo, hHi)
+    local position = if fd then hostSeek(fd, signed64(distanceLo, distanceHi), methodLo) else nil
+    if not position then process.lastError = 131; return 0, 0 end
+    if newLo ~= 0 or newHi ~= 0 then write(8, address(newLo, newHi), result(position)) end
+    return 1, 0
+end
+
+function win32.SetEndOfFile(hLo, hHi)
+    local fd = handleDescriptor(hLo, hHi)
+    local file = if fd then host.descriptors[fd] else nil
+    if file then file.size = file.at end
+    return 1, 0
+end
+
+function win32.GetCommandLineW()
+    if host.strings["\0commandW"] == nil then host.strings["\0commandW"] = newGuestWide(commandLine()) end
+    return host.strings["\0commandW"], 0
+end
+
+function win32.GetCommandLineA()
+    return cachedString(commandLine()), 0
+end
+
+function win32.GetModuleFileNameW(moduleLo, moduleHi, bufLo, bufHi, sizeLo)
+    local name = host.args[1] or "program.exe"
+    name = string.sub(name, 1, math.max(sizeLo - 1, 0))
+    writeWide(address(bufLo, bufHi), name, true)
+    return #name, 0
+end
+
+function win32.GetModuleFileNameA(moduleLo, moduleHi, bufLo, bufHi, sizeLo)
+    local name = string.sub(host.args[1] or "program.exe", 1, math.max(sizeLo - 1, 0))
+    writeString(address(bufLo, bufHi), name)
+    write(1, address(bufLo, bufHi) + #name, 0, 0)
+    return #name, 0
+end
+
+function win32.GetEnvironmentStringsW()
+    local block = table.concat(host.env, "\0") .. "\0\0"
+    local at = resize(0, 0, #block * 2 + 2, 0)
+    writeWide(at, block, true)
+    return at, 0
+end
+
+function win32.GetStartupInfoW(lo, hi)
+    fillMemory(address(lo, hi), 0, 0, 104, 0)
+    write(4, address(lo, hi), 104, 0)
+    return 0, 0
+end
+
+function win32.GetCPInfo(codeLo, codeHi, infoLo, infoHi)
+    local at = address(infoLo, infoHi)
+    fillMemory(at, 0, 0, 20, 0)
+    write(4, at, if codeLo == 65001 then 4 else 1, 0)
+    write(1, at + 4, 63, 0)
+    return 1, 0
+end
+
+function win32.GetACP()
+    return 1252, 0
+end
+
+function win32.GetOEMCP()
+    return 437, 0
+end
+
+function win32.MultiByteToWideChar(codeLo, codeHi, flagsLo, flagsHi, srcLo, srcHi, countLo, countHi, sp)
+    local dst = address(stackArgument(sp, 4))
+    local capacity = signed32((stackArgument(sp, 5)))
+    local src = address(srcLo, srcHi)
+    local count = signed32(countLo)
+    local text = if count < 0 then guestString(src) .. "\0" else readString(src, count)
+    if capacity == 0 then return #text, 0 end
+    if #text > capacity then process.lastError = 122; return 0, 0 end
+    writeWide(dst, text, false)
+    return #text, 0
+end
+
+function win32.WideCharToMultiByte(codeLo, codeHi, flagsLo, flagsHi, srcLo, srcHi, countLo, countHi, sp)
+    local dst = address(stackArgument(sp, 4))
+    local capacity = signed32((stackArgument(sp, 5)))
+    local src = address(srcLo, srcHi)
+    local count = signed32(countLo)
+    local text = if count < 0 then readWide(src) .. "\0" else readWide(src, count)
+    if capacity == 0 then return #text, 0 end
+    if #text > capacity then process.lastError = 122; return 0, 0 end
+    writeString(dst, text)
+    return #text, 0
+end
+
+local function mapCase(text: string, flags: number): string
+    if bit32.btest(flags, 0x200) then return string.upper(text) end
+    if bit32.btest(flags, 0x100) then return string.lower(text) end
+    return text
+end
+
+-- LCMapStringW(locale, flags, src, count, dst, capacity); the Ex form adds a version and reserved words.
+local function mapString(flags: number, src: number, count: number, dst: number, capacity: number): (number, number)
+    local text = if count < 0 then readWide(src) .. "\0" else readWide(src, count)
+    text = mapCase(text, flags)
+    if capacity == 0 then return #text, 0 end
+    if #text > capacity then process.lastError = 122; return 0, 0 end
+    writeWide(dst, text, false)
+    return #text, 0
+end
+
+function win32.LCMapStringW(localeLo, localeHi, flagsLo, flagsHi, srcLo, srcHi, countLo, countHi, sp)
+    return mapString(flagsLo, address(srcLo, srcHi), signed32(countLo), address(stackArgument(sp, 4)),
+        signed32((stackArgument(sp, 5))))
+end
+
+function win32.LCMapStringEx(localeLo, localeHi, flagsLo, flagsHi, srcLo, srcHi, countLo, countHi, sp)
+    return mapString(flagsLo, address(srcLo, srcHi), signed32(countLo), address(stackArgument(sp, 4)),
+        signed32((stackArgument(sp, 5))))
+end
+
+function win32.GetStringTypeW(typeLo, typeHi, srcLo, srcHi, countLo, countHi, typesLo, typesHi)
+    local src, count = address(srcLo, srcHi), signed32(countLo)
+    if count < 0 then count = #readWide(src) + 1 end
+    for i = 0, count - 1 do
+        local c = read(2, src + i * 2)
+        local bits = 0
+        if typeLo == 1 then
+            local upper, lower = c >= 65 and c <= 90, c >= 97 and c <= 122
+            local digit = c >= 48 and c <= 57
+            if upper then bits += 0x1 end
+            if lower then bits += 0x2 end
+            if digit then bits += 0x4 end
+            if c == 32 or (c >= 9 and c <= 13) then bits += 0x8 end
+            if c >= 33 and c <= 126 and not (upper or lower or digit) then bits += 0x10 end
+            if c < 32 or c == 127 then bits += 0x20 end
+            if c == 32 or c == 9 then bits += 0x40 end
+            if digit or (c >= 65 and c <= 70) or (c >= 97 and c <= 102) then bits += 0x80 end
+            if upper or lower then bits += 0x100 end
+            if c < 128 then bits += 0x200 end
+        end
+        write(2, address(typesLo, typesHi) + i * 2, bits, 0)
+    end
+    return 1, 0
+end
+
+function win32.CompareStringW(localeLo, localeHi, flagsLo, flagsHi, aLo, aHi, aCountLo, aCountHi, sp)
+    local bLo, bHi = stackArgument(sp, 4)
+    local bCount = signed32((stackArgument(sp, 5)))
+    local aCount = signed32(aCountLo)
+    local a = if aCount < 0 then readWide(address(aLo, aHi)) else readWide(address(aLo, aHi), aCount)
+    local b = if bCount < 0 then readWide(address(bLo, bHi)) else readWide(address(bLo, bHi), bCount)
+    if bit32.btest(flagsLo, 1) then a, b = string.lower(a), string.lower(b) end
+    return if a < b then 1 elseif a == b then 2 else 3, 0
+end
+
+function win32.GetLocaleInfoW()
+    process.lastError = 87
+    return 0, 0
+end
+
+function win32.GetUserDefaultLCID()
+    return 0x409, 0
+end
+
+function win32.QueryPerformanceCounter(lo, hi)
+    write(8, address(lo, hi), result(math.floor(os.clock() * 1e7)))
+    return 1, 0
+end
+
+function win32.QueryPerformanceFrequency(lo, hi)
+    write(8, address(lo, hi), 10000000, 0)
+    return 1, 0
+end
+
+function win32.GetSystemTimeAsFileTime(lo, hi)
+    -- 100-nanosecond intervals since 1601.
+    local ticks = (os.time() + 11644473600) * 10000000
+    write(8, address(lo, hi), result(ticks))
+    return 0, 0
+end
+
+function win32.GetCurrentProcessId()
+    return 0x1000, 0
+end
+
+function win32.GetCurrentThreadId()
+    return 0x1004, 0
+end
+
+function win32.GetCurrentProcess()
+    return 4294967295, 4294967295
+end
+
+function win32.ExitProcess(code)
+    exitProcess(code, false)
+    return 0, 0
+end
+
+function win32.TerminateProcess(hLo, hHi, code)
+    exitProcess(code, false)
+    return 0, 0
+end
+
+function win32.IsProcessorFeaturePresent(feature)
+    -- Report SSE2 (PF_XMMI64_INSTRUCTIONS_AVAILABLE) as the baseline and nothing else.
+    return if feature == 10 then 1 else 0, 0
+end
+
+function win32.InitializeSListHead(lo, hi)
+    fillMemory(address(lo, hi), 0, 0, 16, 0)
+    return 0, 0
+end
+
+function win32.TlsAlloc()
+    local index = nextWindowsTls
+    nextWindowsTls += 1
+    windowsTls[index] = {lo = 0, hi = 0}
+    return index, 0
+end
+
+function win32.TlsGetValue(index)
+    local slot = windowsTls[index]
+    process.lastError = 0
+    if not slot then return 0, 0 end
+    return slot.lo, slot.hi
+end
+
+function win32.TlsSetValue(index, indexHi, lo, hi)
+    windowsTls[index] = {lo = lo, hi = hi}
+    return 1, 0
+end
+
+function win32.TlsFree(index)
+    windowsTls[index] = nil
+    return 1, 0
+end
+
+function win32.RaiseException(code)
+    error(string.format("guest raised Windows exception 0x%08x", code), 0)
+    return 0, 0
+end
+
+function win32.FindFirstFileExW()
+    process.lastError = 2
+    return 4294967295, 4294967295
+end
+
+function win32.GetTimeZoneInformation(sp, spHi, lo, hi)
+    return 0, 0
+end
+
+function win32.VirtualQuery(lo, hi, infoLo, infoHi, sizeLo)
+    -- Report every page as committed read-write memory.
+    local at = address(infoLo, infoHi)
+    local page = lo - lo % 4096
+    fillMemory(at, 0, 0, 48, 0)
+    write(8, at, page, 0)
+    write(8, at + 8, page, 0)
+    write(4, at + 16, 4, 0)
+    write(8, at + 24, 4096, 0)
+    write(4, at + 32, 0x1000, 0)
+    write(4, at + 36, 4, 0)
+    write(4, at + 40, 0x20000, 0)
+    return 48, 0
+end
+
+function win32.yes()
+    return 1, 0
+end
+
+function win32.no()
+    return 0, 0
+end
+
+function libc.strcoll(aLo, aHi, bLo, bHi)
+    return compareStrings(aLo, aHi, bLo, bHi)
+end
+
+function libc.isspace(c)
+    return if c == 32 or (c >= 9 and c <= 13) then 1 else 0, 0
+end
+
+function libc.sigaction()
+    return 0, 0
+end
+)luau";
 
 constexpr std::string_view JumpOperators = R"(
 type JumpFrames = {[number]: {}}
@@ -1036,13 +3340,49 @@ std::optional<std::uint64_t> Data::immutableWord(std::uint64_t at, unsigned size
 }
 
 void Data::materialize(std::size_t at, unsigned size) {
-    const auto region = std::ranges::find_if(regions, [&](const GuestRegion& value) {
-        return value.readable && !value.executable && at >= value.start && at + size <= value.end;
-    });
-    const unsigned mode = region == regions.end() ? 0 :
-        unsigned(region->writable) + (region->protectable ? 2 : 0);
-    for (unsigned i = 0; i < size; ++i)
-        emitted.emplace(at + i, std::pair(image[at + i], mode));
+    if (!size)
+        return;
+    auto first = at, last = at + size;
+    auto next = emitted.upper_bound(first);
+    if (next != emitted.begin()) {
+        const auto previous = std::prev(next);
+        if (previous->second >= first) {
+            first = previous->first;
+            last = std::max(last, previous->second);
+            next = emitted.erase(previous);
+        }
+    }
+    while (next != emitted.end() && next->first <= last) {
+        last = std::max(last, next->second);
+        next = emitted.erase(next);
+    }
+    emitted.emplace(first, last);
+}
+
+bool Data::materialized(std::uint64_t at) const {
+    const auto next = emitted.upper_bound(at);
+    return next != emitted.begin() && std::prev(next)->second > at;
+}
+
+void Data::materializeAll() {
+    // Code sections are included too: compilers place jump tables and constructor lists among the code.
+    for (const auto& region : regions) {
+        if (!region.readable && !region.executable)
+            continue;
+        auto start = region.start;
+        std::vector<const GuestImport*> gaps;
+        for (const auto& import : imports)
+            if (import.start < region.end && import.start + import.size > region.start)
+                gaps.push_back(&import);
+        std::ranges::sort(gaps, {}, [](const GuestImport* import) { return import->start; });
+        for (const auto* gap : gaps) {
+            if (gap->start > start)
+                materialize(start, unsigned(gap->start - start));
+            start = std::max(start, gap->start + gap->size);
+        }
+        if (start < region.end)
+            materialize(start, unsigned(region.end - start));
+    }
 }
 
 bool Data::materializeObject(std::uint64_t at) {
@@ -1111,7 +3451,7 @@ void Data::materializeIndexed(std::uint64_t at) {
 
 void Data::materializeAddress(std::uint64_t at) {
     materializeObject(at);
-    if (!readable(at, 1) || writable(at, 1) || emitted.contains(at))
+    if (!readable(at, 1) || writable(at, 1) || materialized(at))
         return;
     // Address-taken printable literals may lack an ELF symbol.
     for (unsigned size = 1; size <= 4096 && readable(at, size); ++size) {
@@ -1127,23 +3467,50 @@ void Data::materializeAddress(std::uint64_t at) {
 }
 
 std::string Data::source() const {
+    const auto modeAt = [&](std::size_t at) {
+        const auto region = std::ranges::find_if(regions, [&](const GuestRegion& value) {
+            return value.readable && !value.executable && at >= value.start && at < value.end;
+        });
+        return region == regions.end() ? 0u : unsigned(region->writable) + (region->protectable ? 2 : 0);
+    };
+    // Split ranges where the write mode changes, and trim trailing zeros: the runtime zero-fills each range.
+    std::vector<std::size_t> cuts;
+    for (const auto& region : regions)
+        cuts.insert(cuts.end(), {region.start, region.end});
+    std::ranges::sort(cuts);
     std::string result = "local data: {DataRange} = {\n";
-    for (auto it = emitted.begin(); it != emitted.end();) {
-        const auto start = it->first;
-        auto end = start;
-        const auto mode = it->second.second;
-        std::vector<std::uint8_t> bytes;
-        for (; it != emitted.end() && it->first == end && it->second.second == mode; ++it, ++end)
-            bytes.push_back(it->second.first);
-        result += std::format("    {{first = {}, last = {}, mode = {}, bytes = ", start, end, mode);
-        appendQuoted(result, bytes);
-        result += "},\n";
+    for (const auto& [start, end] : emitted) {
+        for (auto first = start; first < end;) {
+            auto last = end;
+            if (const auto cut = std::ranges::upper_bound(cuts, first); cut != cuts.end() && *cut < last)
+                last = *cut;
+            auto used = last;
+            while (used > first && image[used - 1] == 0)
+                --used;
+            result += std::format("    {{first = {}, last = {}, mode = {}, bytes = ", first, last, modeAt(first));
+            appendQuoted(result, image.subspan(first, used - first));
+            result += "},\n";
+            first = last;
+        }
     }
     return result + "}\n";
 }
 
 void appendRuntime(std::string& source, const RuntimeFeatures& features, const Data& data) {
     source += ArgumentReader;
+    // Guest process state that outlives a single export call.
+    source += "\nlocal guestTrace: {number} = table.create(32, -1)\nlocal guestTraceAt = 1\n";
+    source += "local function describeTrace(): string\n"
+        "    local parts = {}\n"
+        "    for i = 0, 31 do\n"
+        "        local pc = guestTrace[(guestTraceAt + i - 1) % 32 + 1]\n"
+        "        if pc >= 0 then table.insert(parts, string.format(\"%x\", pc)) end\n"
+        "    end\n"
+        "    return \"recent guest blocks: \" .. table.concat(parts, \" \")\n"
+        "end\n";
+    source += "\nlocal process = {initialized = false, exitCallbacks = {} :: {() -> ()}, "
+        "fiberSlots = {} :: {[number]: {lo: number, hi: number, callbackLo: number, callbackHi: number}?}, "
+        "fiberNext = 0, lastError = 0, exceptionFilterLo = 0, exceptionFilterHi = 0}\n";
     if (features.structured)
         source += RoutineOperators;
     if (features.stackGuard)
@@ -1159,6 +3526,8 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
         source += MultiplyOperators;
     if (features.floating)
         source += FloatingOperators;
+    if (features.vector)
+        source += VectorOperators;
     if (features.prime)
         source += PrimeOperators;
     if (features.decimal)
@@ -1170,8 +3539,13 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
         source += data.source();
         source += std::format("local read, write, stackTop, resetMemory, resize, readXmm, writeXmm, "
             "compareStrings, stringLength, copyMemory, fillMemory, processHeap, allocateCpp, compareMemory, "
-            "criticalSection, protectMemory, cLocale, useCLocale, wideClass, testWideClass, pthreadMutex, srwLock = makeMemory({}, data, {}, {})\n",
-            data.image.size(), features.heap, !data.regions.empty());
+            "criticalSection, protectMemory, cLocale, useCLocale, wideClass, testWideClass, pthreadMutex, srwLock, errnoAddress, "
+            "readString, writeString = makeMemory({}, data, {}, {}, {})\n",
+            data.image.size(), features.heap, !data.regions.empty(), data.regions.empty() ? RawStackSize : MappedStackSize);
+        if (features.process)
+            source += ProcessOperators;
+        if (features.x87)
+            source += X87Operators;
     }
 }
 }

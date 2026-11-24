@@ -1,6 +1,7 @@
 #include "decode.h"
 
 #include <array>
+#include <format>
 #include <utility>
 
 namespace ir::decode {
@@ -101,6 +102,75 @@ Instruction decodeStackGuard(Reader& reader) {
     unsupported();
 }
 
+
+std::array<std::uint8_t, 16> interleave(unsigned element, bool high) {
+    std::array<std::uint8_t, 16> bytes{};
+    const unsigned base = high ? 8 : 0;
+    for (unsigned i = 0; i < 8 / element; ++i)
+        for (unsigned b = 0; b < element; ++b) {
+            bytes[2 * i * element + b] = std::uint8_t(base + i * element + b);
+            bytes[(2 * i + 1) * element + b] = std::uint8_t(16 + base + i * element + b);
+        }
+    return bytes;
+}
+
+Instruction decodeXmmEscape(Reader& reader, unsigned prefix, unsigned escape, unsigned rex) {
+    const auto opcode = reader.read(1);
+    const auto modrm = reader.read(1);
+    const unsigned mode = modrm >> 6;
+    const unsigned rm = modrm & 7;
+    const VectorRegister reg{unsigned((modrm >> 3) & 7) + (rex & 4) * 2};
+    const unsigned rmReg = rm + (rex & 1) * 8;
+    const auto operandAt = [&](unsigned trailing) -> VectorOperand {
+        if (mode == 3)
+            return VectorRegister{rmReg};
+        return VectorMemory{x64Address(reader, mode, rm, rex, trailing), false};
+    };
+    if (prefix != 0x66)
+        unsupported();
+    if (escape == 0x3a && (opcode == 0x0a || opcode == 0x0b)) {
+        const auto operand = operandAt(1);
+        const auto control = unsigned(reader.read(1));
+        constexpr std::array modes{ScalarFloatOp::RoundNearestEven, ScalarFloatOp::Floor, ScalarFloatOp::Ceil,
+            ScalarFloatOp::Truncate};
+        const auto op = control & 4 ? ScalarFloatOp::RoundNearestEven : modes[control & 3];
+        return {ScalarFloat{op, opcode == 0x0b ? 8u : 4u, reg, operand, std::nullopt, false}};
+    }
+    if (escape == 0x3a && (opcode == 0x0c || opcode == 0x0d)) {
+        // BLENDPS/BLENDPD take each lane from the source when its immediate bit is set.
+        const auto operand = operandAt(1);
+        const auto control = unsigned(reader.read(1));
+        const unsigned element = opcode == 0x0d ? 8 : 4;
+        std::array<std::uint8_t, 16> bytes{};
+        for (unsigned lane = 0; lane < 16 / element; ++lane)
+            for (unsigned b = 0; b < element; ++b)
+                bytes[lane * element + b] = std::uint8_t((control >> lane & 1 ? 16 : 0) + lane * element + b);
+        return {VectorPermute{reg, reg, operand, bytes}};
+    }
+    if (escape == 0x3a && opcode == 0x0f) {
+        // PALIGNR concatenates destination:source and shifts the pair right by whole bytes.
+        const auto operand = operandAt(1);
+        const auto count = unsigned(reader.read(1));
+        std::array<std::uint8_t, 16> bytes{};
+        for (unsigned i = 0; i < 16; ++i) {
+            const auto index = i + count;
+            bytes[i] = index < 16 ? std::uint8_t(16 + index) : index < 32 ? std::uint8_t(index - 16) : 255;
+        }
+        return {VectorPermute{reg, reg, operand, bytes}};
+    }
+    if (escape == 0x38 && opcode == 0x00)
+        return {VectorLanes{LaneOp::ShuffleBytes, 1, reg, operandAt(0)}};
+    if (escape == 0x38 && opcode == 0x2b)
+        return {VectorLanes{LaneOp::PackUnsigned, 4, reg, operandAt(0)}};
+    if (escape == 0x38 && opcode == 0x29)
+        return {VectorLanes{LaneOp::Equal, 8, reg, operandAt(0)}};
+    if (escape == 0x38 && opcode == 0x37)
+        return {VectorLanes{LaneOp::GreaterSigned, 8, reg, operandAt(0)}};
+    if (escape == 0x38 && (opcode == 0x14 || opcode == 0x15))
+        return {VectorBlend{reg, operandAt(0), reg, VectorRegister{0}, true, opcode == 0x15 ? 8u : 4u}};
+    unsupported();
+}
+
 Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned rex) {
     const auto modrm = reader.read(1);
     const unsigned mode = modrm >> 6;
@@ -112,11 +182,129 @@ Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned
             return VectorRegister{rmReg};
         return VectorMemory{x64Address(reader, mode, rm, rex, trailing), aligned};
     };
-    if (prefix == 0x66 && opcode == 0x73 && mode == 3) {
+    if (prefix == 0x66 && (opcode == 0x71 || opcode == 0x72 || opcode == 0x73) && mode == 3) {
         const auto group = (modrm >> 3) & 7;
-        if (group == 3 || group == 7)
+        if (opcode == 0x73 && (group == 3 || group == 7))
             return {VectorShiftBytes{VectorRegister{rmReg}, unsigned(reader.read(1)), group == 7}};
-        unsupported();
+        if (group != 2 && group != 4 && group != 6)
+            unsupported();
+        const auto op = group == 2 ? ShiftOp::LogicalRight : group == 4 ? ShiftOp::ArithmeticRight : ShiftOp::Left;
+        const unsigned element = opcode == 0x71 ? 2 : opcode == 0x72 ? 4 : 8;
+        if (op == ShiftOp::ArithmeticRight && element == 8)
+            unsupported();
+        return {VectorShiftLanes{op, element, VectorRegister{rmReg}, VectorRegister{rmReg}, unsigned(reader.read(1))}};
+    }
+    if ((prefix == 0 || prefix == 0x66) && (opcode == 0x14 || opcode == 0x15)) {
+        const unsigned element = prefix ? 8 : 4;
+        return {VectorPermute{reg, reg, operandAt(true), interleave(element, opcode == 0x15)}};
+    }
+    if (prefix == 0x66 && ((opcode >= 0x60 && opcode <= 0x62) || (opcode >= 0x68 && opcode <= 0x6a) ||
+        opcode == 0x6c || opcode == 0x6d)) {
+        const unsigned element = opcode == 0x6c || opcode == 0x6d ? 8 : 1u << (opcode & 3);
+        const bool high = opcode == 0x6d || (opcode >= 0x68 && opcode <= 0x6a);
+        return {VectorPermute{reg, reg, operandAt(true), interleave(element, high)}};
+    }
+    if ((prefix == 0 || prefix == 0x66) && opcode == 0xc6) {
+        const auto operand = operandAt(true, 1);
+        const auto control = unsigned(reader.read(1));
+        std::array<std::uint8_t, 16> bytes{};
+        const auto pick = [&](unsigned slot, unsigned source, unsigned lane, unsigned element) {
+            for (unsigned b = 0; b < element; ++b)
+                bytes[slot * element + b] = std::uint8_t(source * 16 + lane * element + b);
+        };
+        if (prefix) {
+            pick(0, 0, control & 1, 8);
+            pick(1, 1, (control >> 1) & 1, 8);
+        } else {
+            pick(0, 0, control & 3, 4);
+            pick(1, 0, (control >> 2) & 3, 4);
+            pick(2, 1, (control >> 4) & 3, 4);
+            pick(3, 1, (control >> 6) & 3, 4);
+        }
+        return {VectorPermute{reg, reg, operand, bytes}};
+    }
+    if ((prefix == 0x66 || prefix == 0xf2) && (opcode == 0x7c || opcode == 0x7d)) {
+        // HADD/HSUB combine adjacent lanes: the destination's pairs fill the low half, the source's the high.
+        const unsigned element = prefix == 0x66 ? 8 : 4;
+        const auto operand = operandAt(true);
+        std::array<std::uint8_t, 16> evens{}, odds{};
+        for (unsigned lane = 0; lane < 16 / element; ++lane) {
+            const auto source = lane < 8 / element ? 0u : 16u;
+            const auto pair = (lane % (8 / element)) * 2;
+            for (unsigned b = 0; b < element; ++b) {
+                evens[lane * element + b] = std::uint8_t(source + pair * element + b);
+                odds[lane * element + b] = std::uint8_t(source + (pair + 1) * element + b);
+            }
+        }
+        const VectorRegister temp{VectorTemp};
+        Instruction instruction{VectorPermute{temp, reg, operand, evens}};
+        instruction.after.push_back(VectorPermute{reg, reg, operand, odds});
+        instruction.after.push_back(VectorFloatLanes{opcode == 0x7c ? FloatLaneOp::Add : FloatLaneOp::Sub, element, reg,
+            reg, temp});
+        return instruction;
+    }
+    if (prefix == 0x66 && opcode == 0xd7 && mode == 3)
+        return {VectorReduce{ReduceOp::SignMask, 1, reg, VectorRegister{rmReg}, 16, reg.index}};
+    if (prefix == 0x66) {
+        struct LaneForm { unsigned opcode; LaneOp op; unsigned element; };
+        static constexpr std::array forms{
+            LaneForm{0x74, LaneOp::Equal, 1}, LaneForm{0x75, LaneOp::Equal, 2}, LaneForm{0x76, LaneOp::Equal, 4},
+            LaneForm{0x64, LaneOp::GreaterSigned, 1}, LaneForm{0x65, LaneOp::GreaterSigned, 2},
+            LaneForm{0x66, LaneOp::GreaterSigned, 4}, LaneForm{0xfc, LaneOp::Add, 1}, LaneForm{0xfd, LaneOp::Add, 2},
+            LaneForm{0xd4, LaneOp::Add, 8}, LaneForm{0xf8, LaneOp::Sub, 1}, LaneForm{0xf9, LaneOp::Sub, 2},
+            LaneForm{0xfb, LaneOp::Sub, 8}, LaneForm{0xd5, LaneOp::Mul, 2}, LaneForm{0xf4, LaneOp::MulWideUnsigned, 8},
+            LaneForm{0xe5, LaneOp::MulHighSigned, 2}, LaneForm{0xe4, LaneOp::MulHighUnsigned, 2},
+            LaneForm{0xda, LaneOp::MinUnsigned, 1}, LaneForm{0xde, LaneOp::MaxUnsigned, 1},
+            LaneForm{0xea, LaneOp::MinSigned, 2}, LaneForm{0xee, LaneOp::MaxSigned, 2},
+            LaneForm{0xe0, LaneOp::AverageUnsigned, 1}, LaneForm{0xe3, LaneOp::AverageUnsigned, 2},
+            LaneForm{0xd8, LaneOp::SubSaturateUnsigned, 1}, LaneForm{0xd9, LaneOp::SubSaturateUnsigned, 2},
+            LaneForm{0xdc, LaneOp::AddSaturateUnsigned, 1}, LaneForm{0xdd, LaneOp::AddSaturateUnsigned, 2},
+            LaneForm{0xe8, LaneOp::SubSaturateSigned, 1}, LaneForm{0xe9, LaneOp::SubSaturateSigned, 2},
+            LaneForm{0xec, LaneOp::AddSaturateSigned, 1}, LaneForm{0xed, LaneOp::AddSaturateSigned, 2},
+            LaneForm{0x63, LaneOp::PackSigned, 2}, LaneForm{0x6b, LaneOp::PackSigned, 4},
+            LaneForm{0x67, LaneOp::PackUnsigned, 2},
+        };
+        for (const auto& form : forms)
+            if (form.opcode == opcode)
+                return {VectorLanes{form.op, form.element, reg, operandAt(true)}};
+        struct ShiftForm { unsigned opcode; ShiftOp op; unsigned element; };
+        static constexpr std::array shifts{
+            ShiftForm{0xd1, ShiftOp::LogicalRight, 2}, ShiftForm{0xd2, ShiftOp::LogicalRight, 4},
+            ShiftForm{0xd3, ShiftOp::LogicalRight, 8}, ShiftForm{0xe1, ShiftOp::ArithmeticRight, 2},
+            ShiftForm{0xe2, ShiftOp::ArithmeticRight, 4}, ShiftForm{0xf1, ShiftOp::Left, 2},
+            ShiftForm{0xf2, ShiftOp::Left, 4}, ShiftForm{0xf3, ShiftOp::Left, 8},
+        };
+        for (const auto& form : shifts)
+            if (form.opcode == opcode)
+                return {VectorShiftLanes{form.op, form.element, reg, reg, 0, operandAt(true)}};
+    }
+    if ((prefix == 0 || prefix == 0x66) && (opcode == 0x51 || opcode == 0x58 || opcode == 0x59 ||
+        (opcode >= 0x5c && opcode <= 0x5f))) {
+        const auto op = opcode == 0x51 ? FloatLaneOp::Sqrt : opcode == 0x58 ? FloatLaneOp::Add :
+            opcode == 0x59 ? FloatLaneOp::Mul : opcode == 0x5c ? FloatLaneOp::Sub : opcode == 0x5d ? FloatLaneOp::Min :
+            opcode == 0x5e ? FloatLaneOp::Div : FloatLaneOp::Max;
+        return {VectorFloatLanes{op, prefix ? 8u : 4u, reg, operandAt(true)}};
+    }
+    if ((prefix == 0 || prefix == 0x66) && opcode == 0xc2) {
+        const auto operand = operandAt(true, 1);
+        constexpr std::array predicates{FloatLaneOp::Equal, FloatLaneOp::Less, FloatLaneOp::LessEqual,
+            FloatLaneOp::Unordered, FloatLaneOp::NotEqual, FloatLaneOp::NotLess, FloatLaneOp::NotLessEqual,
+            FloatLaneOp::Ordered};
+        return {VectorFloatLanes{predicates[reader.read(1) & 7], prefix ? 8u : 4u, reg, operand}};
+    }
+    if (opcode == 0x5a && (prefix == 0 || prefix == 0x66))
+        return {VectorConvert{prefix ? LaneConversion::DoubleToFloat : LaneConversion::FloatToDouble, reg,
+            operandAt(false), prefix ? 8u : 4u}};
+    if (opcode == 0x5b && (prefix == 0 || prefix == 0xf3))
+        return {VectorConvert{prefix ? LaneConversion::FloatToInt32Truncate : LaneConversion::Int32ToFloat, reg,
+            operandAt(true), 4}};
+    if (opcode == 0xe6 && prefix == 0x66)
+        return {VectorConvert{LaneConversion::DoubleToInt32Truncate, reg, operandAt(true), 8}};
+    if (prefix == 0x66 && (opcode == 0x10 || opcode == 0x11)) {
+        const auto operand = operandAt(false);
+        if (opcode == 0x11)
+            return {VectorMove{operand, reg}};
+        return {VectorMove{reg, operand}};
     }
     if (prefix == 0xf3 && opcode == 0xe6)
         return {VectorIntToDouble{reg, operandAt(false)}};
@@ -227,6 +415,10 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
     }
     if (prefix == 0xf3 && (opcode == 0xaa || opcode == 0xab))
         return {RepeatStore{opcode == 0xaa ? 1u : (rex & 8) ? 8u : 4u}};
+    if (prefix == 0xf3 && opcode == 0xc3)
+        return {.end = Return{StackTop{}}};
+    if (prefix == 0xf3 && (opcode == 0xa4 || opcode == 0xa5))
+        return {StringMove{opcode == 0xa4 ? 1u : (rex & 8) ? 8u : 4u, true}};
     if (prefix == 0x66 && opcode == 0x90 && !(rex & 1))
         return {};
     if (prefix == 0x66 && (rex & 8) && opcode == 0xe8) {
@@ -249,10 +441,22 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
         const auto extension = reader.read(1);
         if (prefix == 0xf3 && rex == 0 && extension == 0x1e && reader.read(1) == 0xfa)
             return {};
+        if (prefix == 0xf3 && (extension == 0xb8 || extension == 0xbc || extension == 0xbd)) {
+            const auto modrm = reader.read(1);
+            const unsigned mode = modrm >> 6;
+            const unsigned rm = modrm & 7;
+            const unsigned dst = unsigned((modrm >> 3) & 7) + (rex & 4) * 2;
+            const Value operand = mode == 3 ? Value(Register{rm + (rex & 1) * 8})
+                : Value(Memory{x64Address(reader, mode, rm, rex)});
+            return {BitScan{rex & 8 ? 8u : 4u, dst, operand, extension == 0xbd, false, extension != 0xb8,
+                extension == 0xb8}};
+        }
         if (prefix == 0x66 && extension == 0x1f) {
             skipMultiByteNop(reader, rex);
             return {};
         }
+        if (extension == 0x38 || extension == 0x3a)
+            return decodeXmmEscape(reader, prefix, extension, rex);
         return decodeXmm(reader, prefix, extension, rex);
     }
     if (prefix == 0x66 && !(rex & 8) && (opcode == 0x89 || opcode == 0x8b)) {
@@ -285,6 +489,55 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
             return {Move{2, rm + (rex & 1) * 8, Immediate{reader.read(2)}}};
         const auto address = x64Address(reader, mode, rm, rex, 2);
         return {Store{2, address, Immediate{reader.read(2)}}};
+    }
+    if ((prefix == 0x66 && opcode == 0xf3) || (prefix == 0xf3 && opcode == 0x66)) {
+        if (reader.read(1) == 0xab)
+            return {RepeatStore{2}};
+        unsupported();
+    }
+    if (prefix == 0x66 && !(rex & 8) && (opcode == 0xc1 || opcode == 0xd1 || opcode == 0xd3)) {
+        const auto modrm = reader.read(1);
+        const unsigned group = (modrm >> 3) & 7;
+        const unsigned target = unsigned(modrm & 7) + (rex & 1) * 8;
+        if (modrm >> 6 != 3 || group == 2 || group == 3 || group == 6)
+            unsupported();
+        const auto op = group == 0 ? ShiftOp::RotateLeft : group == 1 ? ShiftOp::RotateRight :
+            group == 4 ? ShiftOp::Left : group == 5 ? ShiftOp::LogicalRight : ShiftOp::ArithmeticRight;
+        // Widen the word into a temporary, shift it as 32 bits, and merge the low half back.
+        Instruction instruction{Extend{4, Temp, Register{target}, 16, 0, op == ShiftOp::ArithmeticRight}};
+        if (op == ShiftOp::RotateLeft || op == ShiftOp::RotateRight)
+            instruction.after.push_back(Binary{BinaryOp::Or, 4, Temp, Temp, Register{Temp}, false, ShiftOp::Left, 16});
+        if (opcode == 0xd3) {
+            instruction.after.push_back(ShiftRegister{op, 4, Temp, Register{Temp}, Register{1}});
+        } else {
+            const auto count = opcode == 0xd1 ? 1u : unsigned(reader.read(1)) & 31u;
+            if (count == 0)
+                return {};
+            instruction.after.push_back(Shift{op, 4, Register{Temp}, (op == ShiftOp::RotateLeft ||
+                op == ShiftOp::RotateRight) ? count % 16 : count});
+        }
+        instruction.after.push_back(Move{2, target, Register{Temp}});
+        return instruction;
+    }
+    if (prefix == 0x66 && !(rex & 8) && opcode == 0xf7) {
+        auto lookahead = reader;
+        const auto group = (lookahead.read(1) >> 3) & 7;
+        if (group == 2 || group == 3) {
+            const auto modrm = reader.read(1);
+            const unsigned mode = modrm >> 6;
+            const unsigned rm = modrm & 7;
+            const Value target = mode == 3 ? Value(Register{rm + (rex & 1) * 8}) :
+                Value(Memory{x64Address(reader, mode, rm, rex)});
+            if (group == 2)
+                return {MemoryBinary{BinaryOp::Xor, 2, target, Immediate{0xffff}, true, false, false}};
+            Instruction instruction{Move{8, Temp, Immediate{0}}};
+            instruction.after.push_back(MemoryBinary{BinaryOp::Sub, 2, Register{Temp}, target, true});
+            if (const auto* reg = std::get_if<Register>(&target))
+                instruction.after.push_back(Move{2, reg->index, Register{Temp}});
+            else
+                instruction.after.push_back(Store{2, std::get<Memory>(target).address, Register{Temp}});
+            return instruction;
+        }
     }
     if (prefix == 0x66 && !(rex & 8) && opcode == 0xff) {
         const auto modrm = reader.read(1);
@@ -348,13 +601,17 @@ Instruction decodeX64(Reader& reader) {
     if (opcode == 0x64)
         return decodeStackGuard(reader);
     if (opcode == 0x65 && !locked) {
-        const auto rex = reader.read(1);
-        const auto operation = reader.read(1);
+        // Only absolute GS loads appear in compiled Windows code: mov reg, gs:[disp32].
+        auto operation = reader.read(1);
+        unsigned rex = 0;
+        if (operation >= 0x40 && operation <= 0x4f) {
+            rex = operation & 15;
+            operation = reader.read(1);
+        }
         const auto destination = reader.read(1);
-        if ((rex & 0xfb) == 0x48 && operation == 0x8b && (destination & 0xc7) == 4 &&
-            reader.read(1) == 0x25 && reader.read(4) == 0x58) {
+        if (operation == 0x8b && (destination & 0xc7) == 4 && reader.read(1) == 0x25) {
             const auto reg = unsigned((destination >> 3) & 7) + unsigned(rex & 4) * 2;
-            return {Move{8, reg, ThreadLocalStorage{}}};
+            return {Move{rex & 8 ? 8u : 4u, reg, ThreadLocalStorage{signExtend(reader.read(4), 32)}}};
         }
         unsupported();
     }
@@ -398,6 +655,14 @@ Instruction decodeX64(Reader& reader) {
     }
     if (opcode >= 0x50 && opcode <= 0x57)
         return {Push{Register{unsigned(opcode & 7) + (rex & 1) * 8}}};
+    if (opcode == 0x6a)
+        return {Push{immediate(signExtend(reader.read(1), 8))}};
+    if (opcode == 0x68)
+        return {Push{immediate(signExtend(reader.read(4), 32))}};
+    if (opcode == 0xa4 || opcode == 0xa5)
+        return {StringMove{opcode == 0xa4 ? 1u : size, false}};
+    if (opcode == 0xcc || opcode == 0xf4)
+        return {.end = Trap{std::format("guest trap instruction at guest offset {}", reader.pc - 1)}};
     if (opcode >= 0x58 && opcode <= 0x5f)
         return {Move{8, unsigned(opcode & 7) + (rex & 1) * 8, StackTop{}}};
 
@@ -418,15 +683,21 @@ Instruction decodeX64(Reader& reader) {
         case 0x99:
             return {Bitfield{size, 2, Register{0}, size * 8 - 1, 1, 0, true}};
         case 0xc9:
-            return {.effect = Move{8, 4, Register{5}}, .after = Move{8, 5, StackTop{}}};
-        case 0xd9: {
-            const auto modrm = reader.read(1);
-            const auto mode = unsigned(modrm >> 6);
+            return {.effect = Move{8, 4, Register{5}}, .after = {Move{8, 5, StackTop{}}}};
+        case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf: {
+            const auto modrm = unsigned(reader.read(1));
+            const auto mode = modrm >> 6;
             const auto group = (modrm >> 3) & 7;
-            if (mode == 3 || (group != 5 && group != 7))
+            if (mode == 3)
+                return {X87{unsigned(opcode), modrm, std::nullopt}};
+            if (opcode == 0xd9 && (group == 5 || group == 7))
+                return {FloatingControl{x64Address(reader, mode, modrm & 7, rex), 2, group == 5}};
+            if ((opcode == 0xd9 && (group == 4 || group == 6)) || (opcode == 0xdd && (group == 4 || group == 6)))
                 unsupported();
-            return {FloatingControl{x64Address(reader, mode, modrm & 7, rex), 2, group == 5}};
+            return {X87{unsigned(opcode), modrm & 0x38, x64Address(reader, mode, modrm & 7, rex)}};
         }
+        case 0x9b:
+            return {};
         case 0xe8:
         case 0xe9:
         case 0xeb: {
@@ -450,8 +721,40 @@ Instruction decodeX64(Reader& reader) {
                     Value(Memory{x64Address(reader, mode, rm, rex)});
                 return {Exchange{size, target, Register{source}, true}};
             }
+            if (extension == 0xb1) {
+                const auto modrm = reader.read(1);
+                const unsigned mode = modrm >> 6;
+                if (mode == 3)
+                    unsupported();
+                const unsigned source = unsigned((modrm >> 3) & 7) + (rex & 4) * 2;
+                return {CompareExchange{size, x64Address(reader, mode, modrm & 7, rex), Register{source}}};
+            }
             if (locked)
                 unsupported();
+            if (extension == 0x0b)
+                return {.end = Trap{std::format("guest trap instruction at guest offset {}", reader.pc - 2)}};
+            if (extension == 0xa5 || extension == 0xad) {
+                const auto modrm = reader.read(1);
+                if (modrm >> 6 != 3)
+                    unsupported();
+                const unsigned target = unsigned(modrm & 7) + (rex & 1) * 8;
+                const unsigned source = unsigned((modrm >> 3) & 7) + (rex & 4) * 2;
+                return {DoubleShift{size, target, Register{source}, extension == 0xa5}};
+            }
+            if (extension == 0xa4 || extension == 0xac) {
+                const auto modrm = reader.read(1);
+                if (modrm >> 6 != 3)
+                    unsupported();
+                const unsigned target = unsigned(modrm & 7) + (rex & 1) * 8;
+                const unsigned source = unsigned((modrm >> 3) & 7) + (rex & 4) * 2;
+                const auto count = unsigned(reader.read(1)) & (size == 8 ? 63u : 31u);
+                if (count == 0)
+                    return {};
+                // SHLD shifts the destination left and fills from the source; SHRD is the mirror image.
+                if (extension == 0xa4)
+                    return {Extract{size, target, Register{target}, Register{source}, size * 8 - count}};
+                return {Extract{size, target, Register{source}, Register{target}, count}};
+            }
             if (extension >= 0xc8 && extension <= 0xcf) {
                 const auto target = unsigned(extension & 7) + (rex & 1) * 8;
                 return {ByteSwap{size, target, Register{target}}};
@@ -528,9 +831,9 @@ Instruction decodeX64(Reader& reader) {
                     extension == 0xb3 ? BitAction::Reset : BitAction::Toggle;
                 return {BitTest{size, Register{rm + (rex & 1) * 8}, Register{group + (rex & 4) * 2}, action}};
             }
-            if ((extension >= 0x10 && extension <= 0x13) || extension == 0x16 || extension == 0x17 ||
-                extension == 0x28 || extension == 0x29 ||
-                extension == 0x2e || extension == 0x2f || extension == 0x50 || (extension >= 0x54 && extension <= 0x57))
+            if ((extension >= 0x10 && extension <= 0x17) || extension == 0x28 || extension == 0x29 ||
+                extension == 0x2e || extension == 0x2f || extension == 0x50 || extension == 0x51 ||
+                (extension >= 0x54 && extension <= 0x5f) || extension == 0xc2 || extension == 0xc6)
                 return decodeXmm(reader, 0, extension, rex);
             if (extension < 0x80 || extension > 0x8f)
                 unsupported();
@@ -623,6 +926,11 @@ Instruction decodeX64(Reader& reader) {
         const Value target = mode == 3 ? Value(Register{dst}) : Value(Memory{x64Address(reader, mode, rm, rex)});
         return {Exchange{size, target, Register{src}}};
     }
+    if (opcode == 0xf6 && group == 2) {
+        const auto [target, field] = byteRegister(dst, rexPresent);
+        const Value operand = mode == 3 ? Value(target) : Value(Memory{x64Address(reader, mode, rm, rex)});
+        return {ByteBinary{BinaryOp::Xor, operand, field, Immediate{255}, 0, true, false, false, false}};
+    }
     if (opcode == 0xf6 && group == 3) {
         const auto [target, field] = byteRegister(dst, rexPresent);
         const Value operand = mode == 3 ? Value(target) : Value(Memory{x64Address(reader, mode, rm, rex)});
@@ -643,10 +951,10 @@ Instruction decodeX64(Reader& reader) {
                                     : Value(Memory{x64Address(reader, mode, rm, rex, bytes)});
         return {Multiply{size, src, lhs, immediate(signExtend(reader.read(bytes), 8 * bytes))}};
     }
-    if (opcode == 0xf7 && group == 6) {
+    if (opcode == 0xf7 && (group == 6 || group == 7)) {
         const Value divisor = mode == 3 ? Value(Register{dst})
                                         : Value(Memory{x64Address(reader, mode, rm, rex)});
-        return {Divide{size, divisor}};
+        return {Divide{size, divisor, group == 7}};
     }
     if (opcode == 0xf7 && (group == 4 || group == 5)) {
         const Value operand = mode == 3 ? Value(Register{dst})
@@ -667,6 +975,30 @@ Instruction decodeX64(Reader& reader) {
         if (group == 2)
             return {.end = Call{value, reader.pc}};
         return {.end = Jump{value}};
+    }
+    if (opcode == 0xff && group == 6) {
+        const Value value = mode == 3 ? Value(Register{dst}) : Value(Memory{x64Address(reader, mode, rm, rex)});
+        return {Push{value}};
+    }
+    if (opcode == 0xf7 && group == 3 && mode != 3) {
+        const auto at = x64Address(reader, mode, rm, rex);
+        return {Move{size, Temp, Memory{at}}, {}, {}, 0,
+            {Binary{BinaryOp::Sub, size, Temp, Zero, Register{Temp}, true}, Store{size, at, Register{Temp}}}};
+    }
+    if ((opcode == 0xc1 || opcode == 0xd1 || opcode == 0xd3) && mode != 3 &&
+        (group <= 1 || group == 4 || group == 5 || group == 7)) {
+        // Shift memory through a temporary: load, shift, and store back.
+        const auto at = x64Address(reader, mode, rm, rex, opcode == 0xc1 ? 1 : 0);
+        const auto op = group == 0 ? ShiftOp::RotateLeft : group == 1 ? ShiftOp::RotateRight :
+            group == 4 ? ShiftOp::Left : group == 5 ? ShiftOp::LogicalRight : ShiftOp::ArithmeticRight;
+        if (opcode == 0xd3)
+            return {Move{size, Temp, Memory{at}}, {}, {}, 0,
+                {ShiftRegister{op, size, Temp, Register{Temp}, Register{1}, true}, Store{size, at, Register{Temp}}}};
+        const auto count = opcode == 0xd1 ? 1u : unsigned(reader.read(1)) & (size == 8 ? 63u : 31u);
+        if (count == 0)
+            return {};
+        return {Move{size, Temp, Memory{at}}, {}, {}, 0,
+            {Shift{op, size, Register{Temp}, count}, Store{size, at, Register{Temp}}}};
     }
     if (opcode == 0x80 && x64Operations[group]) {
         const auto [target, field] = byteRegister(dst, rexPresent);

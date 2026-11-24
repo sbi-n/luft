@@ -80,7 +80,7 @@ std::uint64_t exportedAddress(Bytes image, Bytes directory, std::uint64_t start,
 }
 
 std::string binary::recompilePe(Architecture architecture, binary::Bytes file, std::span<const GuestExport> exports,
-    std::span<const GuestExport> initializers, std::span<const PeInitRange> ranges) {
+    std::span<const GuestExport> initializers, std::span<const PeInitRange> ranges, const ProgramOptions& program) {
     using namespace binary;
     if (read(file, 0, 2) != 0x5a4d)
         throw std::runtime_error("expected a PE image");
@@ -94,6 +94,10 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
     const auto base = read(opt, 24, 8);
     const auto sections = slice(file, header + 24 + opt.size(), read(file, header + 6, 2) * 40);
     Image image;
+    // Windows maps the headers at the image base; runtimes inspect them through __ImageBase.
+    const auto headerSize = std::min<std::uint64_t>(read(opt, 60, 4), file.size());
+    if (headerSize)
+        image.add(0, headerSize, file.first(headerSize), true, false, false);
     for (std::size_t i = 0; i < sections.size(); i += 40) {
         const auto section = sections.subspan(i, 40);
         const auto start = read(section, 12, 4);
@@ -142,6 +146,8 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
         bindings.push_back({*tlsVector, storage, false});
     }
     const auto resolve = [&](const GuestExport& entry) {
+        if (entry.symbol == EntrySymbol)
+            return std::size_t(read(opt, 16, 4));
         const auto address = entry.symbol.empty() ? entry.offset :
             exportedAddress(image.bytes, directory(0), directoryRva(0), entry.symbol);
         return relative(address);
@@ -173,6 +179,65 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
                 addInitializer(relative(target));
         }
     }
+    // The thread environment block answers GS-relative loads: its stack bounds match the runtime stack
+    // that follows the image, and the process environment block reports the default process heap.
+    constexpr std::size_t ThreadBlockSize = 0x100, ProcessBlockSize = 0x100, ParametersSize = 0x400;
+    const auto threadBlock = (image.bytes.size() + 15) & ~std::size_t(15);
+    image.add(threadBlock, ThreadBlockSize + ProcessBlockSize + ParametersSize, {}, true, true, false);
+    const auto processBlock = threadBlock + ThreadBlockSize;
+    image.relocate(processBlock + 0x20, processBlock + ProcessBlockSize);
+    const auto stackLimit = (image.bytes.size() + 15) & ~std::size_t(15);
+    image.relocate(threadBlock + 0x08, stackLimit + MappedStackSize);
+    image.relocate(threadBlock + 0x10, stackLimit);
+    image.relocate(threadBlock + 0x30, threadBlock);
+    image.relocate(threadBlock + 0x40, 0x1000);
+    image.relocate(threadBlock + 0x48, 0x1004);
+    if (tlsVector)
+        image.relocate(threadBlock + 0x58, *tlsVector);
+    image.relocate(threadBlock + 0x60, processBlock);
+    image.relocate(processBlock + 0x30, 0xffeeffe0);
+    auto options = program;
+    options.threadBlock = threadBlock;
+
+    // The DLL C runtime exports some variables. Code reaches them through import slots, so each gets
+    // synthetic storage. The standard FILE array backs __iob_func and _iob.
+    constexpr std::size_t RuntimeFileSize = 48;
+    const auto runtimeLibrary = [](std::string_view library) {
+        std::string lower(library);
+        for (auto& ch : lower)
+            if (ch >= 'A' && ch <= 'Z')
+                ch += 'a' - 'A';
+        return lower.starts_with("msvcrt") || lower.starts_with("ucrtbase") || lower.starts_with("api-ms-win-crt-");
+    };
+    const auto usesStreams = std::ranges::any_of(imports, [&](const GuestImport& import) {
+        return runtimeLibrary(import.library) && (import.name == "__iob_func" || import.name == "__acrt_iob_func" ||
+            import.name == "_iob");
+    });
+    if (usesStreams) {
+        const auto files = (image.bytes.size() + 15) & ~std::size_t(15);
+        image.add(files, 3 * RuntimeFileSize, {}, true, true, false);
+        for (unsigned i = 0; i < 3; ++i)
+            options.streams[i] = files + i * RuntimeFileSize;
+    }
+    std::erase_if(imports, [&](const GuestImport& import) {
+        static constexpr std::array<std::string_view, 12> variables{"_fmode", "_commode", "__initenv", "_environ",
+            "__argc", "__argv", "_iob", "__mb_cur_max", "_acmdln", "__winitenv", "_wcmdln", "_pgmptr"};
+        if (!runtimeLibrary(import.library) || std::ranges::find(variables, import.name) == variables.end())
+            return false;
+        std::size_t storage = 0;
+        if (import.name == "_iob") {
+            storage = options.streams[0];
+        } else {
+            storage = (image.bytes.size() + 15) & ~std::size_t(15);
+            image.add(storage, 16, {}, true, true, false);
+            if (import.name == "__mb_cur_max")
+                image.bytes[storage] = 1;
+        }
+        image.relocate(import.start, storage);
+        bindings.push_back({import.start, storage, false});
+        return true;
+    });
+
     std::vector<GuestObject> objects;
     // Stripped PE images lack data symbol sizes. Materialize a writable section once it is referenced.
     for (const auto& section : image.regions)
@@ -181,5 +246,5 @@ std::string binary::recompilePe(Architecture architecture, binary::Bytes file, s
     if (tlsVector)
         objects.push_back({*tlsVector, 8});
     return recompileMapped(architecture, image.bytes, mapped, image.regions, imports, objects, init,
-        CallingConvention::Microsoft, bindings, functionPointers, tlsVector);
+        CallingConvention::Microsoft, bindings, functionPointers, tlsVector, options);
 }

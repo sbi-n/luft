@@ -38,4 +38,4 @@ add_executable(Luft
     src/lift/arm64.cpp
 )
 target_include_directories(Luft PRIVATE src)
-target_link_libraries(Luft PRIVATE Luft.Target.Luau Luau.Compiler Luau.VM)
+target_link_libraries(Luft PRIVATE Luft.Target.Luau Luft.IR Luau.Compiler Luau.VM)

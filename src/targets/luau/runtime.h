@@ -16,6 +16,9 @@ struct RuntimeFeatures {
     bool prime = false;
     bool structured = false;
     bool decimal = false;
+    bool vector = false;
+    bool process = false;
+    bool x87 = false;
 };
 
 struct Data {
@@ -24,7 +27,8 @@ struct Data {
     std::span<const GuestImport> imports;
     std::span<const ir::CodeRange> code;
     std::span<const GuestObject> objects;
-    std::map<std::size_t, std::pair<std::uint8_t, unsigned>> emitted;
+    // Materialized byte ranges, start to end, kept disjoint and merged.
+    std::map<std::size_t, std::size_t> emitted;
 
     const GuestImport* unresolved(std::uint64_t at, unsigned size) const;
     bool writable(std::uint64_t at, unsigned size) const;
@@ -34,6 +38,9 @@ struct Data {
     bool materializeObject(std::uint64_t at);
     void materializeIndexed(std::uint64_t at);
     void materializeAddress(std::uint64_t at);
+    // Every readable data region except unresolved import slots.
+    void materializeAll();
+    bool materialized(std::uint64_t at) const;
     std::string source() const;
 };
 
