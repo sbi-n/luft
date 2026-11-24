@@ -94,6 +94,17 @@ end
 local function runGuestRoutine(action: GuestRoutine, expectedReturn: number, frameStack: number?): any
     local nextAction: any = action
     while true do
+        local yield = process.yield
+        if yield then
+            process.yieldSteps += 1
+            if process.yieldSteps >= 1024 then
+                process.yieldSteps = 0
+                if os.clock() - process.yieldAt >= process.yieldInterval then
+                    yield()
+                    process.yieldAt = os.clock()
+                end
+            end
+        end
         local result = nextAction(expectedReturn)
         if result == nil then
             return nil
@@ -1338,113 +1349,107 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     local heapLimit = if mapped then 67108864 else 16777216
     local stackBottom = math.ceil(imageSize / 16) * 16
     local stackTop = stackBottom + stackSize
-    local stackData: buffer? = nil
-    local stackInUse = false
-    local contents: {buffer?} = {}
-    -- Heap blocks get 16-byte-rounded storage: word-at-a-time string routines read past the requested size.
-    local heap: {[number]: buffer} = {}
+    local heapStart = stackTop + 16
+    -- Guest memory is one buffer from the lowest image address up: the image, the stack, then the heap, so an
+    -- access only subtracts the base. The heap part grows by copying into a larger buffer.
+    local memoryBase = if #data > 0 then math.min(data[1].first, stackBottom) else stackBottom
+    local memoryEnd = heapStart + (if heapEnabled then math.min(heapLimit, 1048576) else 0)
+    local memory = buffer.create(memoryEnd - memoryBase)
+    for _, range in data do
+        buffer.writestring(memory, range.first - memoryBase, range.bytes)
+    end
+    -- Translations without mapped images embed only the data they reference: reading elsewhere is a bug.
+    local strictImage = not mapped
+    -- Heap blocks are 16-byte rounded (word-at-a-time string routines read past the requested size), and
+    -- freed blocks are reused by later allocations of the same rounded length.
     local heapSizes: {[number]: number} = {}
-    local heapStarts: {number} = {}
-    local heapPages: {number} = {}
+    local heapLengths: {[number]: number} = {}
+    local freeBlocks: {[number]: {number}} = {}
+    local nextAllocation = heapStart
     local criticalSections: {[number]: number} = {}
     local pthreadLocks: {[number]: boolean} = {}
     local srwLocks: {[number]: number} = {}
     local pageProtection: {[number]: number} = {}
-    local heapStart = stackTop + 16
-    local nextAllocation = heapStart
-    local lastHeapStart = 0
     local classicLocale = 0
     local useGlobalLocale = true
     -- Guest memory belongs to the module: data, heap, and locks persist across export calls.
     local function reset(stack: boolean)
-        if stack and not stackData then
-            stackData = buffer.create(stackSize)
-        end
-        stackInUse = stackInUse or stack
     end
-    local function locate(at: number, size: number, write: boolean): (buffer, number)
-        local limit = at + size
-        local stack = stackData
-        if stackInUse and stack and at >= stackBottom and limit <= stackTop then
-            return stack, at - stackBottom
-        end
-        if heapEnabled and at >= heapStart then
-            -- Look up the live buffer so freeing or resizing also affects cached addresses.
-            local bytes = heap[lastHeapStart]
-            if bytes and at >= lastHeapStart and limit <= lastHeapStart + buffer.len(bytes) then
-                return bytes, at - lastHeapStart
-            end
-            local page = math.floor((at - heapStart) / 256) + 1
-            local first = heapPages[page]
-            if first and at < nextAllocation then
-                local last = heapPages[page + 1] or #heapStarts
-                while first < last do
-                    local index = math.floor((first + last + 1) / 2)
-                    if heapStarts[index] <= at then first = index else last = index - 1 end
-                end
-                local start = heapStarts[last]
-                local bytes = heap[start]
-                if bytes and limit <= start + buffer.len(bytes) then
-                    lastHeapStart = start
-                    return bytes, at - start
-                end
-            end
-        else
-            local first, last = 1, #data
-            while first <= last do
-                local index = math.floor((first + last) / 2)
-                local range = data[index]
-                if at < range.first then
-                    last = index - 1
-                elseif at >= range.last then
-                    first = index + 1
-                elseif limit <= range.last then
-                    if write then
-                        if range.mode == 0 then error("write to read-only guest image", 0) end
-                        if range.mode >= 2 then
-                            for page = math.floor(at / 4096), math.floor((limit - 1) / 4096) do
-                                if (pageProtection[page] or (if range.mode == 3 then 4 else 2)) ~= 4 then
-                                    error("write to protected guest page", 0)
-                                end
+    -- Where the native program would take a segmentation fault (null or wild pointers, stack overflow).
+    local function fault(at: number): never
+        error(string.format("guest accessed unmapped memory at 0x%x", at), 0)
+    end
+    -- Checks an access below the stack against the image's ranges and their write protection.
+    local function checkImage(at: number, limit: number, write: boolean)
+        local first, last = 1, #data
+        while first <= last do
+            local index = math.floor((first + last) / 2)
+            local range = data[index]
+            if at < range.first then
+                last = index - 1
+            elseif at >= range.last then
+                first = index + 1
+            elseif limit <= range.last then
+                if write then
+                    if range.mode == 0 then error("write to read-only guest image", 0) end
+                    if range.mode >= 2 then
+                        for page = math.floor(at / 4096), math.floor((limit - 1) / 4096) do
+                            if (pageProtection[page] or (if range.mode == 3 then 4 else 2)) ~= 4 then
+                                error("write to protected guest page", 0)
                             end
                         end
                     end
-                    local bytes = contents[index]
-                    if bytes then
-                        return bytes, at - range.first
-                    end
-                    local initialized = buffer.create(range.last - range.first)
-                    buffer.writestring(initialized, 0, range.bytes)
-                    contents[index] = initialized
-                    return initialized, at - range.first
-                else
-                    break
                 end
+                return
+            else
+                break
             end
+        end
+        if not strictImage then
+            fault(at)
         end
         error("guest memory range was not resolved during translation: " .. at, 0)
     end
+    local function locate(at: number, size: number, write: boolean): (buffer, number)
+        if at < stackBottom then
+            if write or strictImage or at < memoryBase then checkImage(at, at + size, write) end
+        elseif at + size > memoryEnd then
+            fault(at)
+        end
+        return memory, at - memoryBase
+    end
     local function read(size: number, at: number): (number, number)
-        local bytes, index = locate(at, size, false)
-        if size == 1 then
-            return buffer.readu8(bytes, index), 0
+        if at < stackBottom then
+            if strictImage or at < memoryBase then checkImage(at, at + size, false) end
+        elseif at + size > memoryEnd then
+            fault(at)
         end
-        if size == 2 then
-            return buffer.readu16(bytes, index), 0
+        local index = at - memoryBase
+        if size == 8 then
+            return buffer.readu32(memory, index), buffer.readu32(memory, index + 4)
+        elseif size == 4 then
+            return buffer.readu32(memory, index), 0
+        elseif size == 1 then
+            return buffer.readu8(memory, index), 0
         end
-        return buffer.readu32(bytes, index), if size == 8 then buffer.readu32(bytes, index + 4) else 0
+        return buffer.readu16(memory, index), 0
     end
     local function write(size: number, at: number, lo: number, hi: number)
-        local bytes, index = locate(at, size, true)
-        if size == 1 then
-            buffer.writeu8(bytes, index, bit32.band(lo, 255))
-        elseif size == 2 then
-            buffer.writeu16(bytes, index, bit32.band(lo, 65535))
+        if at < stackBottom then
+            checkImage(at, at + size, true)
+        elseif at + size > memoryEnd then
+            fault(at)
+        end
+        local index = at - memoryBase
+        if size == 8 then
+            buffer.writeu32(memory, index, lo)
+            buffer.writeu32(memory, index + 4, hi)
+        elseif size == 4 then
+            buffer.writeu32(memory, index, lo)
+        elseif size == 1 then
+            buffer.writeu8(memory, index, bit32.band(lo, 255))
         else
-            buffer.writeu32(bytes, index, lo)
-            if size == 8 then
-                buffer.writeu32(bytes, index + 4, hi)
-            end
+            buffer.writeu16(memory, index, bit32.band(lo, 65535))
         end
     end
     local function readString(at: number, count: number): string
@@ -1475,45 +1480,65 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         buffer.writeu32(bytes, index + 8, c)
         buffer.writeu32(bytes, index + 12, d)
     end
+    local function release(at: number)
+        local length = heapLengths[at]
+        heapLengths[at] = nil
+        heapSizes[at] = nil
+        local list = freeBlocks[length]
+        if list then
+            table.insert(list, at)
+        else
+            freeBlocks[length] = {at}
+        end
+    end
     local function resize(lo: number, hi: number, size: number, sizeHi: number): (number, number)
         local at = address(lo, hi)
-        local previous = heap[at]
-        if at ~= 0 and previous == nil then
+        local length = heapLengths[at]
+        if at ~= 0 and length == nil then
             error("invalid guest allocation pointer", 0)
         end
         if sizeHi ~= 0 then
             return 0, 0
         end
         if size == 0 then
-            heap[at] = nil
-            heapSizes[at] = nil
+            if length then release(at) end
             return 0, 0
         end
-        if previous and size <= buffer.len(previous) and size * 2 > buffer.len(previous) then
+        if length and size <= length and size * 2 > length then
             -- Shrinking or growing within the rounded block keeps the allocation.
-            if size > heapSizes[at] then buffer.fill(previous, heapSizes[at], 0, size - heapSizes[at]) end
+            local used = heapSizes[at]
+            if size > used then buffer.fill(memory, at - memoryBase + used, 0, size - used) end
             heapSizes[at] = size
             return at, 0
         end
-        local length = math.ceil(size / 16) * 16
-        if nextAllocation + length - heapStart > heapLimit then
-            return 0, 0
+        local needed = math.ceil(size / 16) * 16
+        local start
+        local list = freeBlocks[needed]
+        if list and #list > 0 then
+            start = table.remove(list) :: number
+            buffer.fill(memory, start - memoryBase, 0, needed)
+        else
+            if nextAllocation + needed - heapStart > heapLimit then
+                return 0, 0
+            end
+            start = nextAllocation
+            nextAllocation += needed
+            if nextAllocation > memoryEnd then
+                local capacity = math.max(memoryEnd - heapStart, 65536)
+                while heapStart + capacity < nextAllocation do
+                    capacity *= 2
+                end
+                local larger = buffer.create(heapStart + math.min(capacity, heapLimit) - memoryBase)
+                buffer.copy(larger, 0, memory, 0, start - memoryBase)
+                memory = larger
+                memoryEnd = heapStart + math.min(capacity, heapLimit)
+            end
         end
-        local bytes = buffer.create(length)
-        if previous then
-            buffer.copy(bytes, 0, previous, 0, math.min(size, heapSizes[at]))
-            heap[at] = nil
-            heapSizes[at] = nil
-        end
-        local start = nextAllocation
-        heap[start] = bytes
         heapSizes[start] = size
-        local index = #heapStarts + 1
-        heapStarts[index] = start
-        nextAllocation += length
-        -- Record the first allocation covering each page, including its alignment padding.
-        for page = math.floor((start - heapStart) / 256) + 1, math.ceil((nextAllocation - heapStart) / 256) do
-            heapPages[page] = heapPages[page] or index
+        heapLengths[start] = needed
+        if length then
+            buffer.copy(memory, start - memoryBase, memory, at - memoryBase, math.min(size, heapSizes[at]))
+            release(at)
         end
         return start, 0
     end
@@ -1535,14 +1560,14 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     local function cLocale(): (number, number)
         if classicLocale ~= 0 then return classicLocale, 0 end
         local base = allocateCpp(4074, 0, true)
-        local bytes = heap[base]
-        local classes, lower, upper = 232, 1000, 2536
-        buffer.writeu32(bytes, 104, base + classes + 128 * 2)
-        buffer.writeu32(bytes, 112, base + lower + 128 * 4)
-        buffer.writeu32(bytes, 120, base + upper + 128 * 4)
-        buffer.writeu8(bytes, 4072, 67)
+        local bytes, at = locate(base, 4074, true)
+        local classes, lower, upper = at + 232, at + 1000, at + 2536
+        buffer.writeu32(bytes, at + 104, base + 232 + 128 * 2)
+        buffer.writeu32(bytes, at + 112, base + 1000 + 128 * 4)
+        buffer.writeu32(bytes, at + 120, base + 2536 + 128 * 4)
+        buffer.writeu8(bytes, at + 4072, 67)
         for category = 0, 12 do
-            buffer.writeu32(bytes, 128 + category * 8, base + 4072)
+            buffer.writeu32(bytes, at + 128 + category * 8, base + 4072)
         end
         for ch = -128, 255 do
             local n = ch % 256
@@ -1604,11 +1629,10 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         if handle ~= 0xffeeffe0 or handleHi ~= 0 then
             error("invalid Windows process heap handle", 0)
         end
-        local previous = if pointerHi == 0 then heap[pointer] else nil
+        local previous = if pointerHi == 0 then heapLengths[pointer] else nil
         if op == "HeapFree" then
             if not previous then return 0, 0 end
-            heap[pointer] = nil
-            heapSizes[pointer] = nil
+            release(pointer)
             return 1, 0
         elseif op == "HeapSize" then
             if previous then return heapSizes[pointer], 0 end
@@ -1620,8 +1644,9 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         elseif previous and size and sizeHi == 0 then
             if bit32.band(flags, 16) == 0 then
                 result = resize(pointer, 0, math.max(size, 1), 0)
-            elseif size <= buffer.len(previous) then
-                if size > heapSizes[pointer] then buffer.fill(previous, heapSizes[pointer], 0, size - heapSizes[pointer]) end
+            elseif size <= previous then
+                local used = heapSizes[pointer]
+                if size > used then buffer.fill(memory, pointer - memoryBase + used, 0, size - used) end
                 heapSizes[pointer] = math.max(size, 1)
                 result = pointer
             end
@@ -3931,9 +3956,13 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
         "    end\n"
         "    return \"recent guest blocks: \" .. table.concat(parts, \" \")\n"
         "end\n";
+    // A program's `yield` option runs about every `yieldInterval` seconds of guest execution, between routines;
+    // it may yield the calling coroutine so that a host such as a game keeps running meanwhile. The state lives in
+    // `process`: modules with many exports are close to Luau's limit of 200 locals per function.
     source += "\nlocal process = {initialized = false, exitCallbacks = {} :: {() -> ()}, "
         "fiberSlots = {} :: {[number]: {lo: number, hi: number, callbackLo: number, callbackHi: number}?}, "
-        "fiberNext = 0, lastError = 0, exceptionFilterLo = 0, exceptionFilterHi = 0}\n";
+        "fiberNext = 0, lastError = 0, exceptionFilterLo = 0, exceptionFilterHi = 0, "
+        "yield = nil :: (() -> ())?, yieldInterval = 0.05, yieldAt = 0, yieldSteps = 0}\n";
     if (features.structured)
         source += RoutineOperators;
     if (features.stackGuard)

@@ -12,6 +12,10 @@ export type RunOptions = {
     files: {[string]: string}?,
     stdout: ((string) -> ())?,
     stderr: ((string) -> ())?,
+    -- Runs about every `yieldInterval` seconds (0.05 by default) while the program runs, for example to yield
+    -- with task.wait so the host stays responsive. An error it raises stops the program and comes out of run.
+    yield: (() -> ())?,
+    yieldInterval: number?,
 }
 export type RunResult = {exitCode: number, stdout: string, stderr: string, files: {[string]: string}}
 )luau";
@@ -53,6 +57,9 @@ local function run(options: RunOptions?): RunResult
     host.output = {{{{}}, {{}}}}
     host.writers = {{settings.stdout, settings.stderr}}
     host.files = table.clone(settings.files or {{}})
+    process.yield = settings.yield
+    process.yieldInterval = settings.yieldInterval or 0.05
+    process.yieldAt = os.clock()
     local ok, failure = pcall(entry_{})
     local code = 0
     if not ok then
