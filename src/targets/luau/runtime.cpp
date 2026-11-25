@@ -2,9 +2,20 @@
 
 #include <algorithm>
 #include <format>
+#include <initializer_list>
+#include <span>
 
 namespace luau {
 namespace {
+// MSVC rejects a string literal longer than 16380 bytes (C2026), so each Luau source below is an array of raw
+// literals that concatenate to it. Split one that grows too long at a line break.
+constexpr std::size_t LiteralLimit = 16380;
+
+void appendChunks(std::string& out, std::span<const std::string_view> chunks) {
+    for (const auto chunk : chunks)
+        out += chunk;
+}
+
 void appendQuoted(std::string& out, std::span<const std::uint8_t> bytes) {
     constexpr std::string_view hex = "0123456789abcdef";
     out += '"';
@@ -20,7 +31,7 @@ void appendQuoted(std::string& out, std::span<const std::uint8_t> bytes) {
     out += '"';
 }
 
-constexpr std::string_view ArgumentReader = R"(
+constexpr std::string_view ArgumentReader[] = {R"(
 local function readArguments(maximum: number, ...: Word): {Word}
     local count = select("#", ...)
     if count > maximum then
@@ -42,9 +53,9 @@ local function readArguments(maximum: number, ...: Word): {Word}
     end
     return args
 end
-)";
+)"};
 
-constexpr std::string_view FlagOperators = R"(
+constexpr std::string_view FlagOperators[] = {R"(
 local function evenParity(value: number): boolean
     return bit32.extract(0x9669, bit32.band(bit32.bxor(value, bit32.rshift(value, 4)), 15)) == 1
 end
@@ -69,9 +80,9 @@ local function addFlags(subtract: boolean, arm: boolean, size: number,
     local carry = if subtract then (total < 0) ~= arm else total >= 4294967296
     return lo, hi, carry, (a ~= b) == subtract and negative ~= a, negative, lo == 0 and hi == 0
 end
-)";
+)"};
 
-constexpr std::string_view RoutineOperators = R"(
+constexpr std::string_view RoutineOperators[] = {R"(
 -- A routine returns nil when its guest function returns, or the next routine to run. When control leaves
 -- for a frame other than the caller's, as exception unwinders and longjmp-like code do, it returns the
 -- address that frame resumes at and sets unwindStack to the stack pointer there. The calls in between
@@ -126,9 +137,9 @@ local function runGuestRoutine(action: GuestRoutine, expectedReturn: number, fra
         nextAction = result
     end
 end
-)";
+)"};
 
-constexpr std::string_view ShiftOperators = R"(
+constexpr std::string_view ShiftOperators[] = {R"(
 local function reverseBits(word: number): number
     word = bit32.bor(bit32.lshift(bit32.band(word, 0x55555555), 1), bit32.band(bit32.rshift(word, 1), 0x55555555))
     word = bit32.bor(bit32.lshift(bit32.band(word, 0x33333333), 2), bit32.band(bit32.rshift(word, 2), 0x33333333))
@@ -250,9 +261,9 @@ local function sumBytes(value: number): number
     return bit32.extract(value, 0, 8) + bit32.extract(value, 8, 8)
         + bit32.extract(value, 16, 8) + bit32.extract(value, 24, 8)
 end
-)";
+)"};
 
-constexpr std::string_view FloatingOperators = R"(
+constexpr std::string_view FloatingOperators[] = {R"(
 local floatScratch = buffer.create(8)
 local function decodeFloat(size: number, lo: number, hi: number): number
     buffer.writeu32(floatScratch, 0, lo)
@@ -324,10 +335,10 @@ local function truncateFloat(size: number, arm: boolean, signed: boolean, value:
     local n = if value < 0 then math.ceil(value) else math.floor(value)
     return n % 4294967296, if size == 8 then math.floor(n / 4294967296) % 4294967296 else 0
 end
-)";
+)"};
 
 // Vector lanes are four little-endian 32-bit words. Element access goes through scratch buffers.
-constexpr std::string_view VectorOperators = R"(
+constexpr std::string_view VectorOperators[] = {R"(
 local laneA, laneB, laneR = buffer.create(16), buffer.create(16), buffer.create(16)
 
 local function storeLanes(target: buffer, a: number, b: number, c: number, d: number)
@@ -496,7 +507,7 @@ local function writeMaskLane(target: buffer, at: number, element: number, set: b
     buffer.writeu32(target, at, word)
     if element == 8 then buffer.writeu32(target, at + 4, word) end
 end
-
+)", R"(
 local function vectorFloatLanes(op: number, element: number, size: number, a0: number, a1: number, a2: number, a3: number,
     b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
     storeLanes(laneA, a0, a1, a2, a3)
@@ -727,11 +738,11 @@ local function vectorReduce(op: number, element: number, size: number, s0: numbe
     end
     return result % 4294967296, 0
 end
-)";
+)"};
 
 // The x87 FPU: an eight-register stack of doubles (extended precision is not modeled), a status word for
 // the condition codes, and the control word's rounding mode.
-constexpr std::string_view X87Operators = R"luau(
+constexpr std::string_view X87Operators[] = {R"luau(
 local fpu = {stack = table.create(8, 0), top = 0, status = 0, control = 0x037f}
 
 local function fpuGet(i: number): number
@@ -993,9 +1004,9 @@ local function x87Execute(opcode: number, modrm: number, at: number): ...any
     end
     return nil
 end
-)luau";
+)luau"};
 
-constexpr std::string_view PrimeOperators = R"(
+constexpr std::string_view PrimeOperators[] = {R"(
 local function addMod(alo: number, ahi: number, blo: number, bhi: number,
     mlo: number, mhi: number): (number, number)
     local total = alo + blo
@@ -1084,9 +1095,9 @@ local function nextPrime(lo: number, hi: number): (number, number)
         end
     end
 end
-)";
+)"};
 
-constexpr std::string_view DivisionOperators = R"(
+constexpr std::string_view DivisionOperators[] = {R"(
 local function unsignedDivide(size: number, alo: number, ahi: number, dlo: number, dhi: number,
     blo: number, bhi: number): (number, number, number, number)
     local word = 4294967296
@@ -1241,9 +1252,9 @@ local function divideWord(size: number, signed: boolean, alo: number, ahi: numbe
     end
     return lo, if size == 8 then hi else 0
 end
-)";
+)"};
 
-constexpr std::string_view DecimalOperators = R"luau(
+constexpr std::string_view DecimalOperators[] = {R"luau(
 local function formatDouble(value: number, lo: number, hi: number): string
     local sign = if hi >= 2147483648 then "-" else ""
     if value ~= value then
@@ -1277,9 +1288,9 @@ local function formatDouble(value: number, lo: number, hi: number): string
         return sign .. string.sub(digits, 1, point) .. "." .. string.sub(digits, point + 1)
     end
 end
-)luau";
+)luau"};
 
-constexpr std::string_view MultiplyOperators = R"(
+constexpr std::string_view MultiplyOperators[] = {R"(
 local function multiply32(a: number, b: number): (number, number)
     local al, ah = a % 65536, math.floor(a / 65536)
     local bl, bh = b % 65536, math.floor(b / 65536)
@@ -1322,9 +1333,9 @@ local function signedMultiply(size: number, alo: number, ahi: number, blo: numbe
     local sign = if hi >= 2147483648 then word - 1 else 0
     return lo, hi, upperLo ~= sign or upperHi ~= sign, upperLo, upperHi
 end
-)";
+)"};
 
-constexpr std::string_view MemoryOperators = R"(
+constexpr std::string_view MemoryOperators[] = {R"(
 local function address(lo: number, hi: number): number
     if hi ~= 0 then
         error("guest address is out of range", 0)
@@ -1542,6 +1553,7 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         end
         return start, 0
     end
+)", R"(
     local function allocateCpp(size: number, sizeHi: number, throwing: boolean): (number, number)
         local pointer = resize(0, 0, math.max(size, 1), sizeHi)
         if pointer == 0 and throwing then
@@ -1790,9 +1802,9 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         fillMemory, processHeap, allocateCpp, compareMemory, criticalSection, protectMemory, cLocale, useCLocale,
         wideClass, testWideClass, pthreadMutex, srwLock, errnoAddress, readString, writeString
 end
-)";
+)"};
 
-constexpr std::string_view SehOperators = R"luau(
+constexpr std::string_view SehOperators[] = {R"luau(
 -- Windows x64 structured exception handling: what ntdll does for RaiseException and RtlUnwindEx, after
 -- Wine and ReactOS. Frames are found through the image's .pdata table and unwound by interpreting
 -- UNWIND_INFO. Language handlers such as __CxxFrameHandler4 are guest code that `call` runs.
@@ -2091,10 +2103,10 @@ local function sehUnwind(targetFrame: number, targetIp: number, record: number, 
     write(8, final + 0xf8, resume, 0)
     return resume, nil
 end
-)luau";
+)luau"};
 
 // How unwinders find frame data: glibc's _dl_find_object and dyld's _dyld_find_unwind_sections.
-constexpr std::string_view UnwindLookups = R"luau(
+constexpr std::string_view UnwindLookups[] = {R"luau(
 local function findUnwindObject(pcLo: number, pcHi: number): any
     if pcHi ~= 0 then
         return nil
@@ -2135,11 +2147,11 @@ function libc.dyld_find_unwind_sections(pcLo: number, pcHi: number, infoLo: numb
     write(8, info + 32, object.compactSize, 0)
     return 1, 0
 end
-)luau";
+)luau"};
 
 // Host services for translated programs: arguments, standard streams, a file system, and C library I/O.
 // Each libc entry takes and returns guest words as (lo, hi) pairs.
-constexpr std::string_view ProcessOperators = R"luau(
+constexpr std::string_view ProcessOperators[] = {R"luau(
 type HostFile = {path: string, data: buffer, size: number, at: number, writable: boolean, readable: boolean}
 
 local host = {
@@ -2435,7 +2447,7 @@ local function formatGuest(format: string, arguments: Arguments, windows: boolea
     end
     return table.concat(out)
 end
-
+)luau", R"luau(
 -- Variadic arguments. Kinds: 0 System V x86-64, 1 AAPCS64, 2 Darwin arm64, 3 Windows x64.
 local function registerArguments(kind: number, sp: number, ints: {number}, intIndex: number, floats: {number},
     floatIndex: number): Arguments
@@ -2825,7 +2837,7 @@ function libc.clearerr(lo, hi)
     host.eof[streamDescriptor(lo, hi)] = nil
     return 0, 0
 end
-
+)luau", R"luau(
 -- glibc's getc/putc macros fall back to these when the FILE buffers are empty.
 function libc.__uflow(lo, hi)
     return libc.fgetc(lo, hi)
@@ -3044,7 +3056,7 @@ end
 function libc.pthread_cond_wait()
     error("guest waits on a condition variable that no other thread can signal", 0)
 end
-
+)luau", R"luau(
 -- C locale character classes in Darwin's rune type bits.
 local function runeType(c: number): number
     if c < 0 or c > 255 then return 0 end
@@ -3286,7 +3298,7 @@ end
 function libc.dgettext(domainLo: number, domainHi: number, lo: number, hi: number): (number, number)
     return lo, hi
 end
-
+)luau", R"luau(
 -- KERNEL32 for programs built against the Windows CRT. Every entry receives the four register arguments as
 -- (lo, hi) pairs followed by the stack pointer; later arguments live above the 32-byte shadow space.
 local win32 = {}
@@ -3695,9 +3707,9 @@ end
 function libc.sigaction()
     return 0, 0
 end
-)luau";
+)luau"};
 
-constexpr std::string_view JumpOperators = R"(
+constexpr std::string_view JumpOperators[] = {R"(
 type JumpFrames = {[number]: {}}
 
 local function protectJump(frames: JumpFrames, environment: number,
@@ -3732,8 +3744,20 @@ local function jumpToFrame(frames: JumpFrames, environment: number, value: numbe
     end
     error({frame = frame, value = if value == 0 then 1 else value}, 0)
 end
-)";
+)"};
 
+// Clang and GCC accept longer literals, so check here what only an MSVC build would report.
+consteval bool fitLiteralLimit(std::initializer_list<std::span<const std::string_view>> sources) {
+    for (const auto chunks : sources)
+        for (const auto chunk : chunks)
+            if (chunk.size() > LiteralLimit)
+                return false;
+    return true;
+}
+static_assert(fitLiteralLimit({ArgumentReader, FlagOperators, RoutineOperators, ShiftOperators, FloatingOperators,
+    VectorOperators, X87Operators, PrimeOperators, DivisionOperators, DecimalOperators, MultiplyOperators,
+    MemoryOperators, SehOperators, UnwindLookups, ProcessOperators, JumpOperators}),
+    "a runtime chunk exceeds MSVC's string literal limit; split it at a line break");
 }
 
 std::string quoted(std::string_view value) {
@@ -3938,7 +3962,7 @@ std::string Data::source() const {
 }
 
 void appendRuntime(std::string& source, const RuntimeFeatures& features, const Data& data) {
-    source += ArgumentReader;
+    appendChunks(source, ArgumentReader);
     if (features.landingPads && !data.landingPads.empty()) {
         // Unwinders jump to these with the stack pointer of the frame that resumes.
         source += "local landingPads: {[number]: boolean} = {";
@@ -3964,30 +3988,30 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
         "fiberNext = 0, lastError = 0, exceptionFilterLo = 0, exceptionFilterHi = 0, "
         "yield = nil :: (() -> ())?, yieldInterval = 0.05, yieldAt = 0, yieldSteps = 0}\n";
     if (features.structured)
-        source += RoutineOperators;
+        appendChunks(source, RoutineOperators);
     if (features.stackGuard)
         source += "\n-- Synthetic guard for translated Linux x86-64 functions.\n"
             "local stackGuardLo, stackGuardHi = 0xa5a5a500, 0x5a5a5a5a\n";
     if (features.flags)
-        source += FlagOperators;
+        appendChunks(source, FlagOperators);
     if (features.shifts)
-        source += ShiftOperators;
+        appendChunks(source, ShiftOperators);
     if (features.division)
-        source += DivisionOperators;
+        appendChunks(source, DivisionOperators);
     if (features.multiply)
-        source += MultiplyOperators;
+        appendChunks(source, MultiplyOperators);
     if (features.floating)
-        source += FloatingOperators;
+        appendChunks(source, FloatingOperators);
     if (features.vector)
-        source += VectorOperators;
+        appendChunks(source, VectorOperators);
     if (features.prime)
-        source += PrimeOperators;
+        appendChunks(source, PrimeOperators);
     if (features.decimal)
-        source += DecimalOperators;
+        appendChunks(source, DecimalOperators);
     if (features.jumpFrames)
-        source += JumpOperators;
+        appendChunks(source, JumpOperators);
     if (features.memory) {
-        source += MemoryOperators;
+        appendChunks(source, MemoryOperators);
         source += data.source();
         source += std::format("local read, write, stackTop, resetMemory, resize, readXmm, writeXmm, "
             "compareStrings, stringLength, copyMemory, fillMemory, processHeap, allocateCpp, compareMemory, "
@@ -4002,18 +4026,18 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
                     "framesSize = {}, compact = {}, compactSize = {}}},\n", object.start, object.end, object.header,
                     object.frameHeader, object.frames, object.framesSize, object.compact, object.compactSize);
             source += "}\n";
-            source += ProcessOperators;
-            source += UnwindLookups;
+            appendChunks(source, ProcessOperators);
+            appendChunks(source, UnwindLookups);
         }
         if (features.seh) {
-            source += SehOperators;
+            appendChunks(source, SehOperators);
             if (!data.unwindObjects.empty())
                 source += std::format("seh.base, seh.stop, seh.table, seh.count = {}, {}, {}, {}\n",
                     data.unwindObjects.front().header, data.unwindObjects.front().end,
                     data.unwindObjects.front().frames, data.unwindObjects.front().framesSize / 12);
         }
         if (features.x87)
-            source += X87Operators;
+            appendChunks(source, X87Operators);
     }
 }
 }

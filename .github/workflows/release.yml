@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Run on a branch to check the builds; only a tag ref publishes.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -68,6 +70,7 @@ jobs:
   release:
     name: Publish release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -82,9 +85,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: >-
-          gh release create "$RELEASE_TAG"
-          dist/luft-linux-x86-64.tar.gz
-          dist/luft-windows-x86-64.zip
-          dist/luft-macos-aarch64.tar.gz
-          --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$RELEASE_TAG"
+        run: |
+          assets=(dist/luft-linux-x86-64.tar.gz dist/luft-windows-x86-64.zip dist/luft-macos-aarch64.tar.gz)
+          # Publishing a release on GitHub's web page creates it before this runs; attach the builds to it.
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi
