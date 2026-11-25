@@ -50,14 +50,14 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir dist
-          COPYFILE_DISABLE=1 tar -czf "dist/luft-${{ matrix.platform }}.tar.gz" -C build Luft
+          COPYFILE_DISABLE=1 tar -czf "dist/luft-${{ matrix.platform }}.tar.gz" README.md -C build Luft
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist
-          Compress-Archive -Path build/Release/Luft.exe -DestinationPath "dist/luft-${{ matrix.platform }}.zip"
+          Compress-Archive -Path build/Release/Luft.exe, README.md -DestinationPath "dist/luft-${{ matrix.platform }}.zip"
 
       - uses: actions/upload-artifact@v7
         with:
