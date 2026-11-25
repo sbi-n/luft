@@ -980,6 +980,12 @@ Instruction decodeX64(Reader& reader) {
         const Value operand = mode == 3 ? Value(target) : Value(Memory{x64Address(reader, mode, rm, rex)});
         return {ByteBinary{BinaryOp::Sub, operand, field, Immediate{0}, 0, true, false, true}};
     }
+    if (opcode == 0xf6 && (group == 4 || group == 5)) {
+        const auto [target, field] = byteRegister(dst, rexPresent);
+        const Value operand = mode == 3 ? Value(target) : Value(Memory{x64Address(reader, mode, rm, rex)});
+        return {Multiply{1, 0, Register{0}, operand, true, Zero, false,
+            group == 4 ? MultiplyOperands::UnsignedByte : MultiplyOperands::SignedByte, mode == 3 ? field : 0}};
+    }
     if (opcode == 0xf6 && group == 0) {
         const auto [target, field] = byteRegister(dst, rexPresent);
         const Value operand = mode == 3 ? Value(target) : Value(Memory{x64Address(reader, mode, rm, rex, 1)});
@@ -1089,6 +1095,14 @@ Instruction decodeX64(Reader& reader) {
             : Value(Memory{x64Address(reader, mode, rm, rex, 4)});
         const auto rhs = immediate(signExtend(reader.read(4), 32));
         return {MemoryBinary{BinaryOp::And, size, target, rhs, false}};
+    }
+    if (mode != 3 && carryAlu) {
+        // ADC and SBB with a memory operand.
+        const Memory memory{x64Address(reader, mode, rm, rex)};
+        const auto op = opcode & 8 ? BinaryOp::Sub : BinaryOp::Add;
+        if (opcode & 2)
+            return {MemoryBinary{op, size, Register{src}, memory, true, false, true, true}};
+        return {MemoryBinary{op, size, memory, Register{src}, true, false, true, true}};
     }
     if (mode != 3 && (registerAlu || opcode == 0x85)) {
         const Memory memory{x64Address(reader, mode, rm, rex)};

@@ -25,6 +25,39 @@ EXPORT udiv32(u64 a, u64 b) { return (u32)b ? (u32)a / (u32)b : 0; }
 EXPORT sdiv32(u64 a, u64 b) { return ((i32)b && !((i32)a == INT32_MIN && (i32)b == -1)) ? (u64)(i64)((i32)a / (i32)b) : 0; }
 EXPORT smod32(u64 a, u64 b) { return ((i32)b && !((i32)a == INT32_MIN && (i32)b == -1)) ? (u64)(i64)((i32)a % (i32)b) : 0; }
 EXPORT divconst(u64 a, u64 b) { return a / 7 + a / 10 + (u64)((i64)a / 3) + (u32)a / 13 + (u64)((i64)b % 9); }
+// x86 byte multiplies (GCC divides bytes by constants with MUL r/m8) and ADC/SBB with memory operands; the C
+// fallback computes the same values elsewhere.
+EXPORT bytemul(u64 a, u64 b) {
+    u64 mem = b ^ 0x5555, sum = a, diff = b, into = a ^ b;
+    unsigned short ax1 = (uint8_t)a, ax2 = (uint16_t)a, ax3 = (uint8_t)(a >> 16);
+    uint8_t f1, f2, f3, factor = (uint8_t)(b >> 8);
+#if defined(__x86_64__)
+    __asm__("mulb %2\n\tsetc %1" : "+a"(ax1), "=r"(f1) : "q"((uint8_t)b) : "cc");
+    __asm__("mulb %%ah\n\tseto %1" : "+a"(ax2), "=r"(f2) : : "cc");
+    __asm__("imulb %2\n\tsetc %1" : "+a"(ax3), "=r"(f3) : "m"(factor) : "cc");
+    __asm__("addq %[b], %[s]\n\tadcq %[m], %[s]" : [s] "+r"(sum) : [b] "r"(b), [m] "m"(mem) : "cc");
+    __asm__("cmpq %[a], %[d]\n\tsbbq %[m], %[d]" : [d] "+r"(diff) : [a] "r"(a), [m] "m"(mem) : "cc");
+    __asm__("cmpl %k[a], %k[b]\n\tadcq %[a], %[m]\n\tsbbl %k[b], %k[i]" : [m] "+m"(mem), [i] "+r"(into)
+            : [a] "r"(a), [b] "r"(b) : "cc");
+#else
+    u64 p1 = (u64)(uint8_t)a * (uint8_t)b, p2 = (u64)(uint8_t)a * (uint8_t)(a >> 8);
+    i64 p3 = (i64)(int8_t)(a >> 16) * (int8_t)factor;
+    ax1 = (unsigned short)p1, f1 = p1 > 255;
+    ax2 = (unsigned short)p2, f2 = p2 > 255;
+    ax3 = (unsigned short)p3, f3 = p3 < -128 || p3 > 127;
+    u64 carry = a + b < a;
+    sum = a + b + mem + carry;
+    u64 borrow = b < a;
+    diff = b - mem - borrow;
+    u64 carry32 = (u32)b < (u32)a;
+    u64 wide = mem + a + carry32;
+    u64 carry64 = wide < mem || (carry32 && wide == mem);
+    mem = wide;
+    into = (u32)((u32)into - (u32)b - (u32)carry64);
+#endif
+    return ax1 ^ ((u64)ax2 << 16) ^ ((u64)ax3 << 32) ^ ((u64)(f1 | f2 << 1 | f3 << 2) << 48) ^ sum * 3 ^ diff * 5 ^
+        mem * 7 ^ into * 11;
+}
 EXPORT shifts(u64 a, u64 b) {
     unsigned s = b & 63;
     return (a << s) ^ (a >> s) ^ (u64)((i64)a >> s) ^ ((u32)a << (s & 31)) ^ ((u32)a >> (s & 31)) ^

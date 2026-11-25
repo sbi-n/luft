@@ -40,9 +40,11 @@ std::string printModule(const std::map<ir::Address, std::string>& functions,
                 source += std::format("host.streams[{}] = {}\n", program.streams[i], i);
     }
 
-    std::string body;
+    // Entry functions live in one table rather than a local each: the runtime already declares most of the
+    // 200 locals a Luau function (here the module or instantiate()) may have, and libraries export many functions.
+    std::string body = "\nlocal entries: {[string]: (...Word) -> Word} = {}\n";
     for (const auto& [entry, code] : functions)
-        body += std::format("\nlocal function entry_{}(...: Word): Word\n{}end\n", entry, code);
+        body += std::format("\nentries.entry_{} = function(...: Word): Word\n{}end\n", entry, code);
     source += body;
 
     if (isProgram) {
@@ -60,9 +62,13 @@ local function run(options: RunOptions?): RunResult
     process.yield = settings.yield
     process.yieldInterval = settings.yieldInterval or 0.05
     process.yieldAt = os.clock()
-    local ok, failure = pcall(entry_{})
+    local ok, failure = pcall(entries.entry_{})
     local code = 0
     if not ok then
+        if type(failure) == "string" and string.find(failure, "buffer access out of bounds", 1, true) then
+            -- Translated code indexes the guest memory buffer directly: its bounds check failing is a guest fault.
+            failure = "guest accessed unmapped memory (" .. failure .. ")"
+        end
         if type(failure) == "table" and (failure :: any).luftExit ~= nil then
             code = (failure :: any).luftExit
         elseif {} then
@@ -90,11 +96,11 @@ end}})
     }
 
     if (exports.empty()) {
-        source += "\nlocal result = entry_0()\nreturn string.format(\"0x%08x%08x\", result.hi, result.lo)\n";
+        source += "\nlocal result = entries.entry_0()\nreturn string.format(\"0x%08x%08x\", result.hi, result.lo)\n";
     } else {
         source += "\nreturn table.freeze({\n";
         for (const auto& entry : exports)
-            source += std::format("    [\"{}\"] = entry_{},\n", entry.name, entry.offset);
+            source += std::format("    [\"{}\"] = entries.entry_{},\n", entry.name, entry.offset);
         source += "})\n";
     }
     return source;

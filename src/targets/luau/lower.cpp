@@ -55,7 +55,7 @@ public:
         : graph(graph), addressTaken(addressTaken), data(data), entry(entry), arm(arm), convention(convention),
           initializers(initializers), program(program), loops(loops),
           features(withProgramStack(detectFeatures(graph, entry, arm, initializers), program)),
-          flagsAtEntry(features.flags ? liveFlagsAtEntry(graph, features.calls) : std::set<Address>{}),
+          flagsAtEntry(features.flags ? liveFlagsAtEntry(graph, false) : std::set<Address>{}),
           useRoutineTable(graph.size() > 48) {
         for (const auto& [pc, block] : graph) {
             visitEdges(block, [&](Address target) { ++predecessors[target]; });
@@ -152,6 +152,8 @@ public:
                 source += std::format("    local {} = 0, 0, 0, 0\n", joinLanes(xmm(VectorRegister{index})));
         if (features.flags)
             source += "    local carry, overflow, negative, zero, parity = false, false, false, false, false\n";
+        if (isProgram() && usesMemory())
+            source += inlineMemoryAccess();
         if (useRoutineTable) {
             source += "    local routines: {[string]: GuestRoutine} = {}\n";
         } else {
@@ -239,10 +241,55 @@ public:
         return source;
     }
 
-    // A Luau function holds at most 32767 child closures. Larger programs define their routines inside
-    // group functions, each a child of the entry.
+    // Programs read and write guest memory through these shadows of the runtime's read and write: Luau inlines
+    // local functions, and a size that is a constant folds each to a few buffer calls. The buffer holds guest
+    // memory from its lowest mapped address to the end of the heap, so its own bounds check is the fault check
+    // (run() reports a failed one as an unmapped access). Writes below the stack, into the image, go to the
+    // runtime's write, which enforces read-only data and page protection; so do reads there without mapped images,
+    // which are checked against the embedded data.
+    std::string inlineMemoryAccess() const {
+        const bool strict = data.regions.empty();
+        return std::format(R"(    local guestBytes: buffer = buffer.create(0)
+    local guestBase: number, guestFloor: number = (process.watchMemory :: any)(function(bytes: buffer)
+        guestBytes = bytes
+    end)
+    local slowRead, slowWrite = read, write
+    local function read(size: number, at: number): (number, number)
+{}        local index = at - guestBase
+        if size == 8 then
+            return buffer.readu32(guestBytes, index), buffer.readu32(guestBytes, index + 4)
+        elseif size == 4 then
+            return buffer.readu32(guestBytes, index), 0
+        elseif size == 1 then
+            return buffer.readu8(guestBytes, index), 0
+        end
+        return buffer.readu16(guestBytes, index), 0
+    end
+    local function write(size: number, at: number, lo: number, hi: number)
+        if at < guestFloor then
+            slowWrite(size, at, lo, hi)
+            return
+        end
+        local index = at - guestBase
+        if size == 8 then
+            buffer.writeu32(guestBytes, index, lo)
+            buffer.writeu32(guestBytes, index + 4, hi)
+        elseif size == 4 then
+            buffer.writeu32(guestBytes, index, lo)
+        elseif size == 1 then
+            buffer.writeu8(guestBytes, index, lo)
+        else
+            buffer.writeu16(guestBytes, index, lo)
+        end
+    end
+)", strict ? "        if at < guestFloor then\n            return slowRead(size, at)\n        end\n" : "");
+    }
+
+    // A Luau function holds at most 32767 child closures, and each closure that captures the entry's register
+    // locals searches the open upvalues for them. Routines are defined inside group functions: those capture the
+    // registers once, and their routines capture the group's upvalues directly.
     std::string groupRoutines(const std::vector<std::string>& bodies) const {
-        std::size_t limit = 30000, group = 16000;
+        std::size_t limit = 0, group = 512;
         if (const auto* forced = std::getenv("LUFT_ROUTINE_GROUP"))
             limit = group = std::max<std::size_t>(1, std::strtoull(forced, nullptr, 10));
         std::string source;
@@ -251,11 +298,14 @@ public:
                 source += body;
             return source;
         }
-        for (std::size_t first = 0, index = 0; first < bodies.size(); first += group, ++index) {
-            source += std::format("    local function defineRoutines{}()\n", index);
+        // One reassigned local holds every group: a local per group would count against the entry's 200
+        // locals, and Luau never inlines a function whose local is reassigned.
+        source += "    local defineRoutines: () -> ()\n";
+        for (std::size_t first = 0; first < bodies.size(); first += group) {
+            source += "    defineRoutines = function()\n";
             for (auto i = first; i < std::min(bodies.size(), first + group); ++i)
                 source += bodies[i];
-            source += std::format("    end\n    defineRoutines{}()\n", index);
+            source += "    end\n    defineRoutines()\n";
         }
         return source;
     }
@@ -325,6 +375,9 @@ private:
     bool usesExceptionFilter = false;
     bool usesLastError = false;
     bool usesFiberSlots = false;
+    // The condition of the block effects() emitted last, when it compares operands directly.
+    struct DirectBranch { const Condition* condition; std::string expression; };
+    std::optional<DirectBranch> directBranch;
     std::set<unsigned> registers;
     std::set<unsigned> xmmRegisters;
     std::set<Address> functions;
@@ -404,6 +457,16 @@ private:
         return std::format("offset({}, {})", reg(addr.base).pair(), addr.displacement);
     }
 
+    // The guest address of a memory operand, for read, write, and the other bounds-checked accessors.
+    std::string memoryAddress(const EffectiveAddress& addr, const Constants& constants) {
+        if (!knownAddress(addr, constants) && addr.index == Zero && addr.displacement != 0 &&
+            addr.displacement > -4294967296 && addr.displacement < 4294967296) {
+            needsMemory = true;
+            return std::format("addressAt({}, {})", reg(addr.base).pair(), addr.displacement);
+        }
+        return "address(" + addressPair(addr, constants) + ")";
+    }
+
     std::string memoryError(std::uint64_t at, unsigned size) {
         if (const auto* import = data.unresolved(at, size))
             return std::format("unresolved binary import or relocation for {} at guest address {}", import->name, at);
@@ -427,7 +490,7 @@ private:
                 data.materialize(*known, size);
         }
         needsMemory = true;
-        const auto expression = std::format("read({}, address({}))", size, addressPair(addr, constants));
+        const auto expression = std::format("read({}, {})", size, memoryAddress(addr, constants));
         return size == 8 ? expression : "(" + expression + ")";
     }
 
@@ -438,7 +501,7 @@ private:
         if (const auto at = knownAddress(mem.address, constants); at && *at < data.image.size()) {
             if (mem.aligned && *at % 16 != 0) {
                 needsMemory = true;
-                return std::format("readXmm(address({}), true)", addressPair(mem.address, constants));
+                return std::format("readXmm({}, true)", memoryAddress(mem.address, constants));
             }
             if ((!data.readable(*at, 16) && !data.materialized(*at)) || data.unresolved(*at, 16)) {
                 trap(depth, memoryError(*at, 16));
@@ -457,7 +520,7 @@ private:
             data.materialize(*at, 16);
         }
         needsMemory = true;
-        return std::format("readXmm(address({}), {})", addressPair(mem.address, constants), mem.aligned);
+        return std::format("readXmm({}, {})", memoryAddress(mem.address, constants), mem.aligned);
     }
 
     // Returns the lanes of a vector operand. Memory operands load into locals named prefix0..prefix3, so
@@ -656,7 +719,7 @@ private:
         } else {
             const auto& at = std::get<Memory>(target).address;
             if (prepareWrite(depth, at, 1, constants))
-                line(depth, std::format("write(1, address({}), {}, 0)", addressPair(at, constants), byte));
+                line(depth, std::format("write(1, {}, {}, 0)", memoryAddress(at, constants), byte));
         }
     }
 
@@ -720,7 +783,23 @@ private:
         }
         if (op.invert)
             rhs = {"bit32.bnot(" + rhs.lo + ")", "bit32.bnot(" + rhs.hi + ")"};
-        if (op.op == BinaryOp::Add || op.op == BinaryOp::Sub) {
+        const auto* immediate = std::get_if<Immediate>(&op.rhs);
+        const bool plain = !flags && !op.withCarry && op.count == 0 && !op.invert && !op.extendBits;
+        if (plain && op.dst != Zero && op.op != BinaryOp::And && op.op != BinaryOp::Sub && op.lhs == Zero) {
+            // A move written as an add, or, or exclusive or with the zero register (mov is orr with xzr).
+            line(depth + 1, std::format("{} = {}, {}", dst.pair(), rhs.lo, op.size == 8 ? rhs.hi : "0"));
+        } else if (plain && op.dst != Zero && immediate && op.size == 8 && (op.op == BinaryOp::Add || op.op == BinaryOp::Sub) &&
+            std::int64_t(immediate->value) > -4294967296 && std::int64_t(immediate->value) < 4294967296) {
+            // Adding a constant only carries into (or borrows from) the high word when the low word wraps.
+            const auto delta = op.op == BinaryOp::Add ? std::int64_t(immediate->value) : -std::int64_t(immediate->value);
+            line(depth + 1, std::format("local sum = {} + {}", lhs.lo, delta));
+            if (delta >= 0)
+                line(depth + 1, std::format("if sum < 4294967296 then {0} = sum, {1} "
+                    "else {0} = sum - 4294967296, ({1} + 1) % 4294967296 end", dst.pair(), lhs.hi));
+            else
+                line(depth + 1, std::format("if sum >= 0 then {0} = sum, {1} "
+                    "else {0} = sum + 4294967296, ({1} + 4294967295) % 4294967296 end", dst.pair(), lhs.hi));
+        } else if (op.op == BinaryOp::Add || op.op == BinaryOp::Sub) {
             const bool subtract = op.op == BinaryOp::Sub;
             if (flags || op.withCarry) {
                 needsAddFlags = true;
@@ -751,6 +830,153 @@ private:
         if (flags && features.parity)
             line(depth + 1, "parity = evenParity(" + dst.lo + ")");
         line(depth, "end");
+    }
+
+    // The relation a branch on flags tests, after a compare (Sub), a test (And), or an add.
+    enum class Relation { Equal, NotEqual, Below, AboveOrEqual, Above, BelowOrEqual, Less, GreaterOrEqual, Greater,
+        LessOrEqual, Negative, NotNegative };
+
+    std::optional<Relation> relation(unsigned code) const {
+        using enum Relation;
+        static constexpr std::array<std::optional<Relation>, 16> armRelations{Equal, NotEqual, AboveOrEqual, Below,
+            Negative, NotNegative, std::nullopt, std::nullopt, Above, BelowOrEqual, GreaterOrEqual, Less, Greater,
+            LessOrEqual, std::nullopt, std::nullopt};
+        static constexpr std::array<std::optional<Relation>, 16> x64Relations{std::nullopt, std::nullopt, Below,
+            AboveOrEqual, Equal, NotEqual, BelowOrEqual, Above, Negative, NotNegative, std::nullopt, std::nullopt, Less,
+            GreaterOrEqual, LessOrEqual, Greater};
+        return code < 16 ? (arm ? armRelations : x64Relations)[code] : std::nullopt;
+    }
+
+    // A branch whose flags come only from the block's last effect, a plain compare, test, or add, tests the
+    // operands directly instead of materializing carry, overflow, negative, and zero. `clobbered` means the effect
+    // overwrote one of its operands, so only its result is available.
+    std::optional<std::string> directCondition(const Binary& op, unsigned code, bool clobbered) {
+        if (op.count != 0 || op.invert || op.extendBits || op.withCarry || (op.size != 4 && op.size != 8))
+            return std::nullopt;
+        if (op.op != BinaryOp::Sub && op.op != BinaryOp::And && op.op != BinaryOp::Add)
+            return std::nullopt;
+        const auto kind = relation(code);
+        if (!kind)
+            return std::nullopt;
+        const bool wide = op.size == 8;
+        LuauWord rhs;
+        bool immediate = false;
+        std::uint64_t value = 0;
+        if (const auto* constant = std::get_if<Immediate>(&op.rhs)) {
+            immediate = true;
+            value = wide ? constant->value : std::uint32_t(constant->value);
+            rhs = wordLiteral(value);
+        } else if (const auto* source = std::get_if<Register>(&op.rhs)) {
+            rhs = reg(source->index);
+        } else {
+            return std::nullopt;
+        }
+        const auto lhs = reg(op.lhs);
+        using enum Relation;
+        const auto isZero = [&](const LuauWord& word) {
+            return wide ? std::format("({} == 0 and {} == 0)", word.lo, word.hi) : std::format("({} == 0)", word.lo);
+        };
+        const auto sign = [&](const LuauWord& word) { return (wide ? word.hi : word.lo) + " >= 2147483648"; };
+        const auto signOnly = [&](const LuauWord& word, Relation want) -> std::optional<std::string> {
+            // Results of a test, whose carry and overflow are clear: signed relations compare it with zero.
+            switch (want) {
+                case Equal: return isZero(word);
+                case NotEqual: return "not " + isZero(word);
+                case Negative: case Less: return "(" + sign(word) + ")";
+                case NotNegative: case GreaterOrEqual: return "not (" + sign(word) + ")";
+                case Greater: return std::format("(not {} and not ({}))", isZero(word), sign(word));
+                case LessOrEqual: return std::format("({} or {})", isZero(word), sign(word));
+                default: return std::nullopt;
+            }
+        };
+        if (clobbered) {
+            if (op.dst == Zero)
+                return std::nullopt;
+            const auto result = reg(op.dst);
+            if (op.op == BinaryOp::And)
+                return signOnly(result, *kind);
+            if (*kind == Equal)
+                return isZero(result);
+            if (*kind == NotEqual)
+                return "not " + isZero(result);
+            if (*kind == Negative)
+                return "(" + sign(result) + ")";
+            if (*kind == NotNegative)
+                return "not (" + sign(result) + ")";
+            return std::nullopt;
+        }
+        if (op.op == BinaryOp::And) {
+            const bool same = !immediate && std::get<Register>(op.rhs).index == op.lhs;
+            LuauWord result = same ? lhs : LuauWord{std::format("bit32.band({}, {})", lhs.lo, rhs.lo),
+                std::format("bit32.band({}, {})", lhs.hi, rhs.hi)};
+            if (!same && (*kind == Equal || *kind == NotEqual)) {
+                auto test = std::format("bit32.btest({}, {})", lhs.lo, rhs.lo);
+                if (wide)
+                    test = std::format("({} or bit32.btest({}, {}))", test, lhs.hi, rhs.hi);
+                return *kind == NotEqual ? test : "not " + test;
+            }
+            return signOnly(result, *kind);
+        }
+        if (op.op == BinaryOp::Add) {
+            // Only equality: a + b == 0 exactly when a is the two's complement of an immediate b.
+            if (!immediate || (*kind != Equal && *kind != NotEqual))
+                return std::nullopt;
+            const auto negated = wordLiteral(wide ? std::uint64_t(0) - value : std::uint32_t(0u - std::uint32_t(value)));
+            auto equal = wide ? std::format("({} == {} and {} == {})", lhs.lo, negated.lo, lhs.hi, negated.hi)
+                              : std::format("({} == {})", lhs.lo, negated.lo);
+            return *kind == Equal ? equal : "not " + equal;
+        }
+        // Compare: a - b.
+        const auto unsignedLess = [&](std::string_view strict) {
+            if (!wide)
+                return std::format("({} {} {})", lhs.lo, strict, rhs.lo);
+            return std::format("({} < {} or ({} == {} and {} {} {}))", lhs.hi, rhs.hi, lhs.hi, rhs.hi, lhs.lo, strict, rhs.lo);
+        };
+        const auto unsignedGreater = [&](std::string_view strict) {
+            if (!wide)
+                return std::format("({} {} {})", lhs.lo, strict, rhs.lo);
+            return std::format("({} > {} or ({} == {} and {} {} {}))", lhs.hi, rhs.hi, lhs.hi, rhs.hi, lhs.lo, strict, rhs.lo);
+        };
+        // Signed order is unsigned order with the sign bits flipped.
+        const auto flipped = [&](const std::string& word, bool constant) {
+            return constant ? std::to_string(std::uint32_t(std::stoull(word)) ^ 0x80000000u)
+                            : std::format("bit32.bxor({}, 2147483648)", word);
+        };
+        const auto signedCompare = [&](std::string_view strict, bool less) {
+            const auto a = flipped(wide ? lhs.hi : lhs.lo, false);
+            const auto b = flipped(wide ? rhs.hi : rhs.lo, immediate);
+            if (!wide)
+                return std::format("({} {} {})", a, strict, b);
+            return std::format("({} {} {} or ({} == {} and {} {} {}))", a, less ? "<" : ">", b, lhs.hi, rhs.hi,
+                lhs.lo, strict, rhs.lo);
+        };
+        const bool zeroImmediate = immediate && value == 0;
+        switch (*kind) {
+            case Equal:
+                return wide ? std::format("({} == {} and {} == {})", lhs.lo, rhs.lo, lhs.hi, rhs.hi)
+                            : std::format("({} == {})", lhs.lo, rhs.lo);
+            case NotEqual:
+                return wide ? std::format("({} ~= {} or {} ~= {})", lhs.lo, rhs.lo, lhs.hi, rhs.hi)
+                            : std::format("({} ~= {})", lhs.lo, rhs.lo);
+            case Below: return unsignedLess("<");
+            case BelowOrEqual: return unsignedLess("<=");
+            case Above: return unsignedGreater(">");
+            case AboveOrEqual: return unsignedGreater(">=");
+            case Less: return zeroImmediate ? "(" + sign(lhs) + ")" : signedCompare("<", true);
+            case GreaterOrEqual: return zeroImmediate ? "not (" + sign(lhs) + ")" : signedCompare(">=", false);
+            case Greater:
+                return zeroImmediate ? std::format("(not {} and not ({}))", isZero(lhs), sign(lhs))
+                                     : signedCompare(">", false);
+            case LessOrEqual:
+                return zeroImmediate ? std::format("({} or {})", isZero(lhs), sign(lhs)) : signedCompare("<=", true);
+            case Negative: case NotNegative: {
+                if (wide)
+                    return std::nullopt;
+                const auto difference = std::format("({} - {}) % 4294967296 >= 2147483648", lhs.lo, rhs.lo);
+                return *kind == Negative ? "(" + difference + ")" : "not (" + difference + ")";
+            }
+        }
+        return std::nullopt;
     }
 
     void memoryBinary(unsigned depth, const MemoryBinary& op, Constants& constants, bool flags) {
@@ -792,8 +1018,8 @@ private:
             } else {
                 const auto& mem = std::get<Memory>(op.dst);
                 if (prepareWrite(depth + 1, mem.address, op.size, constants))
-                    line(depth + 1, std::format("write({}, address({}), resultLo, resultHi)", op.size,
-                        addressPair(mem.address, constants)));
+                    line(depth + 1, std::format("write({}, {}, resultLo, resultHi)", op.size,
+                        memoryAddress(mem.address, constants)));
             }
         }
         line(depth, "end");
@@ -804,7 +1030,9 @@ private:
             line(depth, std::format("guestTrace[guestTraceAt] = {}; guestTraceAt = guestTraceAt % 32 + 1", pc));
         std::set<const Effect*> liveWrites;
         if (features.flags) {
-            bool live = observesExitFlags(block, features.calls);
+            // No calling convention (System V, Microsoft x64, AAPCS64) preserves or returns flags across a call or
+            // return, so only branches and indirect jumps observe the flags a block leaves.
+            bool live = observesExitFlags(block, false);
             visitEdges(block, [&](Address target) { live |= flagsAtEntry.contains(target); });
             for (const auto& effect : block.effects | std::views::reverse) {
                 if (live && writesFlags(effect))
@@ -812,6 +1040,20 @@ private:
                 if (overwritesFlags(effect))
                     live = false;
                 live |= readsFlags(effect);
+            }
+        }
+        directBranch.reset();
+        if (const auto* branch = std::get_if<Branch>(&block.end); branch && features.flags && !block.effects.empty() &&
+            !flagsAtEntry.contains(branch->taken) && !flagsAtEntry.contains(branch->other)) {
+            const auto* flags = std::get_if<FlagsCondition>(&branch->condition);
+            const auto* op = std::get_if<Binary>(&block.effects.back());
+            if (flags && op && op->flags && liveWrites.contains(&block.effects.back())) {
+                const auto* source = std::get_if<Register>(&op->rhs);
+                const bool clobbered = op->dst != Zero && (op->dst == op->lhs || (source && source->index == op->dst));
+                if (auto expression = directCondition(*op, flags->code, clobbered)) {
+                    directBranch = DirectBranch{&branch->condition, std::move(*expression)};
+                    liveWrites.erase(&block.effects.back());
+                }
             }
         }
         for (const auto& effect : block.effects) {
@@ -865,7 +1107,7 @@ private:
                     } else {
                         const auto& mem = std::get<Memory>(move.dst);
                         if (prepareWrite(depth, mem.address, 1, constants))
-                            line(depth, std::format("write(1, address({}), {}, 0)", addressPair(mem.address, constants),
+                            line(depth, std::format("write(1, {}, {}, 0)", memoryAddress(mem.address, constants),
                                 byte));
                     }
                 },
@@ -879,7 +1121,7 @@ private:
                     if (dst) {
                         line(depth + 1, "local oldLo, oldHi = " + reg(dst->index).pair());
                     } else {
-                        line(depth + 1, std::format("local at = address({})", addressPair(mem->address, constants)));
+                        line(depth + 1, std::format("local at = {}", memoryAddress(mem->address, constants)));
                         line(depth + 1, std::format("local oldLo, oldHi = read({}, at)", exchange.size));
                     }
                     if (exchange.add) {
@@ -1017,6 +1259,28 @@ private:
                 [&](const Multiply& mul) {
                     if (mul.dst == Zero)
                         return;
+                    if (mul.operands == MultiplyOperands::UnsignedByte || mul.operands == MultiplyOperands::SignedByte) {
+                        // AX = AL * r/m8; CF and OF report a product that does not fit in AL (AH is not its sign).
+                        const auto ax = reg(mul.dst);
+                        const auto source = byteValue(mul.rhs, mul.rhsField, constants);
+                        const bool flags = setFlags && mul.flags;
+                        line(depth, "do");
+                        line(depth + 1, std::format("local a, b = bit32.extract({}, 0, 8), {}", ax.lo, source));
+                        if (mul.operands == MultiplyOperands::SignedByte) {
+                            line(depth + 1, "if a >= 128 then a -= 256 end");
+                            line(depth + 1, "if b >= 128 then b -= 256 end");
+                        }
+                        line(depth + 1, "local product = a * b");
+                        line(depth + 1, std::format("{0} = bit32.replace({0}, product % 65536, 0, 16)", ax.lo));
+                        if (flags) {
+                            line(depth + 1, mul.operands == MultiplyOperands::SignedByte ?
+                                "carry = product < -128 or product > 127" : "carry = product > 255");
+                            line(depth + 1, "overflow = carry");
+                        }
+                        line(depth, "end");
+                        constants[mul.dst].reset();
+                        return;
+                    }
                     needsMultiply = true;
                     const auto dst = reg(mul.dst);
                     const bool narrow = mul.operands == MultiplyOperands::Signed32 || mul.operands == MultiplyOperands::Unsigned32;
@@ -1075,7 +1339,7 @@ private:
                     } else {
                         const auto& mem = std::get<Memory>(set.dst);
                         if (prepareWrite(depth, mem.address, 1, constants))
-                            line(depth, std::format("write(1, address({}), {}, 0)", addressPair(mem.address, constants),
+                            line(depth, std::format("write(1, {}, {}, 0)", memoryAddress(mem.address, constants),
                                 byte));
                     }
                 },
@@ -1083,8 +1347,8 @@ private:
                 [&](const MemoryBinary& op) { memoryBinary(depth, op, constants, setFlags && op.flags); },
                 [&](const Store& store) {
                     if (prepareWrite(depth, store.address, store.size, constants))
-                        line(depth, std::format("write({}, address({}), {})", store.size,
-                            addressPair(store.address, constants), value(store.src, 8, constants)));
+                        line(depth, std::format("write({}, {}, {})", store.size,
+                            memoryAddress(store.address, constants), value(store.src, 8, constants)));
                 },
                 [&](const PairTransfer& pair) {
                     auto second = pair.address;
@@ -1101,15 +1365,15 @@ private:
                                     line(depth + 2, joinLanes(lanes) + " = lo, hi, 0, 0");
                                     line(depth + 1, "end");
                                 } else if (prepareWrite(depth + 1, address, pair.size, constants)) {
-                                    line(depth + 1, std::format("write({}, address({}), {}, {})", pair.size,
-                                        addressPair(address, constants), lanes[0], lanes[1]));
+                                    line(depth + 1, std::format("write({}, {}, {}, {})", pair.size,
+                                        memoryAddress(address, constants), lanes[0], lanes[1]));
                                 }
                             } else if (pair.load) {
                                 if (auto source = readVector(depth + 1, VectorMemory{address, false}, constants))
                                     line(depth + 1, joinLanes(lanes) + " = " + *source);
                             } else if (prepareWrite(depth + 1, address, 16, constants)) {
-                                line(depth + 1, std::format("writeXmm(address({}), false, {})",
-                                    addressPair(address, constants), joinLanes(lanes)));
+                                line(depth + 1, std::format("writeXmm({}, false, {})",
+                                    memoryAddress(address, constants), joinLanes(lanes)));
                             }
                         };
                         transfer(pair.first, pair.address);
@@ -1130,10 +1394,10 @@ private:
                         constants[pair.second] = pair.second == Zero ? Constants::value_type(0) : std::nullopt;
                     } else if (prepareWrite(depth + 1, pair.address, pair.size, constants) &&
                         prepareWrite(depth + 1, second, pair.size, constants)) {
-                        line(depth + 1, std::format("write({}, address({}), {})",
-                            pair.size, addressPair(pair.address, constants), reg(pair.first).pair()));
-                        line(depth + 1, std::format("write({}, address({}), {})",
-                            pair.size, addressPair(second, constants), reg(pair.second).pair()));
+                        line(depth + 1, std::format("write({}, {}, {})",
+                            pair.size, memoryAddress(pair.address, constants), reg(pair.first).pair()));
+                        line(depth + 1, std::format("write({}, {}, {})",
+                            pair.size, memoryAddress(second, constants), reg(pair.second).pair()));
                     }
                     if (pair.writeback) {
                         const auto cell = reg(pair.address.base);
@@ -1284,7 +1548,7 @@ private:
                 [&](const X87& op) {
                     needsX87 = true;
                     needsMemory = true;
-                    const auto at = op.memory ? std::format("address({})", addressPair(*op.memory, constants)) :
+                    const auto at = op.memory ? std::format("{}", memoryAddress(*op.memory, constants)) :
                         std::string("0");
                     const auto call = std::format("x87Execute({}, {}, {})", op.opcode, op.modrm, at);
                     const bool compareFlags = !op.memory && (op.opcode == 0xdb || op.opcode == 0xdf) &&
@@ -1421,7 +1685,7 @@ private:
                         } else {
                             const auto& at = std::get<Memory>(bit.target).address;
                             if (prepareWrite(depth + 1, at, bit.size, constants))
-                                line(depth + 1, std::format("write({}, address({}), lo, hi)", bit.size, addressPair(at, constants)));
+                                line(depth + 1, std::format("write({}, {}, lo, hi)", bit.size, memoryAddress(at, constants)));
                         }
                     }
                     line(depth, "end");
@@ -1598,7 +1862,7 @@ private:
                         } else {
                             const auto& addr = std::get<VectorMemory>(move.dst).address;
                             if (prepareWrite(depth, addr, move.size, constants))
-                                line(depth, std::format("write({}, address({}), {})", move.size, addressPair(addr, constants), source));
+                                line(depth, std::format("write({}, {}, {})", move.size, memoryAddress(addr, constants), source));
                         }
                         return;
                     }
@@ -1610,7 +1874,7 @@ private:
                     } else {
                         const auto& mem = std::get<VectorMemory>(move.dst);
                         if (prepareWrite(depth, mem.address, 16, constants))
-                            line(depth, std::format("writeXmm(address({}), {}, {})", addressPair(mem.address, constants),
+                            line(depth, std::format("writeXmm({}, {}, {})", memoryAddress(mem.address, constants),
                                 mem.aligned, *source));
                     }
                 },
@@ -1661,7 +1925,7 @@ private:
                     } else {
                         const auto& at = std::get<VectorMemory>(move.dst).address;
                         if (prepareWrite(depth, at, 8, constants))
-                            line(depth, std::format("write(8, address({}), {})", addressPair(at, constants), data));
+                            line(depth, std::format("write(8, {}, {})", memoryAddress(at, constants), data));
                     }
                 },
                 [&](const VectorShiftBytes& shift) {
@@ -1847,8 +2111,8 @@ private:
                         const auto check = control.size == 4 ? "bit32.band(mxcsr, 0xffffffc0) ~= 0x1f80" : "x87Control ~= 0x037f";
                         line(depth, std::format("if {} then error(\"unsupported guest floating-point control mode\", 0) end", check));
                     } else if (prepareWrite(depth, control.address, control.size, constants)) {
-                        line(depth, std::format("write({}, address({}), {}, 0)", control.size,
-                            addressPair(control.address, constants), cell));
+                        line(depth, std::format("write({}, {}, {}, 0)", control.size,
+                            memoryAddress(control.address, constants), cell));
                     }
                 },
                 [&](const VectorLanes& op) {
@@ -2118,6 +2382,8 @@ private:
     }
 
     std::string condition(const Condition& node) {
+        if (directBranch && directBranch->condition == &node)
+            return directBranch->expression;
         if (const auto* flags = std::get_if<FlagsCondition>(&node))
             return std::string((arm ? ArmConditions : X64Conditions)[flags->code]);
         if (const auto* test = std::get_if<TestBitCondition>(&node)) {

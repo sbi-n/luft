@@ -104,8 +104,9 @@ end
 -- library code, are never resumed.
 local function runGuestRoutine(action: GuestRoutine, expectedReturn: number, frameStack: number?): any
     local nextAction: any = action
+    -- run() sets the yield callback before the guest starts; it does not change while routines run.
+    local yield = process.yield
     while true do
-        local yield = process.yield
         if yield then
             process.yieldSteps += 1
             if process.yieldSteps >= 1024 then
@@ -179,14 +180,16 @@ local function shiftParts(op: number, size: number, count: number, lo: number, h
                 if count == 32 then bit32.band(hi, 1) else bit32.extract(lo, 64 - count)
         end
     end
-    local right: (number, number) -> number = if op == 2 then bit32.arshift else bit32.rshift
+    -- bit32 calls stay direct (not through a local chosen at run time) so that Luau compiles them to fast calls,
+    -- and an inlined call with a constant op keeps only one of them.
     if size == 4 then
-        return right(lo, count), 0, bit32.extract(lo, count - 1)
+        return if op == 2 then bit32.arshift(lo, count) else bit32.rshift(lo, count), 0, bit32.extract(lo, count - 1)
     elseif count < 32 then
         return bit32.bor(bit32.rshift(lo, count), bit32.lshift(hi, 32 - count)),
-            right(hi, count), bit32.extract(lo, count - 1)
+            if op == 2 then bit32.arshift(hi, count) else bit32.rshift(hi, count), bit32.extract(lo, count - 1)
     end
-    return right(hi, count - 32), if op == 2 and hi >= 2147483648 then 4294967295 else 0,
+    return if op == 2 then bit32.arshift(hi, count - 32) else bit32.rshift(hi, count - 32),
+        if op == 2 and hi >= 2147483648 then 4294967295 else 0,
         if count == 32 then bit32.extract(lo, 31) else bit32.extract(hi, count - 33)
 end
 
@@ -398,9 +401,11 @@ local function wideLanes(op: number, alo: number, ahi: number, blo: number, bhi:
         count = -count
         local fill = if op == 26 and ahi >= 2147483648 then 4294967295 else 0
         if count >= 64 then return fill, fill end
-        local right = if op == 26 then bit32.arshift else bit32.rshift
-        if count >= 32 then return right(ahi, count - 32), fill end
-        return bit32.bor(bit32.rshift(alo, count), bit32.lshift(ahi, 32 - count)), right(ahi, count)
+        if count >= 32 then
+            return if op == 26 then bit32.arshift(ahi, count - 32) else bit32.rshift(ahi, count - 32), fill
+        end
+        return bit32.bor(bit32.rshift(alo, count), bit32.lshift(ahi, 32 - count)),
+            if op == 26 then bit32.arshift(ahi, count) else bit32.rshift(ahi, count)
     elseif op == 0 or op == 1 then
         local sum = if op == 0 then alo + blo else alo - blo
         local high = if op == 0 then ahi + bhi else ahi - bhi
@@ -1343,9 +1348,32 @@ local function address(lo: number, hi: number): number
     return lo
 end
 
+-- Luau inlines this; a constant displacement folds the range tests, leaving an add and one compare when the
+-- low word does not carry or borrow.
 local function offset(lo: number, hi: number, displacement: number): (number, number)
     local sum = lo + displacement
+    if displacement >= 0 and displacement < 4294967296 then
+        if sum < 4294967296 then return sum, hi end
+        return sum - 4294967296, (hi + 1) % 4294967296
+    elseif displacement < 0 and displacement > -4294967296 then
+        if sum >= 0 then return sum, hi end
+        return sum + 4294967296, (hi + 4294967295) % 4294967296
+    end
     return sum % 4294967296, (hi + math.floor(sum / 4294967296)) % 4294967296
+end
+
+-- The address a memory access uses for a register plus a displacement. With a zero high word the sum is the
+-- address: one that leaves the low 32 bits fails the access's bounds check like any unmapped address. Luau
+-- inlines addressAt at every access; the rare wrapped case calls through `process`, which Luau never inlines,
+-- keeping the inlined code and the compiler's work small (and adding no local to a module near the limit).
+process.wrappedAddress = function(lo: number, hi: number, displacement: number): number
+    return address(offset(lo, hi, displacement))
+end
+local function addressAt(lo: number, hi: number, displacement: number): number
+    if hi ~= 0 then
+        return (process.wrappedAddress :: any)(lo, hi, displacement)
+    end
+    return lo + displacement
 end
 
 local function indexedOffset(lo: number, hi: number, indexLo: number, indexHi: number,
@@ -1371,6 +1399,14 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     end
     -- Translations without mapped images embed only the data they reference: reading elsewhere is a bug.
     local strictImage = not mapped
+    -- Translated programs access memory through inlined copies of read and write that keep their own reference
+    -- to the buffer; this callback hands them the new one when the heap grows.
+    local memoryMoved: ((buffer) -> ())? = nil
+    process.watchMemory = function(moved: (buffer) -> ()): (number, number)
+        memoryMoved = moved
+        moved(memory)
+        return memoryBase, stackBottom
+    end
     -- Heap blocks are 16-byte rounded (word-at-a-time string routines read past the requested size), and
     -- freed blocks are reused by later allocations of the same rounded length.
     local heapSizes: {[number]: number} = {}
@@ -1543,6 +1579,7 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
                 buffer.copy(larger, 0, memory, 0, start - memoryBase)
                 memory = larger
                 memoryEnd = heapStart + math.min(capacity, heapLimit)
+                if memoryMoved then memoryMoved(memory) end
             end
         end
         heapSizes[start] = size
@@ -3986,7 +4023,9 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
     source += "\nlocal process = {initialized = false, exitCallbacks = {} :: {() -> ()}, "
         "fiberSlots = {} :: {[number]: {lo: number, hi: number, callbackLo: number, callbackHi: number}?}, "
         "fiberNext = 0, lastError = 0, exceptionFilterLo = 0, exceptionFilterHi = 0, "
-        "yield = nil :: (() -> ())?, yieldInterval = 0.05, yieldAt = 0, yieldSteps = 0}\n";
+        "yield = nil :: (() -> ())?, yieldInterval = 0.05, yieldAt = 0, yieldSteps = 0, "
+        "watchMemory = nil :: (((buffer) -> ()) -> (number, number))?, "
+        "wrappedAddress = nil :: ((number, number, number) -> number)?}\n";
     if (features.structured)
         appendChunks(source, RoutineOperators);
     if (features.stackGuard)

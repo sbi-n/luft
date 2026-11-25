@@ -57,7 +57,9 @@ struct ConditionalCompare {
 };
 struct Divide { unsigned size; Value divisor; bool sign = false; };
 struct DivideWord { unsigned size; unsigned dst; Register lhs; Register rhs; bool sign; };
-enum class MultiplyOperands { Full, Signed32, Unsigned32, SignedHigh, UnsignedHigh, SignedWide, UnsignedWide };
+// UnsignedByte and SignedByte are x86 MUL and IMUL r/m8: AX = AL times the byte at `rhsField` of rhs.
+enum class MultiplyOperands { Full, Signed32, Unsigned32, SignedHigh, UnsignedHigh, SignedWide, UnsignedWide,
+    UnsignedByte, SignedByte };
 struct Multiply {
     unsigned size;
     unsigned dst;
@@ -67,6 +69,7 @@ struct Multiply {
     unsigned accumulator = Zero;
     bool subtract = false;
     MultiplyOperands operands = MultiplyOperands::Full;
+    unsigned rhsField = 0;
 };
 struct SetCondition { Value dst; unsigned field; unsigned condition; };
 struct Binary {
