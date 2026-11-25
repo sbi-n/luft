@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x86-64
+            cmake_args: ''
+          - runner: macos-15
+            platform: macos-aarch64
+            cmake_args: ''
+          - runner: windows-2022
+            platform: windows-x86-64
+            cmake_args: '-A x64'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install CMake
+        run: python -m pip install "cmake>=4.4,<5"
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --target Luft --parallel 4
+
+      - name: Package (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir dist
+          COPYFILE_DISABLE=1 tar -czf "dist/luft-${{ matrix.platform }}.tar.gz" -C build Luft
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist
+          Compress-Archive -Path build/Release/Luft.exe -DestinationPath "dist/luft-${{ matrix.platform }}.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: luft-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: luft-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$RELEASE_TAG"
+          dist/luft-linux-x86-64.tar.gz
+          dist/luft-windows-x86-64.zip
+          dist/luft-macos-aarch64.tar.gz
+          --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$RELEASE_TAG"
