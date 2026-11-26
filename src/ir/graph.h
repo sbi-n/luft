@@ -17,6 +17,8 @@ inline constexpr unsigned Temp = 33;
 inline constexpr unsigned RegisterCount = 40;
 // Vector register index reserved for translator temporaries.
 inline constexpr unsigned VectorTemp = 32;
+// A second scratch vector, for instructions that need two intermediate values.
+inline constexpr unsigned VectorTemp2 = 33;
 
 struct Register { unsigned index; };
 struct Immediate { std::uint64_t value; };
@@ -41,8 +43,14 @@ enum class ShiftOp { Left, LogicalRight, ArithmeticRight, RotateRight, RotateLef
 struct Nop {};
 struct Move { unsigned size; unsigned dst; Value src; };
 struct ByteMove { Value dst; unsigned dstField; Value src; unsigned srcField; };
-struct Exchange { unsigned size; Value dst; Register src; bool add = false; };
-struct AtomicAdd { unsigned size; EffectiveAddress address; Register src; unsigned dst; };
+// XCHG and XADD; one-byte forms name the byte of each register (8 for AH and its kin) in the fields.
+struct Exchange { unsigned size; Value dst; Register src; bool add = false; unsigned dstField = 0; unsigned srcField = 0; };
+// ARM64 LSE atomics (LDADD, LDCLR, LDEOR, LDSET, the max/min forms, SWP): memory becomes `op` of its value and
+// `src`, and `dst` receives the old value, zero-extended.
+enum class AtomicOp { Add, Clear, Xor, Set, SignedMax, SignedMin, UnsignedMax, UnsignedMin, Swap };
+struct AtomicUpdate { unsigned size; EffectiveAddress address; Register src; unsigned dst; AtomicOp op = AtomicOp::Add; };
+// ARM64 CAS: when memory holds `compare`'s value it becomes `value`; `compare` receives the old value.
+struct CompareSwap { unsigned size; EffectiveAddress address; unsigned compare; Register value; };
 struct Extend { unsigned size; unsigned dst; Value src; unsigned bits; unsigned field; bool sign; };
 struct ConditionalMove { unsigned size; unsigned dst; Value src; unsigned condition; };
 enum class SelectElse { Copy, Increment, Invert, Negate };
@@ -133,7 +141,8 @@ struct BitScan {
     unsigned size; unsigned dst; Value src; bool reverse; bool leadingCount = false; bool counts = false;
     bool population = false;
 };
-struct ByteSwap { unsigned size; unsigned dst; Register src; bool reverseBits = false; };
+// Reverses the bytes of the register, or of each `unit`-byte part of it (REV16, REV32), or with `reverseBits` its bits.
+struct ByteSwap { unsigned size; unsigned dst; Register src; bool reverseBits = false; unsigned unit = 0; };
 struct StringDirection { bool backward; };
 struct RepeatStore { unsigned size; };
 // An x87 instruction (opcodes D8-DF) interpreted by the runtime's FPU emulation.
@@ -143,23 +152,38 @@ struct DoubleShift { unsigned size; unsigned dst; Register src; bool left; };
 // MOVS copies [RSI] to [RDI]; with a REP prefix it repeats RCX times.
 struct StringMove { unsigned size; bool repeat; };
 // CMPXCHG compares the accumulator with memory and stores the source when they match.
-struct CompareExchange { unsigned size; EffectiveAddress address; Register src; };
+struct CompareExchange { unsigned size; EffectiveAddress address; Register src; unsigned srcField = 0; };
 struct CpuId {};
 struct VectorRegister { unsigned index; };
 struct VectorMemory { EffectiveAddress address; bool aligned; };
 using VectorOperand = std::variant<VectorRegister, VectorMemory>;
 enum class VectorOp {
     Xor, And, AndNot, Or, UnpackLowDwords, UnpackLowQwords, AddDwords, SubDwords,
-    DotUnsignedBytes, AccumulatePairs, CompareZeroDwords, CompareZeroQwords, AddQwords, SubQwords, SumQwords,
+    DotUnsignedBytes, DotSignedBytes, AccumulatePairs, CompareZeroDwords, CompareZeroQwords, AddQwords, SubQwords, SumQwords,
     CompareUnsignedWords, CompareUnsignedDwords
 };
 struct VectorBinary {
     VectorOp op; VectorRegister dst; VectorOperand src; std::optional<VectorRegister> lhs = {}; unsigned size = 16;
 };
 struct VectorMove { VectorOperand dst; VectorOperand src; unsigned size = 16; bool keepUpper = false; };
-struct InterleavedLoad4 { VectorRegister first; EffectiveAddress address; unsigned elementSize; };
+// LD2-LD4 and ST2-ST4: element i of register first + r is element i * count + r in memory. An eight-byte form
+// clears the registers' upper halves when it loads.
+struct InterleavedTransfer {
+    VectorRegister first; EffectiveAddress address; unsigned elementSize; unsigned count = 4; unsigned size = 16;
+    bool store = false;
+};
+// TBL and TBX: each byte of `indices` selects a byte of the `count` consecutive registers from `table`. An index
+// past them yields zero, or with `extend` keeps the destination's byte.
+struct VectorTable { VectorRegister dst; VectorRegister table; unsigned count; VectorRegister indices; bool extend; unsigned size = 16; };
+// FMLA and FMLS on vectors: dst = dst + a * b (or dst - a * b) in each lane, or with one lane of b for every lane.
+struct VectorFusedMultiply {
+    unsigned element; VectorRegister dst; VectorRegister a; VectorRegister b; std::optional<unsigned> bLane;
+    bool negateProduct; unsigned size = 16;
+};
 struct VectorSplat { VectorRegister dst; Register src; unsigned elementSize; unsigned size; };
-struct VectorWiden { VectorRegister dst; VectorRegister src; unsigned bits; unsigned shift; bool upper; };
+// Widens the elements of `src`'s low (or `upper`) half, `bits` wide (8, 16, or 32), to twice their width, then
+// shifts each left by `shift`.
+struct VectorWiden { VectorRegister dst; VectorRegister src; unsigned bits; unsigned shift; bool upper; bool sign = false; };
 struct VectorHalfMove { VectorOperand dst; VectorOperand src; bool dstHigh; bool srcHigh; };
 struct VectorShiftBytes { VectorRegister dst; unsigned count; bool left; };
 struct VectorIntToDouble { VectorRegister dst; VectorOperand src; };
@@ -184,6 +208,9 @@ struct FloatToInteger {
     unsigned fractionBits = 0;
 };
 struct FloatingControl { EffectiveAddress address; unsigned size; bool load; };
+// ARM64 MSR FPCR: the translation keeps the default control (round to nearest, no flush to zero, no traps), so
+// writing any other value is unsupported.
+struct FloatingControlWrite { unsigned src; };
 
 // Element-wise vector operations. Lanes are `element` bytes wide; `size` is 8 or 16 bytes, and an
 // 8-byte result clears the upper half. A missing lhs means the destination is also the first operand.
@@ -198,6 +225,9 @@ enum class LaneOp {
     TestBits,     // CMTST: all ones where the operands share a set bit.
     // USHL/SSHL: shift left by the signed low byte of each second-operand lane; negative counts shift right.
     ShiftUnsigned, ShiftSigned,
+    MulWideSigned, // SMULL: the low 32 bits of each 64-bit lane, signed, widen to a 64-bit product.
+    // ADDP, SMAXP, UMAXP, SMINP, UMINP: lane i combines lanes 2i and 2i + 1 of the first operand followed by the second.
+    AddPairs, MaxPairsSigned, MaxPairsUnsigned, MinPairsSigned, MinPairsUnsigned,
 };
 struct VectorLanes {
     LaneOp op; unsigned element; VectorRegister dst; VectorOperand rhs; std::optional<VectorRegister> lhs = {};
@@ -206,6 +236,8 @@ struct VectorLanes {
 enum class FloatLaneOp {
     Add, Sub, Mul, Div, Min, Max, Sqrt, Equal, Less, LessEqual, Unordered, NotEqual, NotLess, NotLessEqual,
     Ordered, Greater, GreaterEqual, Negate, Absolute, MinNumber, MaxNumber, ArmMin, ArmMax,
+    // FRINTN/FRINTX/FRINTI, FRINTA, FRINTM, FRINTP, FRINTZ and SSE4.1 ROUNDPS/ROUNDPD, on the second operand.
+    RoundEven, RoundAway, Floor, Ceil, Truncate,
 };
 struct VectorFloatLanes {
     FloatLaneOp op; unsigned element; VectorRegister dst; VectorOperand rhs; std::optional<VectorRegister> lhs = {};
@@ -248,19 +280,23 @@ struct FloatConditionalCompare { unsigned size; VectorRegister lhs; std::optiona
 // Moves one lane between vector registers, or between a vector lane and memory.
 struct VectorLaneMove { unsigned element; VectorRegister dst; unsigned dstLane; VectorRegister src; unsigned srcLane; };
 struct VectorLaneLoad { unsigned element; VectorRegister dst; unsigned lane; EffectiveAddress address; bool replicate = false; unsigned size = 16; };
-using Effect = std::variant<Nop, Move, ByteMove, Exchange, AtomicAdd, Extend, ConditionalMove, Select, ConditionalCompare,
+// ST1 (single structure): one lane of a vector register to memory.
+struct VectorLaneStore { unsigned element; VectorRegister src; unsigned lane; EffectiveAddress address; };
+// PTEST: ZF when lhs AND rhs is zero, CF when (NOT lhs) AND rhs is; the other flags clear.
+struct VectorTest { VectorRegister lhs; VectorOperand rhs; };
+using Effect = std::variant<Nop, Move, ByteMove, Exchange, AtomicUpdate, CompareSwap, Extend, ConditionalMove, Select, ConditionalCompare,
     Divide, DivideWord, Multiply, SetCondition,
     Binary, MemoryBinary, Store, PairTransfer, Push, KeepBits, ByteBinary, ByteShift, Shift, ShiftRegister,
     Bitfield, BitTest, BitScan, ByteSwap,
     StringDirection, RepeatStore, StringMove, CompareExchange, CpuId, Extract, DoubleShift, X87,
-    VectorBinary, VectorMove, InterleavedLoad4, VectorSplat, VectorWiden,
+    VectorBinary, VectorMove, InterleavedTransfer, VectorTable, VectorFusedMultiply, VectorSplat, VectorWiden,
     VectorHalfMove, VectorShiftBytes, VectorIntToDouble, VectorSignMask,
     VectorShuffle, VectorTransfer,
     VectorImmediate, VectorByteOperation,
     FloatBinary, FloatCompare,
-    FloatMask, IntegerToFloat, FloatToInteger, FloatingControl,
+    FloatMask, IntegerToFloat, FloatToInteger, FloatingControl, FloatingControlWrite,
     VectorLanes, VectorFloatLanes, VectorShiftLanes, VectorPermute, VectorConvert, VectorReduce, VectorBlend,
-    ScalarFloat, FusedMultiply, FloatSelect, FloatConditionalCompare, VectorLaneMove, VectorLaneLoad>;
+    ScalarFloat, FusedMultiply, FloatSelect, FloatConditionalCompare, VectorLaneMove, VectorLaneLoad, VectorLaneStore, VectorTest>;
 
 
 struct FlagsCondition { unsigned code; };
@@ -284,6 +320,11 @@ using Graph = std::map<Address, Block>;
 struct CodeRange { std::size_t first; std::size_t last; };
 struct References {
     std::set<Address> functions;
+    // Functions known only because code takes their address: some are labels inside a function.
+    std::set<Address> taken;
+    // Slots of imported functions that never return, such as abort and __stack_chk_fail: code after a call to one
+    // belongs to other paths.
+    std::set<Address> noReturnSlots;
     std::set<Address> data;
     std::vector<GuestObject> tables;
 };
@@ -293,5 +334,6 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
     std::span<const GuestExport> exports, std::span<const GuestRegion> regions,
     std::vector<CodeRange>* code = nullptr, References* references = nullptr,
     std::span<const GuestBinding> bindings = {}, CallingConvention convention = CallingConvention::Native,
-    std::optional<std::size_t> tlsVector = {}, std::size_t threadBlock = 0);
+    std::optional<std::size_t> tlsVector = {}, std::size_t threadBlock = 0,
+    std::span<const std::pair<std::size_t, std::size_t>> functionRanges = {});
 }

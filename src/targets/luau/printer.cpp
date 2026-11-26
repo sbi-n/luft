@@ -9,7 +9,11 @@ export type RunOptions = {
     args: {string}?,
     env: {string}?,
     stdin: string?,
+    -- Files by path, relative to `cwd` or absolute. The result's files keep these names; files the program makes
+    -- are named relative to `cwd` when they are inside it.
     files: {[string]: string}?,
+    -- The working directory, "/work" by default. It and the directories that hold the files exist.
+    cwd: string?,
     stdout: ((string) -> ())?,
     stderr: ((string) -> ())?,
     -- Runs about every `yieldInterval` seconds (0.05 by default) while the program runs, for example to yield
@@ -34,10 +38,15 @@ std::string printModule(const std::map<ir::Address, std::string>& functions,
     }
     luau::appendRuntime(source, runtime, data);
     if (runtime.process) {
-        source += std::format("libc.darwin, libc.arm = {}, {}\n", program.darwin, false);
+        source += std::format("libc.darwin, libc.arm, libc.windows = {}, {}, {}\n", program.darwin, runtime.arm,
+            runtime.windows);
         for (unsigned i = 0; i < program.streams.size(); ++i)
             if (program.streams[i])
                 source += std::format("host.streams[{}] = {}\n", program.streams[i], i);
+        for (const auto& [start, bytes] : program.threadTemplates)
+            source += std::format("process.threadTemplates[{}] = {}\n", start, quoted(bytes));
+        for (const auto& [start, bytes] : program.threadBlocks)
+            source += std::format("process.threadBlocks[{}] = {}\n", start, quoted(bytes));
     }
 
     // Entry functions live in one table rather than a local each: the runtime already declares most of the
@@ -58,7 +67,7 @@ local function run(options: RunOptions?): RunResult
     host.stdinAt = 1
     host.output = {{{{}}, {{}}}}
     host.writers = {{settings.stdout, settings.stderr}}
-    host.files = table.clone(settings.files or {{}})
+    host.load(settings.files, settings.cwd)
     process.yield = settings.yield
     process.yieldInterval = settings.yieldInterval or 0.05
     process.yieldAt = os.clock()
@@ -81,7 +90,7 @@ local function run(options: RunOptions?): RunResult
         hostClose(fd)
     end
     return {{exitCode = code, stdout = table.concat(host.output[1]), stderr = table.concat(host.output[2]),
-        files = host.files}}
+        files = host.results()}}
 end
 
 return run

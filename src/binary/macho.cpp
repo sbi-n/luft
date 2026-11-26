@@ -21,6 +21,7 @@ struct MachUnit {
     std::size_t regionCount;
     std::string_view name;
     Bytes fixups;
+    Bytes functionStarts;
     Symbols definitions;
     Symbols exports;
     std::vector<std::string_view> dependencies;
@@ -28,6 +29,7 @@ struct MachUnit {
     std::optional<std::uint64_t> entry = {};
     // Thread-local templates and the descriptors that address them.
     std::optional<std::size_t> threadTemplate = {};
+    std::size_t threadTemplateSize = 0;
     std::vector<std::pair<std::size_t, std::size_t>> threadDescriptors = {};
     // __TEXT,__eh_frame and __TEXT,__unwind_info as mapped.
     std::pair<std::size_t, std::size_t> frames = {};
@@ -258,7 +260,7 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
     std::vector<std::string_view> dependencies;
     std::string_view name;
     std::optional<std::uint64_t> entry;
-    Bytes symbols, strings, fixups;
+    Bytes symbols, strings, fixups, functionStarts;
     std::optional<std::uint64_t> base;
     std::size_t offset = 0;
     for (std::size_t i = 0; i < commandCount; ++i) {
@@ -274,6 +276,9 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
             case 0x02:
                 symbols = slice(file, read(command, 8, 4), read(command, 12, 4) * 16);
                 strings = slice(file, read(command, 16, 4), read(command, 20, 4));
+                break;
+            case 0x26: // LC_FUNCTION_STARTS: ULEB128 deltas from the image base.
+                functionStarts = slice(file, read(command, 8, 4), read(command, 12, 4));
                 break;
             case 0x80000034:
                 fixups = slice(file, read(command, 8, 4), read(command, 12, 4));
@@ -305,6 +310,7 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
     const auto firstRegion = image.regions.size();
     std::vector<MachUnit::InitSection> initSections;
     std::optional<std::size_t> threadTemplate;
+    std::size_t threadTemplateEnd = 0;
     std::vector<std::pair<std::size_t, std::size_t>> threadDescriptors;
     std::pair<std::size_t, std::size_t> frames, compact;
     for (const auto segment : segments) {
@@ -327,6 +333,8 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
                 initSections.push_back({mappedBase + address - *base, length, type == 9 ? 8u : 4u});
             if ((type == 0x11 || type == 0x12) && !threadTemplate)
                 threadTemplate = mappedBase + address - *base;
+            if (type == 0x11 || type == 0x12)
+                threadTemplateEnd = std::max<std::size_t>(threadTemplateEnd, mappedBase + address - *base + length);
             if (type == 0x13)
                 threadDescriptors.emplace_back(mappedBase + address - *base, length);
             const auto sectionName = std::string_view(reinterpret_cast<const char*>(section.data()),
@@ -338,10 +346,41 @@ MachUnit mapMachO(Image& image, Architecture architecture, Bytes file, std::size
         }
     }
 
-    return {*base, mappedBase, firstRegion, image.regions.size() - firstRegion, name, fixups,
+    return {*base, mappedBase, firstRegion, image.regions.size() - firstRegion, name, fixups, functionStarts,
         definedSymbols(symbols, strings), definedSymbols(symbols, strings, true),
-        std::move(dependencies), std::move(initSections), entry, threadTemplate, std::move(threadDescriptors),
+        std::move(dependencies), std::move(initSections), entry, threadTemplate,
+        threadTemplate ? threadTemplateEnd - *threadTemplate : 0, std::move(threadDescriptors),
         frames, compact};
+}
+
+void appendFunctionRanges(const Image& image, const MachUnit& unit, ProgramOptions& program) {
+    const auto regions = std::span(image.regions).subspan(unit.firstRegion, unit.regionCount);
+    auto bytes = unit.functionStarts;
+    auto pc = unit.offset;
+    while (!bytes.empty() && bytes.front() != 0) {
+        std::size_t delta = 0;
+        for (unsigned shift = 0;; shift += 7) {
+            if (bytes.empty() || shift >= 28)
+                throw std::runtime_error("invalid Mach-O function start delta");
+            const auto byte = bytes.front();
+            bytes = bytes.subspan(1);
+            delta |= std::size_t(byte & 0x7f) << shift;
+            if (!(byte & 0x80))
+                break;
+        }
+        if (!delta || delta > image.bytes.size() - pc)
+            throw std::runtime_error("invalid Mach-O function start");
+        pc += delta;
+        const auto region = std::ranges::find_if(regions, [&](const GuestRegion& r) {
+            return r.executable && pc >= r.start && pc < r.end;
+        });
+        if (region != regions.end()) {
+            auto& ranges = program.functionRanges;
+            if (!ranges.empty() && pc < ranges.back().second)
+                ranges.back().second = pc;
+            ranges.emplace_back(pc, region->end);
+        }
+    }
 }
 
 void appendInitializers(const Image& image, const MachUnit& unit, std::vector<std::size_t>& initializers) {
@@ -393,16 +432,23 @@ std::string binary::recompileMachO(Architecture architecture, Bytes file,
     std::optional<std::size_t> stackGuard;
     std::optional<std::size_t> runeLocale;
     for (const auto& unit : units) {
+        if (architecture == Architecture::Arm64)
+            appendFunctionRanges(image, unit, program);
         if (!unit.fixups.empty())
             applyFixups(image, units, unit, imports, functionPointers, bindings, stackGuard, runeLocale, streams, program);
         auto unitObjects = dataObjects(image, unit);
         objects.insert(objects.end(), unitObjects.begin(), unitObjects.end());
         // A single guest thread keeps each thread-local variable in its template. The descriptor's key word,
         // which dyld fills with a pthread key, instead records where the template starts.
-        if (unit.threadTemplate)
+        if (unit.threadTemplate) {
             for (const auto& [start, size] : unit.threadDescriptors)
                 for (std::size_t at = start; at + 24 <= start + size; at += 24)
                     image.relocate(at + 8, *unit.threadTemplate);
+            // Guest threads besides the main one copy the template's initial bytes.
+            const auto first = image.bytes.begin() + std::ptrdiff_t(*unit.threadTemplate);
+            program.threadTemplates.emplace_back(*unit.threadTemplate,
+                std::string(first, first + std::ptrdiff_t(unit.threadTemplateSize)));
+        }
     }
     if (runeLocale)
         objects.push_back({*runeLocale, RuneLocaleSize});

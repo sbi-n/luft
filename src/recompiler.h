@@ -63,10 +63,17 @@ struct ProgramOptions {
     std::size_t imageBase = 0;
     // Where the guest's unwinders find each mapped object's exception metadata.
     std::vector<UnwindObject> unwindObjects = {};
+    // Function extents reported by the image, as half-open guest address ranges.
+    std::vector<std::pair<std::size_t, std::size_t>> functionRanges = {};
+    // Darwin thread-local templates by address, with their initial bytes, for guest threads' copies.
+    std::vector<std::pair<std::size_t, std::string>> threadTemplates = {};
+    // ELF thread-local blocks by address, with their initial bytes: switching guest threads swaps their contents.
+    std::vector<std::pair<std::size_t, std::string>> threadBlocks = {};
 };
 
-// The guest stack sits right after the image. Executables get a larger one than raw code.
-inline constexpr std::size_t MappedStackSize = 1 << 20;
+// The guest stack sits right after the image. Executables get a larger one than raw code: eight megabytes, the
+// main thread's stack on Linux and macOS, which deeply recursive programs such as parsers rely on.
+inline constexpr std::size_t MappedStackSize = 8 << 20;
 inline constexpr std::size_t RawStackSize = 1 << 16;
 
 struct GuestExport {

@@ -192,6 +192,8 @@ def app_spec(source: Path):
     spec.setdefault("files", {})
     spec.setdefault("env", [])
     spec.setdefault("outputs", [])
+    # Targets the app does not build for, such as Windows for what msvcrt formats differently from glibc.
+    spec.setdefault("skip", [])
     return spec
 
 
@@ -214,8 +216,9 @@ def build_apps(work: Path, apps, targets, levels):
     linux = []
     for app in apps:
         cxx = app.suffix == ".cpp"
+        skipped = app_spec(app)["skip"]
         for target in targets:
-            if cxx and target not in CXX_TARGETS:
+            if (cxx and target not in CXX_TARGETS) or target in skipped:
                 continue
             for level in levels:
                 name = f"{app.stem}-{target}-{level}"
@@ -254,6 +257,7 @@ def native_apps(work: Path, executables, specs):
         scratch = work / f"run-{path.name}"
         scratch.mkdir(exist_ok=True)
         for name, content in spec["files"].items():
+            (scratch / name).parent.mkdir(parents=True, exist_ok=True)
             (scratch / name).write_bytes(content.encode("latin-1"))
         if target.endswith("macho"):
             env = dict(item.split("=", 1) for item in spec["env"])
@@ -264,13 +268,15 @@ def native_apps(work: Path, executables, specs):
             results[key] = app_report(result.returncode, result.stdout.decode("latin-1"),
                                       result.stderr.decode("latin-1"), files)
         else:
-            (scratch / "stdin").write_bytes(spec["stdin"].encode("latin-1"))
+            # The streams and status sit beside the program's working directory, not in it.
+            (work / f"{scratch.name}.stdin").write_bytes(spec["stdin"].encode("latin-1"))
             runner = f"qemu-x86_64 -0 {shlex.quote(spec['args'][0])} -L /usr/x86_64-linux-gnu" \
                 if target == "x86_64-elf" else f"bash -c 'exec -a \"$0\" \"$@\"' {shlex.quote(spec['args'][0])}"
             arguments = " ".join(shlex.quote(a) for a in spec["args"][1:])
             env = " ".join(shlex.quote(e) for e in spec["env"])
             linux.append((key, f"cd {shlex.quote(scratch.name)} && env -i {env} {runner} ../{path.name} {arguments} "
-                               f"< stdin > stdout 2> stderr; echo $? > status"))
+                               f"< ../{scratch.name}.stdin > ../{scratch.name}.stdout 2> ../{scratch.name}.stderr; "
+                               f"echo $? > ../{scratch.name}.status"))
     if linux:
         docker(work, " ; ".join(f"( {command} )" for _, command in linux))
         for key, _ in linux:
@@ -278,8 +284,8 @@ def native_apps(work: Path, executables, specs):
             spec = specs[key[0]]
             files = {name: (scratch / name).read_bytes().decode("latin-1") for name in spec["outputs"]
                      if (scratch / name).exists()}
-            results[key] = app_report(int((scratch / "status").read_text()), (scratch / "stdout").read_bytes().decode("latin-1"),
-                                      (scratch / "stderr").read_bytes().decode("latin-1"), files)
+            stream = lambda kind: (work / f"{scratch.name}.{kind}").read_bytes().decode("latin-1")
+            results[key] = app_report(int(stream("status")), stream("stdout"), stream("stderr"), files)
     for key in executables:
         if key[1] == "x86_64-pe":
             results[key] = results.get((key[0], "x86_64-elf", key[2]))

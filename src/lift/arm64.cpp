@@ -52,6 +52,108 @@ std::optional<Instruction> decodeArmSimd(std::uint32_t word) {
         return instruction;
     };
 
+    if (((word & 0x9f20fc00) == 0x0e208000 || (word & 0x9f20fc00) == 0x0e20a000) && type < 3) {
+        // SMLAL, UMLAL, SMLSL, and UMLSL: products of the widened halves accumulate into the wide destination.
+        const unsigned bits = 8u << type;
+        const auto op = bits < 32 ? LaneOp::Mul : u ? LaneOp::MulWideUnsigned : LaneOp::MulWideSigned;
+        const VectorRegister second{VectorTemp2};
+        const auto accumulate = (word & 0x2000) ? LaneOp::Sub : LaneOp::Add;
+        return withTemp(VectorWiden{temp, vm, bits, 0, q, !u}, {VectorWiden{second, vn, bits, 0, q, !u},
+            VectorLanes{op, bits / 4, temp, second, temp}, VectorLanes{accumulate, bits / 4, vd, temp, vd}});
+    }
+    if ((word & 0x9f20fc00) == 0x0e20c000 && type < 3) {
+        // SMULL and UMULL: halves of both operands widen to twice their width and multiply; the 2 forms take the
+        // upper halves.
+        const unsigned bits = 8u << type;
+        const auto op = bits < 32 ? LaneOp::Mul : u ? LaneOp::MulWideUnsigned : LaneOp::MulWideSigned;
+        return withTemp(VectorWiden{temp, vm, bits, 0, q, !u},
+            {VectorWiden{vd, vn, bits, 0, q, !u}, VectorLanes{op, bits / 4, vd, temp, vd}});
+    }
+    if ((word & 0xbfa0fc00) == 0x0e20cc00 || (word & 0xbfa0fc00) == 0x0ea0cc00) {
+        // FMLA and FMLS (vector).
+        const unsigned element = word & 0x00400000 ? 8 : 4;
+        if (element == 8 && !q)
+            return std::nullopt;
+        return Instruction{VectorFusedMultiply{element, vd, vn, vm, std::nullopt, bool(word & 0x00800000), width}};
+    }
+    if ((word & 0x9f3e0c00) == 0x0e200800 && ((word >> 12) & 0x1e) == 0x18 && (!(word & 0x00400000) || q)) {
+        // FRINTN, FRINTM, FRINTP, FRINTZ, FRINTA, FRINTX, FRINTI (vector). X and I round as the default mode does.
+        const bool o2 = word & 0x00800000, low = !((word >> 12) & 1);
+        const auto op = u ? (low && !o2 ? FloatLaneOp::RoundAway : o2 && low ? std::optional<FloatLaneOp>{}
+                                                                             : FloatLaneOp::RoundEven)
+                          : low ? (o2 ? FloatLaneOp::Ceil : FloatLaneOp::RoundEven) : (o2 ? FloatLaneOp::Truncate : FloatLaneOp::Floor);
+        if (!op)
+            return std::nullopt;
+        return Instruction{VectorFloatLanes{*op, word & 0x00400000 ? 8u : 4u, vd, vn, std::nullopt, width}};
+    }
+    if ((word & 0x9f000400) == 0x0f000000 || (word & 0xdf000400) == 0x5f000000) {
+        // Operations with one element of Vm, in vector forms and scalar ones (bits 28 and 30 set).
+        const bool scalarForm = word & 0x10000000;
+        const auto opcode = (word >> 12) & 15;
+        const unsigned size = (word >> 22) & 3;
+        const bool h = word & 0x800, l = word & 0x200000, m = word & 0x100000;
+        if (size >= 2 && (opcode == 1 || opcode == 5 || opcode == 9) && !u) {
+            // FMUL, FMLA, FMLS: Vm is any register; S lanes index by H:L, D lanes by H.
+            const bool single = size == 2;
+            if (!single && (l || (!q && !scalarForm)))
+                return std::nullopt;
+            const unsigned lane = single ? (h ? 2u : 0u) | (l ? 1u : 0u) : (h ? 1u : 0u);
+            const unsigned element = single ? 4 : 8;
+            const unsigned length = scalarForm ? element : width;
+            if (opcode == 9)
+                return Instruction{VectorFloatLanes{FloatLaneOp::Mul, element, vd, vm, vn, length, lane}};
+            return Instruction{VectorFusedMultiply{element, vd, vn, vm, lane, opcode == 5, length}};
+        }
+        if (scalarForm || (size != 1 && size != 2))
+            return std::nullopt;
+        // Integer forms: 16-bit lanes index by H:L:M with Vm from v0-v15, 32-bit lanes by H:L.
+        const unsigned element = 1u << size;
+        const unsigned lane = size == 1 ? (h ? 4u : 0u) | (l ? 2u : 0u) | (m ? 1u : 0u) : (h ? 2u : 0u) | (l ? 1u : 0u);
+        const VectorRegister source{size == 1 ? rm & 15 : rm};
+        std::array<std::uint8_t, 16> bytes{};
+        for (unsigned i = 0; i < 16; ++i)
+            bytes[i] = std::uint8_t(lane * element + i % element);
+        const Effect broadcast = VectorPermute{temp, source, source, bytes};
+        const bool accumulate = u && (opcode == 0 || opcode == 4);
+        if ((opcode == 8 && !u) || accumulate) {
+            // MUL, MLA, MLS (by element).
+            if (!accumulate)
+                return withTemp(broadcast, {VectorLanes{LaneOp::Mul, element, vd, temp, vn, width}});
+            return withTemp(broadcast, {VectorLanes{LaneOp::Mul, element, temp, vn, temp, width},
+                VectorLanes{opcode == 4 ? LaneOp::Sub : LaneOp::Add, element, vd, temp, vd, width}});
+        }
+        if (opcode == 14 && size == 2)
+            // SDOT and UDOT (by element): every lane's four bytes multiply one four-byte group of Vm.
+            return withTemp(broadcast,
+                {VectorBinary{u ? VectorOp::DotUnsignedBytes : VectorOp::DotSignedBytes, vd, temp, vn, width}});
+        if (opcode == 10) {
+            // SMULL and UMULL (by element): the 2 forms take Vn's upper half.
+            const unsigned bits = element * 8;
+            const auto op = bits < 32 ? LaneOp::Mul : u ? LaneOp::MulWideUnsigned : LaneOp::MulWideSigned;
+            return withTemp(broadcast, {VectorWiden{temp, temp, bits, 0, false, !u}, VectorWiden{vd, vn, bits, 0, q, !u},
+                VectorLanes{op, bits / 4, vd, temp, vd}});
+        }
+        return std::nullopt;
+    }
+    if ((word & 0xbf80b400) == 0x0f801000) {
+        // FMLA and FMLS (by element): every lane multiplies one lane of Vm.
+        const bool single = !(word & 0x00400000);
+        if ((!single && (word & 0x00200000)) || (!single && !q))
+            return std::nullopt;
+        const unsigned lane = single ? ((word >> 10) & 2) | ((word >> 21) & 1) : (word >> 11) & 1;
+        return Instruction{VectorFusedMultiply{single ? 4u : 8u, vd, vn, vm, lane, bool(word & 0x4000), width}};
+    }
+    if ((word & 0x9f20cc00) == 0x0e200000 && type < 3) {
+        // SADDL, SADDW, SSUBL, SSUBW and their unsigned forms: a half of Vm's elements widens to twice its width
+        // and joins Vn's, which widen too in the L forms. The 2 forms take the upper halves.
+        const unsigned bits = 8u << type;
+        const auto op = (word >> 12) & 2 ? LaneOp::Sub : LaneOp::Add;
+        const bool wideFirst = (word >> 12) & 1;
+        if (wideFirst)
+            return withTemp(VectorWiden{temp, vm, bits, 0, q, !u}, {VectorLanes{op, bits / 4, vd, temp, vn}});
+        return withTemp(VectorWiden{temp, vm, bits, 0, q, !u},
+            {VectorWiden{vd, vn, bits, 0, q, !u}, VectorLanes{op, bits / 4, vd, temp, vd}});
+    }
     if ((word & 0xff201fe0) == 0x1e201000) {
         if (type > 1)
             unsupported();
@@ -355,12 +457,33 @@ std::optional<Instruction> decodeArmSimd(std::uint32_t word) {
             case 0x01: op = u ? LaneOp::AddSaturateUnsigned : LaneOp::AddSaturateSigned; break;
             case 0x05: op = u ? LaneOp::SubSaturateUnsigned : LaneOp::SubSaturateSigned; break;
             case 0x02: if (u) op = LaneOp::AverageUnsigned; break;
+            case 0x17: if (!u) op = LaneOp::AddPairs; break;
+            case 0x14: if (size < 3) op = u ? LaneOp::MaxPairsUnsigned : LaneOp::MaxPairsSigned; break;
+            case 0x15: if (size < 3) op = u ? LaneOp::MinPairsUnsigned : LaneOp::MinPairsSigned; break;
             case 0x12:
                 return withTemp(VectorLanes{LaneOp::Mul, element, temp, vm, vn, width},
                     {VectorLanes{u ? LaneOp::Sub : LaneOp::Add, element, vd, temp, vd, width}});
         }
         if (op)
             return Instruction{VectorLanes{*op, element, vd, vm, vn, width}};
+        return std::nullopt;
+    }
+    if ((word & 0xdfe0fc00) == 0x5ee08400)
+        // ADD and SUB on scalar D registers.
+        return Instruction{VectorLanes{u ? LaneOp::Sub : LaneOp::Add, 8, vd, vm, vn, 8}};
+    if ((word & 0xdf800400) == 0x5f000400 && ((word >> 19) & 8)) {
+        // SSHR, USHR, SSRA, USRA, and SHL on a scalar D register: a 64-bit lane whose upper half clears.
+        const auto immediate = (word >> 16) & 0x7f;
+        const auto opcode = (word >> 11) & 0x1f;
+        const auto right = 128 - immediate;
+        const auto op = u ? ShiftOp::LogicalRight : ShiftOp::ArithmeticRight;
+        if (opcode == 0x00)
+            return Instruction{VectorShiftLanes{op, 8, vd, vn, right, std::nullopt, 8}};
+        if (opcode == 0x02)
+            return withTemp(VectorShiftLanes{op, 8, temp, vn, right, std::nullopt, 8},
+                {VectorLanes{LaneOp::Add, 8, vd, temp, vd, 8}});
+        if (opcode == 0x0a && !u)
+            return Instruction{VectorShiftLanes{ShiftOp::Left, 8, vd, vn, immediate - 64, std::nullopt, 8}};
         return std::nullopt;
     }
     if ((word & 0x9f800400) == 0x0f000400 && ((word >> 19) & 15) != 0) {
@@ -387,11 +510,15 @@ std::optional<Instruction> decodeArmSimd(std::uint32_t word) {
                 {VectorConvert{LaneConversion::Narrow, vd, temp, element * 2, q}});
         return std::nullopt;
     }
+    if ((word & 0xbfe08c00) == 0x0e000000) {
+        // TBL and TBX with one to four table registers.
+        return Instruction{VectorTable{vd, vn, ((word >> 13) & 3) + 1, vm, bool(word & 0x1000), width}};
+    }
     if ((word & 0xbf9f0000) == 0x0d000000 || (word & 0xbf800000) == 0x0d800000) {
-        // LD1 (single structure) and LD1R, with optional post-index.
+        // LD1 and ST1 (single structure) and LD1R, with optional post-index.
         const bool load = word & 0x00400000;
         const bool replicate = (word >> 13 & 7) == 6;
-        if (!load || (word & 0x00200000))
+        if ((word & 0x00200000) || (!load && replicate))
             return std::nullopt;
         const auto opcode = (word >> 13) & 7;
         const auto size = (word >> 10) & 3;
@@ -410,7 +537,8 @@ std::optional<Instruction> decodeArmSimd(std::uint32_t word) {
         } else {
             unsupported();
         }
-        Instruction instruction{VectorLaneLoad{element, vd, lane, {rn, 0}, replicate, width}};
+        Instruction instruction = load ? Instruction{VectorLaneLoad{element, vd, lane, {rn, 0}, replicate, width}}
+                                       : Instruction{VectorLaneStore{element, vd, lane, {rn, 0}}};
         if (word & 0x00800000) {
             if (rm == 31)
                 instruction.after.push_back(Binary{BinaryOp::Add, 8, rn, rn, immediate(element), false});
@@ -420,9 +548,24 @@ std::optional<Instruction> decodeArmSimd(std::uint32_t word) {
         return instruction;
     }
     if ((word & 0xbfbf0000) == 0x0c000000 || (word & 0xbfa00000) == 0x0c800000) {
-        // LD1/ST1 (multiple structures) with one to four consecutive registers.
+        // LD1/ST1 (multiple structures) with one to four consecutive registers, and LD2-LD4/ST2-ST4, which
+        // interleave elements across two to four registers.
         const bool load = word & 0x00400000;
         const auto opcode = (word >> 12) & 15;
+        const unsigned interleaved = opcode == 0 ? 4 : opcode == 4 ? 3 : opcode == 8 ? 2 : 0;
+        if (interleaved) {
+            const auto element = 1u << ((word >> 10) & 3);
+            if (element == 8 && !q)
+                return std::nullopt;
+            Instruction instruction{InterleavedTransfer{vd, {rn, 0}, element, interleaved, width, !load}};
+            if (word & 0x00800000) {
+                if (rm == 31)
+                    instruction.after.push_back(Binary{BinaryOp::Add, 8, rn, rn, immediate(interleaved * width), false});
+                else
+                    instruction.after.push_back(Binary{BinaryOp::Add, 8, rn, rn, Register{rm}, false});
+            }
+            return instruction;
+        }
         const unsigned count = opcode == 7 ? 1 : opcode == 10 ? 2 : opcode == 6 ? 3 : opcode == 2 ? 4 : 0;
         if (!count)
             return std::nullopt;
@@ -466,6 +609,15 @@ Instruction decodeArm(Reader& reader) {
         return {}; // Hints (NOP, BTI, PAC) and barriers have no single-threaded effect.
     if ((word & 0xffffffe0) == 0xd53bd040 && reader.threadPointer) // MRS Xt, TPIDR_EL0: the Linux thread pointer.
         return {Move{8, rd == 31 ? Zero : rd, Immediate{std::uint64_t(reader.threadPointer)}}};
+    // MRS Xt, FPCR and FPSR: the default control (round to nearest, no traps) and no exception flags, as software
+    // floating point (libgcc's soft-fp) reads them. Like x86's MXCSR, a control other than the default is
+    // unsupported; written exception flags are not kept.
+    if ((word & 0xffffffe0) == 0xd53b4400 || (word & 0xffffffe0) == 0xd53b4420)
+        return {Move{8, rd == 31 ? Zero : rd, Immediate{0}}};
+    if ((word & 0xffffffe0) == 0xd51b4400)
+        return {FloatingControlWrite{rd == 31 ? Zero : rd}};
+    if ((word & 0xffffffe0) == 0xd51b4420)
+        return {};
     if ((word & 0xffe0001f) == 0xd4200000 || (word & 0xffe0001f) == 0xd4400000 || (word >> 16) == 0)
         return {.end = Trap{std::format("guest trap instruction at guest offset {}", pc)}};
     if ((word & 0xfffffc1f) == 0xd65f0000)
@@ -601,10 +753,37 @@ Instruction decodeArm(Reader& reader) {
         return {BitScan{size, armReg(rd), Register{armReg(rn)}, true, true}};
     if ((word & 0xfffffc00) == 0x5ac00800 || (word & 0xfffffc00) == 0xdac00c00)
         return {ByteSwap{size, armReg(rd), Register{armReg(rn)}}};
+    // REV16 swaps the bytes of each halfword, and REV32 those of each word of a 64-bit register.
+    if ((word & 0x7ffffc00) == 0x5ac00400)
+        return {ByteSwap{size, armReg(rd), Register{armReg(rn)}, false, 2}};
+    if ((word & 0xfffffc00) == 0xdac00800)
+        return {ByteSwap{8, armReg(rd), Register{armReg(rn)}, false, 4}};
     if ((word & 0x7ffffc00) == 0x5ac00000)
         return {ByteSwap{size, armReg(rd), Register{armReg(rn)}, true}};
-    if ((word & 0xbf20fc00) == 0xb8200000)
-        return {AtomicAdd{size, {rn, 0}, Register{armReg(rm)}, armReg(rd)}};
+    if ((word & 0x3f200c00) == 0x38200000) {
+        // LSE atomics in every size and ordering (the A and R bits order memory, which one thread never needs).
+        const unsigned width = 1u << (word >> 30);
+        const auto opc = (word >> 12) & 7;
+        if (!(word & 0x8000)) {
+            constexpr std::array ops{AtomicOp::Add, AtomicOp::Clear, AtomicOp::Xor, AtomicOp::Set, AtomicOp::SignedMax,
+                AtomicOp::SignedMin, AtomicOp::UnsignedMax, AtomicOp::UnsignedMin};
+            return {AtomicUpdate{width, {rn, 0}, Register{armReg(rm)}, armReg(rd), ops[opc]}};
+        }
+        if (opc == 0)
+            return {AtomicUpdate{width, {rn, 0}, Register{armReg(rm)}, armReg(rd), AtomicOp::Swap}};
+        if (opc == 4 && rm == 31) {
+            // LDAPR: a load-acquire.
+            if (width < 4)
+                return {Extend{4, armReg(rd), Memory{{rn, 0}}, width * 8, 0, false}};
+            return {Move{width, armReg(rd), Memory{{rn, 0}}}};
+        }
+        unsupported();
+    }
+    if ((word & 0x3fa07c00) == 0x08a07c00) {
+        // CAS, CASA, CASL, CASAL and their byte and halfword forms.
+        const unsigned width = 1u << (word >> 30);
+        return {CompareSwap{width, {rn, 0}, armReg(rm), Register{armReg(rd)}}};
+    }
     // Exclusive loads and stores. The guest runs on one thread, so a store-exclusive always succeeds.
     if ((word & 0x3fff7c00) == 0x085f7c00 || (word & 0x3fe07c00) == 0x08007c00) {
         const unsigned width = 1u << (word >> 30);
@@ -730,17 +909,25 @@ Instruction decodeArm(Reader& reader) {
         return {VectorByteOperation{VectorRegister{rd}, VectorRegister{rn}, word & 0x40000000 ? 16u : 8u,
             byteOp == 0x2e303800}};
     const auto vectorLogic = word & 0xbfe0fc00;
-    if (vectorLogic == 0x2e809400)
-        return {VectorBinary{VectorOp::DotUnsignedBytes, VectorRegister{rd}, VectorRegister{rm},
-            VectorRegister{rn}, word & 0x40000000 ? 16u : 8u}};
+    if (vectorLogic == 0x2e809400 || vectorLogic == 0x0e809400)
+        // UDOT and SDOT: each 32-bit lane adds the products of its four bytes.
+        return {VectorBinary{vectorLogic == 0x2e809400 ? VectorOp::DotUnsignedBytes : VectorOp::DotSignedBytes,
+            VectorRegister{rd}, VectorRegister{rm}, VectorRegister{rn}, word & 0x40000000 ? 16u : 8u}};
     if (vectorLogic == 0x2e603c00 || vectorLogic == 0x2ea03c00)
         return {VectorBinary{vectorLogic == 0x2e603c00 ? VectorOp::CompareUnsignedWords : VectorOp::CompareUnsignedDwords,
             VectorRegister{rd}, VectorRegister{rm}, VectorRegister{rn}, word & 0x40000000 ? 16u : 8u}};
-    if ((word & 0xbf80fc00) == 0x2f00a400) {
+    if ((word & 0x9f80fc00) == 0x0f00a400 && (word & 0x00780000)) {
+        // SSHLL and USHLL (SXTL, UXTL): widen each element of a half, then shift it left.
         const auto amount = (word >> 16) & 127;
         const auto bits = std::bit_floor(amount);
-        if (bits == 16 || bits == 32)
-            return {VectorWiden{VectorRegister{rd}, VectorRegister{rn}, bits, amount - bits, bool(word & 0x40000000)}};
+        if (bits <= 32)
+            return {VectorWiden{VectorRegister{rd}, VectorRegister{rn}, bits, amount - bits, bool(word & 0x40000000),
+                !(word & 0x20000000)}};
+    }
+    if ((word & 0xbf3ffc00) == 0x2e213800 && ((word >> 22) & 3) < 3) {
+        // SHLL: widen each element of a half, then shift it left by its width.
+        const unsigned bits = 8u << ((word >> 22) & 3);
+        return {VectorWiden{VectorRegister{rd}, VectorRegister{rn}, bits, bits, bool(word & 0x40000000), false}};
     }
     if (vectorLogic == 0x0e201c00 || vectorLogic == 0x0ea01c00 || vectorLogic == 0x2e201c00) {
         const auto op = vectorLogic == 0x0e201c00 ? VectorOp::And :
@@ -778,10 +965,6 @@ Instruction decodeArm(Reader& reader) {
             return {VectorTransfer{Register{armReg(rn)}, VectorRegister{rd}, true,
                 1u << element, imm >> (element + 1)}};
     }
-    const auto ld4 = word & 0xfffff000;
-    if ((ld4 == 0x4c400000 || ld4 == 0x4cdf0000) && ((word >> 10) & 3) >= 2)
-        return transfer(InterleavedLoad4{VectorRegister{rd}, {rn, 0}, 1u << ((word >> 10) & 3)}, rn,
-            ld4 == 0x4cdf0000 ? 64 : 0);
     if ((word & 0xbff89c00) == 0x0f000400) {
         const auto immediate = ((word >> 11) & 0xe0) | ((word >> 5) & 0x1f);
         const auto lane = immediate << (((word >> 13) & 3) * 8);

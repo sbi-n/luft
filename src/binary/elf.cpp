@@ -346,8 +346,9 @@ void relocate(const Sections& sections, std::span<std::uint8_t> image,
                 }))
                     functionPointers.push_back(*result);
             } else {
+                // Absolute relocations to functions fill tables of function pointers, such as SQLite's system calls.
                 const bool callable = read(symbol, 6, 2) == 0 &&
-                    (type == jump || (type == global && (symbol[4] & 15) == 2));
+                    (type == jump || ((type == global || (type == absolute && addend == 0)) && (symbol[4] & 15) == 2));
                 imports.push_back({std::size_t(at), std::size_t(width),
                     name.empty() ? "unknown ELF relocation" : name, callable, false, {}, type == copy});
             }
@@ -735,6 +736,12 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
         if (object.frames)
             binary::frameLandingPads(image, object.frames, object.framesSize, program.landingPads);
     }
+    // Code reaches thread-local variables at a fixed thread pointer, so switching guest threads swaps the
+    // contents of every object's block.
+    for (const auto& unit : units)
+        if (unit.tls && unit.tls->size)
+            program.threadBlocks.emplace_back(unit.tls->start, std::string(image.begin() + std::ptrdiff_t(unit.tls->start),
+                image.begin() + std::ptrdiff_t(unit.tls->start + unit.tls->size)));
     return recompileMapped(architecture, image, mapped, regions, imports, objects, initializers,
         CallingConvention::Native, bindings, functionPointers, {}, program);
 }

@@ -75,6 +75,10 @@ void recoverRelativeX64Table(Address pc, Jump& jump, const std::map<Address, Ins
         return &at->second;
     };
     const auto* inst = previous();
+    // Instructions the compiler scheduled between the sum and the jump leave the target alone.
+    for (unsigned skipped = 0; inst && skipped < 4 && !inst->end && inst->after.empty() &&
+        !writesRegister(inst->effect, target->index); ++skipped)
+        inst = previous();
     const auto* add = inst ? std::get_if<Binary>(&inst->effect) : nullptr;
     const auto* base = add ? std::get_if<Register>(&add->rhs) : nullptr;
     if (!add || !base || add->op != BinaryOp::Add || add->size != 8 || add->count ||
@@ -205,8 +209,56 @@ struct GapDecoder {
     const std::map<Address, std::vector<Address>>* edges = nullptr;
     // Known function entries: values of registers are undefined there.
     const std::set<Address>* functions = nullptr;
+    // Entries known only because code takes their address, which ADR also does for labels inside a function,
+    // such as the base of a jump table's cases.
+    const std::set<Address>* taken = nullptr;
+    // The stack pointer, whose slots hold spilled values.
+    unsigned stack = Zero;
+    // Import slots of functions that never return.
+    const std::set<Address>* noReturnSlots = nullptr;
 };
 thread_local GapDecoder* gapDecoder = nullptr;
+
+// Whether a call can return to the instruction after it: not when it calls an import that never returns, through
+// its slot or a stub (a PLT entry, or a Darwin stub) that jumps through the slot.
+bool callReturns(const Instructions& instructions, const Call& call) {
+    if (!gapDecoder || !gapDecoder->noReturnSlots || gapDecoder->noReturnSlots->empty())
+        return true;
+    const auto slotOf = [](const Value& target) -> std::optional<Address> {
+        if (const auto* memory = std::get_if<Memory>(&target);
+            memory && memory->address.base == Zero && memory->address.index == Zero)
+            return memory->address.displacement;
+        return std::nullopt;
+    };
+    auto slot = slotOf(call.target);
+    if (const auto* start = std::get_if<Immediate>(&call.target); start && !slot) {
+        std::map<unsigned, Address> constants, loaded;
+        auto at = instructions.find(Address(start->value));
+        for (unsigned steps = 0; at != instructions.end() && steps < 4; ++steps) {
+            const auto& inst = at->second;
+            if (const auto* move = std::get_if<Move>(&inst.effect); move && move->size == 8) {
+                if (const auto* value = std::get_if<Immediate>(&move->src))
+                    constants[move->dst] = Address(value->value);
+                else if (const auto* memory = std::get_if<Memory>(&move->src);
+                    memory && memory->address.index == Zero && constants.contains(memory->address.base))
+                    loaded[move->dst] = constants[memory->address.base] + memory->address.displacement;
+                else if (const auto found = slotOf(move->src))
+                    loaded[move->dst] = *found;
+            }
+            if (inst.end) {
+                if (const auto* jump = std::get_if<Jump>(&*inst.end)) {
+                    if (const auto* reg = std::get_if<Register>(&jump->target); reg && loaded.contains(reg->index))
+                        slot = loaded[reg->index];
+                    else
+                        slot = slotOf(jump->target);
+                }
+                break;
+            }
+            at = instructions.find(inst.next);
+        }
+    }
+    return !slot || !gapDecoder->noReturnSlots->contains(*slot);
+}
 
 const Instruction* previousInstruction(const Instructions& instructions, Address& cursor) {
     auto at = instructions.lower_bound(cursor);
@@ -250,6 +302,7 @@ const Instruction* previousInstruction(const Instructions& instructions, Address
 
 std::optional<Address> resolveRegister(const Instructions& instructions, Address pc, unsigned reg, unsigned depth = 0);
 std::optional<Address> resolveLinear(const Instructions& instructions, Address pc, unsigned reg, unsigned depth);
+std::optional<Address> resolveStackSlot(const Instructions& instructions, Address pc, Address offset, unsigned depth);
 
 // Evaluates a definition of `reg` found just before `at`, or nothing when its value is not a constant.
 std::optional<Address> constantDefinition(const Instructions& instructions, const Effect& effect, Address at,
@@ -265,6 +318,10 @@ std::optional<Address> constantDefinition(const Instructions& instructions, cons
             return address->displacement;
         if (const auto* source = std::get_if<Register>(&move->src))
             return resolveRegister(instructions, at, source->index, depth + 1);
+        // A reload of a spilled value, as compilers spill jump-table bases in large functions.
+        if (const auto* memory = std::get_if<Memory>(&move->src); memory && gapDecoder &&
+            gapDecoder->stack != Zero && memory->address.base == gapDecoder->stack && memory->address.index == Zero)
+            return resolveStackSlot(instructions, at, memory->address.displacement, depth + 1);
     }
     if (const auto* add = std::get_if<Binary>(&effect); add && add->size == 8 && add->op == BinaryOp::Add &&
         add->dst == reg && !add->count && !add->extendBits && !add->invert && !add->withCarry)
@@ -291,14 +348,18 @@ std::optional<Address> resolveThroughPredecessors(const Instructions& instructio
             continue;
         if (--budget == 0)
             return std::nullopt;
-        // Reaching the function's entry leaves the register with the caller's value.
-        if (cursor != pc && gapDecoder->functions && gapDecoder->functions->contains(cursor))
+        // Reaching the function's entry leaves the register with the caller's value. A taken address that
+        // other code reaches is a label, and the search continues through its predecessors.
+        if (cursor != pc && gapDecoder->functions && gapDecoder->functions->contains(cursor) &&
+            !(gapDecoder->taken && gapDecoder->taken->contains(cursor)))
             return std::nullopt;
         std::vector<std::pair<Address, const Instruction*>> predecessors;
         if (auto at = instructions.lower_bound(cursor); at != instructions.begin()) {
             --at;
             const auto* end = at->second.end ? &*at->second.end : nullptr;
-            const bool fallsThrough = !end || std::holds_alternative<Branch>(*end) || std::holds_alternative<Call>(*end);
+            const auto* call = end ? std::get_if<Call>(end) : nullptr;
+            const bool fallsThrough = !end || std::holds_alternative<Branch>(*end) ||
+                (call && callReturns(instructions, *call));
             if (at->second.next == cursor && fallsThrough)
                 predecessors.emplace_back(at->first, &at->second);
         }
@@ -308,8 +369,9 @@ std::optional<Address> resolveThroughPredecessors(const Instructions& instructio
                     predecessors.emplace_back(source, &at->second);
         if (predecessors.empty()) {
             // Code without known predecessors is entered through unresolved indirect jumps, typically the
-            // table being recovered; only function entries leave the register undefined.
-            if (gapDecoder->functions && gapDecoder->functions->contains(cursor))
+            // table being recovered, whose cases ADR may take; only function entries leave the register undefined.
+            if (gapDecoder->functions && gapDecoder->functions->contains(cursor) &&
+                !(gapDecoder->taken && gapDecoder->taken->contains(cursor)))
                 return std::nullopt;
             continue;
         }
@@ -332,6 +394,88 @@ std::optional<Address> resolveThroughPredecessors(const Instructions& instructio
             }
             if (!defined)
                 work.push_back(address);
+        }
+    }
+    return found;
+}
+
+// Resolves the eight-byte stack slot `offset` bytes above the stack pointer just before `pc`: every path there must
+// store the same constant in it, and none may move the stack pointer after the store.
+std::optional<Address> resolveStackSlot(const Instructions& instructions, Address pc, Address offset, unsigned depth) {
+    if (!gapDecoder || !gapDecoder->edges || gapDecoder->stack == Zero || depth > 4)
+        return std::nullopt;
+    const auto sp = gapDecoder->stack;
+    const auto entry = [&](Address at) {
+        return gapDecoder->functions && gapDecoder->functions->contains(at) &&
+            !(gapDecoder->taken && gapDecoder->taken->contains(at));
+    };
+    // A store that overlaps the slot without filling it, or stores something other than a register.
+    constexpr unsigned Spoiled = ~0u;
+    std::optional<Address> found;
+    std::set<Address> visited;
+    std::vector<Address> work{pc};
+    unsigned budget = 4096;
+    while (!work.empty()) {
+        const auto cursor = work.back();
+        work.pop_back();
+        if (!visited.insert(cursor).second)
+            continue;
+        if (--budget == 0 || (cursor != pc && entry(cursor)))
+            return std::nullopt;
+        std::vector<std::pair<Address, const Instruction*>> predecessors;
+        if (auto at = instructions.lower_bound(cursor); at != instructions.begin()) {
+            --at;
+            const auto* end = at->second.end ? &*at->second.end : nullptr;
+            const auto* call = end ? std::get_if<Call>(end) : nullptr;
+            const bool fallsThrough = !end || std::holds_alternative<Branch>(*end) ||
+                (call && callReturns(instructions, *call));
+            if (at->second.next == cursor && fallsThrough)
+                predecessors.emplace_back(at->first, &at->second);
+        }
+        if (const auto into = gapDecoder->edges->find(cursor); into != gapDecoder->edges->end())
+            for (const auto source : into->second)
+                if (const auto at = instructions.find(source); at != instructions.end())
+                    predecessors.emplace_back(source, &at->second);
+        if (predecessors.empty()) {
+            if (entry(cursor))
+                return std::nullopt;
+            continue;
+        }
+        for (const auto& [address, inst] : predecessors) {
+            std::vector<const Effect*> effects{&inst->effect};
+            for (const auto& effect : inst->after)
+                effects.push_back(&effect);
+            std::optional<unsigned> stored;
+            for (auto it = effects.rbegin(); it != effects.rend() && !stored; ++it) {
+                const auto& effect = **it;
+                if (writesRegister(effect, sp))
+                    return std::nullopt;
+                // Which register the instruction stores to the slot; a store that only overlaps it spoils it.
+                const auto consider = [&](unsigned size, Address at, unsigned reg) {
+                    if (at == offset && size == 8)
+                        stored = reg;
+                    else if (at < offset + 8 && offset < at + Address(size))
+                        stored = Spoiled;
+                };
+                if (const auto* store = std::get_if<Store>(&effect);
+                    store && store->address.base == sp && store->address.index == Zero) {
+                    const auto* source = std::get_if<Register>(&store->src);
+                    consider(store->size, store->address.displacement, source ? source->index : Spoiled);
+                } else if (const auto* pair = std::get_if<PairTransfer>(&effect);
+                    pair && !pair->load && pair->address.base == sp && pair->address.index == Zero) {
+                    consider(pair->size, pair->address.displacement, pair->first);
+                    if (!stored)
+                        consider(pair->size, pair->address.displacement + Address(pair->size), pair->second);
+                }
+            }
+            if (!stored) {
+                work.push_back(address);
+                continue;
+            }
+            const auto value = *stored == Spoiled ? std::nullopt : resolveRegister(instructions, address, *stored, depth + 1);
+            if (!value || (found && *found != *value))
+                return std::nullopt;
+            found = value;
         }
     }
     return found;
@@ -496,18 +640,64 @@ std::optional<std::size_t> guardedBound(const Instructions& instructions, const 
 
 // Recognizes `movslq (base, index, 4), target; add base, target; jmp *target` where the table base was
 // materialized anywhere earlier in the function.
+// What bounds a table that no compare guards: a switch over every value of an enumeration needs no bounds
+// check, so its table ends where the next data the code refers to begins, and its cases stay in the function.
+struct Unguarded {
+    const std::set<Address>& boundaries;
+    Address functionStart;
+    Address functionEnd;
+};
+
 void recoverHoistedX64Table(Address pc, Jump& jump, const Instructions& instructions, const BranchIndex& branches,
-    std::span<const std::uint8_t> image, std::span<const GuestRegion> regions, References& references) {
+    std::span<const std::uint8_t> image, std::span<const GuestRegion> regions, References& references,
+    const Unguarded* unguarded = nullptr) {
     const auto* target = std::get_if<Register>(&jump.target);
     if (!target)
         return;
     auto cursor = pc;
     const auto* inst = previousInstruction(instructions, cursor);
+    for (unsigned skipped = 0; inst && skipped < 4 && !inst->end && inst->after.empty() &&
+        !writesRegister(inst->effect, target->index); ++skipped)
+        inst = previousInstruction(instructions, cursor);
     const auto* add = inst ? std::get_if<Binary>(&inst->effect) : nullptr;
     const auto* base = add ? std::get_if<Register>(&add->rhs) : nullptr;
     if (!add || !base || add->op != BinaryOp::Add || add->size != 8 || add->count || add->dst != target->index ||
         add->lhs != target->index || base->index == target->index)
         return;
+    // A table that no compare guards: its entries are cases before it, up to the next address the code refers to.
+    const auto scanUnguarded = [&](Address table, Address codeBase) {
+        const bool inlineData = executableEnd(std::size_t(table), image.size(), regions) != 0;
+        const auto next = unguarded->boundaries.upper_bound(table);
+        const auto limit = std::min<std::size_t>(1024, next == unguarded->boundaries.end() ? 1024 : (*next - table) / 4);
+        recordJumpTable(jump, image, regions, references, std::size_t(table), 4, limit, false, codeBase, 1, true,
+            inlineData);
+        if (!jump.destinations.empty() && (jump.destinations.front() < unguarded->functionStart ||
+            jump.destinations.back() >= unguarded->functionEnd)) {
+            jump.destinations.clear();
+            references.tables.pop_back();
+        }
+    };
+    if (unguarded) {
+        // Unoptimized code adds the entry to the table's address instead, so the target holds the table.
+        auto scan = cursor;
+        const Extend* entry = nullptr;
+        for (unsigned skipped = 0; skipped < 4 && !entry; ++skipped) {
+            const auto* prior = previousInstruction(instructions, scan);
+            if (!prior || prior->end)
+                break;
+            if (const auto* extend = std::get_if<Extend>(&prior->effect); extend && extend->dst == base->index)
+                entry = extend;
+            else if (writesRegister(prior->effect, base->index) || writesRegister(prior->effect, target->index))
+                break;
+        }
+        const auto* slot = entry ? std::get_if<Memory>(&entry->src) : nullptr;
+        if (slot && entry->sign && entry->size == 8 && entry->bits == 32 && slot->address.base == target->index &&
+            slot->address.index != Zero && slot->address.index != target->index && slot->address.scale == 4)
+            if (const auto codeBase = resolveRegister(instructions, scan, target->index); codeBase && *codeBase >= 0) {
+                scanUnguarded(*codeBase + slot->address.displacement, *codeBase);
+                return;
+            }
+    }
     const Extend* load = nullptr;
     for (unsigned skipped = 0; skipped < 4 && !load; ++skipped) {
         inst = previousInstruction(instructions, cursor);
@@ -529,16 +719,22 @@ void recoverHoistedX64Table(Address pc, Jump& jump, const Instructions& instruct
     if (table < 0)
         return;
     const auto bound = guardedBound(instructions, branches, cursor, memory->address.index, false);
+    const bool inlineData = executableEnd(std::size_t(table), image.size(), regions) != 0;
+    if (!bound && unguarded) {
+        // Tables among the code end at the first entry that is not a case before them.
+        scanUnguarded(table, *codeBase);
+        return;
+    }
     if (!bound)
         return;
-    const bool inlineData = executableEnd(std::size_t(table), image.size(), regions) != 0;
     recordJumpTable(jump, image, regions, references, std::size_t(table), 4, *bound, true, *codeBase, 1, true, inlineData);
 }
 
 // Recognizes `ldr{b,h,} w, [base, index]; add target, code, w{, sxtb|lsl #n}; br target` with ADR/ADRP
 // materializations of `code` and `base` anywhere earlier in the function.
 void recoverHoistedArmTable(Address pc, Jump& jump, const Instructions& instructions, const BranchIndex& branches,
-    std::span<const std::uint8_t> image, std::span<const GuestRegion> regions, References& references) {
+    std::span<const std::uint8_t> image, std::span<const GuestRegion> regions, References& references,
+    const Unguarded* unguarded = nullptr) {
     const auto* target = std::get_if<Register>(&jump.target);
     if (!target)
         return;
@@ -590,12 +786,42 @@ void recoverHoistedArmTable(Address pc, Jump& jump, const Instructions& instruct
     const auto table = resolveRegister(instructions, loadAt, memory->address.base);
     if (!code || !table || *code < 0 || *table < 0)
         return;
-    const auto bound = guardedBound(instructions, branches, loadAt, memory->address.index, true);
+    auto bound = guardedBound(instructions, branches, loadAt, memory->address.index, true);
+    // A switch on the low bits of a value can mask the index instead of branching on its range.
+    if (!bound && memory->address.scale == width) {
+        auto at = instructions.find(loadAt);
+        while (at != instructions.begin() && at != instructions.end() && !branches.contains(at->first) &&
+            !(gapDecoder && gapDecoder->functions && gapDecoder->functions->contains(at->first))) {
+            const auto next = at->first;
+            const auto& inst = (--at)->second;
+            if (inst.next != next || inst.end || !inst.after.empty())
+                break;
+            if (!writesRegister(inst.effect, memory->address.index))
+                continue;
+            if (const auto* mask = std::get_if<Binary>(&inst.effect); mask && mask->op == BinaryOp::And &&
+                !mask->count && !mask->invert && !mask->extendBits && !mask->withCarry)
+                if (const auto* bits = std::get_if<Immediate>(&mask->rhs); bits && bits->value < 4096 &&
+                    (bits->value & (bits->value + 1)) == 0)
+                    bound = bits->value + 1;
+            break;
+        }
+    }
+    if (!bound && unguarded) {
+        const auto next = unguarded->boundaries.upper_bound(*table);
+        const auto entries = next == unguarded->boundaries.end() ? 0 : std::size_t(*next - *table) / width;
+        if (entries >= 2 && entries <= (width == 1 ? 256u : 1024u))
+            bound = entries;
+    }
     if (!bound)
         return;
     const bool inlineData = executableEnd(std::size_t(*table), image.size(), regions) != 0;
     recordJumpTable(jump, image, regions, references, std::size_t(*table), width, *bound, true, *code,
         1u << sum->count, sign, inlineData);
+    if (unguarded && !jump.destinations.empty() &&
+        (jump.destinations.front() < unguarded->functionStart || jump.destinations.back() >= unguarded->functionEnd)) {
+        jump.destinations.clear();
+        references.tables.pop_back();
+    }
 }
 
 // Evaluates the code between a jump table's bounds check and its indirect jump once per index value.
@@ -934,6 +1160,73 @@ void recoverSimulatedTable(Address pc, Jump& jump, const Instructions& instructi
     }
 }
 
+// A table that no compare guards, read by dispatch code the pattern matchers miss, such as unoptimized code that
+// spills the index: the straight-line run before the jump runs once per value of each register it could take the
+// index from. The register whose value moves the table read by one entry is the index; the table ends at the next
+// address the code refers to, or at the first entry that is not a case of the function.
+void recoverUnguardedSimulatedTable(Address pc, Jump& jump, const Instructions& instructions,
+    std::span<const std::uint8_t> image, std::span<const GuestRegion> regions, References& references,
+    const Unguarded& unguarded, bool arm) {
+    const auto* target = std::get_if<Register>(&jump.target);
+    if (!target)
+        return;
+    std::vector<std::pair<Address, const Instruction*>> run;
+    auto cursor = pc;
+    while (run.size() < 24) {
+        const auto* inst = previousInstruction(instructions, cursor);
+        if (!inst || inst->end)
+            break;
+        run.emplace_back(cursor, inst);
+    }
+    if (run.empty())
+        return;
+    std::ranges::reverse(run);
+    const auto runStart = run.front().first;
+    const auto simulate = [&](unsigned index, std::uint64_t value, TableSimulator& simulator) {
+        simulator.registers[index] = value;
+        for (const auto& [at, inst] : run)
+            simulator.run(*inst);
+        return simulator.failed ? std::nullopt : simulator.registers[target->index];
+    };
+    const unsigned registers = arm ? 31 : 16, stack = arm ? 31 : 4;
+    for (unsigned index = 0; index < registers; ++index) {
+        if (index == stack || index == target->index)
+            continue;
+        TableSimulator first(instructions, image, regions, runStart), second(instructions, image, regions, runStart);
+        if (!simulate(index, 0, first) || !simulate(index, 1, second))
+            continue;
+        // The table read that moves by its own width.
+        std::optional<std::pair<std::size_t, std::size_t>> table;
+        for (const auto& [at, size] : first.reads)
+            if ((size == 1 || size == 2 || size == 4 || size == 8) && second.reads.contains({at + size, size}))
+                table = std::pair{at, size};
+        if (!table)
+            continue;
+        const auto [start, width] = *table;
+        const auto next = unguarded.boundaries.upper_bound(Address(start));
+        const auto limit = std::min<std::size_t>(1024,
+            next == unguarded.boundaries.end() ? 1024 : std::size_t(*next - Address(start)) / width);
+        std::set<Address> destinations;
+        std::size_t count = 0;
+        for (; count < limit; ++count) {
+            TableSimulator simulator(instructions, image, regions, runStart);
+            const auto destination = simulate(index, count, simulator);
+            if (!destination || *destination >= image.size() ||
+                std::size_t(*destination) >= executableEnd(*destination, image.size(), regions) ||
+                (arm && *destination % 4) || Address(*destination) < unguarded.functionStart ||
+                Address(*destination) >= unguarded.functionEnd ||
+                (*destination >= start && *destination < start + limit * width))
+                break;
+            destinations.insert(Address(*destination));
+        }
+        if (destinations.size() < 2)
+            continue;
+        jump.destinations.assign(destinations.begin(), destinations.end());
+        references.tables.push_back({start, count * width});
+        return;
+    }
+}
+
 std::optional<std::size_t> rvaTableBound(const std::map<Address, Instruction>& instructions,
     std::map<Address, Instruction>::const_iterator entry, unsigned base, unsigned index) {
     for (unsigned skipped = 0; entry != instructions.begin() && skipped < 2; ++skipped) {
@@ -1214,6 +1507,59 @@ std::optional<Address> linkedArmPlt(const Instruction& first, Reader reader,
     }
     return {};
 }
+
+// The page an ARM64 ADRP left in `reg` before `pc`, searching back along the fallthrough path. Code reuses a page
+// long after its ADRP, past calls when the register is callee-saved.
+std::optional<Address> adrpPage(const Instructions& instructions, Address pc, unsigned reg) {
+    auto cursor = pc;
+    for (unsigned steps = 0; steps < 64; ++steps) {
+        const auto* inst = previousInstruction(instructions, cursor);
+        if (!inst)
+            return std::nullopt;
+        if (inst->end && (std::holds_alternative<Jump>(*inst->end) || std::holds_alternative<Return>(*inst->end) ||
+            std::holds_alternative<Trap>(*inst->end) || (std::holds_alternative<Call>(*inst->end) && (reg < 19 || reg > 28))))
+            return std::nullopt;
+        if (std::ranges::any_of(inst->after, [&](const Effect& effect) { return writesRegister(effect, reg); }))
+            return std::nullopt;
+        if (writesRegister(inst->effect, reg)) {
+            const auto* move = std::get_if<Move>(&inst->effect);
+            const auto* page = move && move->size == 8 && move->dst == reg ? std::get_if<Immediate>(&move->src) : nullptr;
+            if (page && page->value % 4096 == 0)
+                return Address(page->value);
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+// Whether the x86-64 function at `entry` loads its own return address before it moves RSP, as setjmp does
+// (MSVC's static _setjmp, glibc's __sigsetjmp, musl's setjmp). longjmp later resumes the caller there.
+bool readsReturnAddress(const std::map<Address, Instruction>& instructions, Address entry) {
+    auto pc = entry;
+    for (unsigned count = 0; count < 32; ++count) {
+        const auto found = instructions.find(pc);
+        if (found == instructions.end())
+            return false;
+        const auto& instruction = found->second;
+        if (const auto* move = std::get_if<Move>(&instruction.effect); move && move->size == 8)
+            if (const auto* memory = std::get_if<Memory>(&move->src); memory && memory->address == EffectiveAddress{4, 0})
+                return true;
+        if (writesRegister(instruction.effect, 4) ||
+            std::ranges::any_of(instruction.after, [](const Effect& effect) { return writesRegister(effect, 4); }))
+            return false;
+        // An entry such as glibc's _setjmp may jump to the implementation that reads it.
+        if (instruction.end) {
+            const auto* jump = std::get_if<Jump>(&*instruction.end);
+            const auto* target = jump && jump->destinations.empty() ? std::get_if<Immediate>(&jump->target) : nullptr;
+            if (!target)
+                return false;
+            pc = Address(target->value);
+            continue;
+        }
+        pc = instruction.next;
+    }
+    return false;
+}
 }
 
 std::size_t executableEnd(std::size_t pc, std::size_t imageSize, std::span<const GuestRegion> regions) {
@@ -1228,10 +1574,13 @@ std::size_t executableEnd(std::size_t pc, std::size_t imageSize, std::span<const
 Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
     std::span<const GuestExport> exports, std::span<const GuestRegion> regions,
     std::vector<CodeRange>* code, References* references, std::span<const GuestBinding> bindings,
-    CallingConvention convention, std::optional<std::size_t> tlsVector, std::size_t threadBlock) {
+    CallingConvention convention, std::optional<std::size_t> tlsVector, std::size_t threadBlock,
+    std::span<const std::pair<std::size_t, std::size_t>> functionRanges) {
     std::map<Address, Instruction> instructions;
     BranchIndex branches;
     std::set<Address> functionEntries;
+    // Entries known only from addresses code takes; a direct call or an export makes one a function.
+    std::set<Address> takenEntries;
     std::set<Address> entries;
     std::vector<Address> pending;
     std::map<Address, Address> fixedPointers;
@@ -1255,11 +1604,37 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
         if (entries.insert(entry).second)
             pending.push_back(entry);
     };
-    const auto recoverTable = [&](Address pc, Jump& jump) {
+    const auto recoverTable = [&](Address pc, Jump& jump, const std::set<Address>* boundaries = nullptr) {
         if (!references || !jump.destinations.empty() || !std::holds_alternative<Register>(jump.target))
             return;
         const bool arm = architecture == Architecture::Arm64;
-        if (arm) {
+        if (boundaries) {
+            // The last resort, once every other table and reference is known. The function spans the entries
+            // around the jump, past labels whose address the code only takes.
+            auto after = functionEntries.upper_bound(pc);
+            while (after != functionEntries.end() && takenEntries.contains(*after))
+                ++after;
+            auto before = functionEntries.upper_bound(pc);
+            while (before != functionEntries.begin() && takenEntries.contains(*std::prev(before)))
+                --before;
+            const auto start = before == functionEntries.begin() ? Address(0) : *std::prev(before);
+            Unguarded unguarded{*boundaries, start,
+                after == functionEntries.end() ? Address(executableEnd(pc, image.size(), regions)) : *after};
+            // An address taken inside a function may be a switch label or a computed goto.
+            // Prefer the executable's function extent when it covers this dispatch.
+            const auto range = std::ranges::upper_bound(functionRanges, std::size_t(pc), {},
+                &std::pair<std::size_t, std::size_t>::first);
+            if (range != functionRanges.begin() && std::size_t(pc) < std::prev(range)->second) {
+                unguarded.functionStart = Address(std::prev(range)->first);
+                unguarded.functionEnd = Address(std::prev(range)->second);
+            }
+            if (arm)
+                recoverHoistedArmTable(pc, jump, instructions, branches, image, regions, *references, &unguarded);
+            else
+                recoverHoistedX64Table(pc, jump, instructions, branches, image, regions, *references, &unguarded);
+            if (jump.destinations.empty())
+                recoverUnguardedSimulatedTable(pc, jump, instructions, image, regions, *references, unguarded, arm);
+        } else if (arm) {
             recoverArmTable(pc, jump, instructions, image, regions, *references);
             if (jump.destinations.empty())
                 recoverHoistedArmTable(pc, jump, instructions, branches, image, regions, *references);
@@ -1295,6 +1670,8 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
         for (const auto target : references->functions) {
             addEntry(target);
             functionEntries.insert(target);
+            if (references->taken.contains(target))
+                takenEntries.insert(target);
         }
 
     // On Linux the thread block is the thread pointer that x86-64 FS and ARM64 TPIDR_EL0 hold.
@@ -1314,6 +1691,9 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
     }, {}};
     gaps.edges = &branches;
     gaps.functions = &functionEntries;
+    gaps.taken = &takenEntries;
+    gaps.stack = architecture == Architecture::Arm64 ? 31 : 4;
+    gaps.noReturnSlots = references ? &references->noReturnSlots : nullptr;
     if (architecture == Architecture::Arm64)
         gaps.preserved = {19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29};
     else if (convention == CallingConvention::Microsoft)
@@ -1383,6 +1763,14 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
                 if (references && instruction.end)
                     if (auto* jump = std::get_if<Jump>(&*instruction.end))
                         recoverTable(pc, *jump);
+                // ADRP and ADD form code addresses, such as callbacks passed to qsort, even far apart.
+                if (architecture == Architecture::Arm64 && !regions.empty() && !instruction.addressTaken)
+                    if (const auto* add = std::get_if<Binary>(&instruction.effect); add && add->op == BinaryOp::Add &&
+                        add->size == 8 && !add->flags && !add->count && !add->extendBits && !add->invert &&
+                        !add->withCarry && add->lhs < 31)
+                        if (const auto* offset = std::get_if<Immediate>(&add->rhs); offset && offset->value < 4096)
+                            if (const auto page = adrpPage(instructions, pc, add->lhs))
+                                instruction.addressTaken = *page + Address(offset->value);
                 // A return through a register holding a code address is a jump; libunwind pops ARM guarded
                 // control stack entries with `adr x16, next; ret x16`.
                 if (architecture == Architecture::Arm64 && instruction.end)
@@ -1408,11 +1796,18 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
                 for (const auto destination : jump->destinations)
                     branches[destination].push_back(pc);
             } else if (const auto* call = decoded.end ? std::get_if<Call>(&*decoded.end) : nullptr) {
-                if (const auto* target = std::get_if<Immediate>(&call->target))
+                if (const auto* target = std::get_if<Immediate>(&call->target)) {
                     functionEntries.insert(Address(target->value));
+                    takenEntries.erase(Address(target->value));
+                    if (references)
+                        references->taken.erase(Address(target->value));
+                }
             }
-            if (decoded.addressTaken)
-                functionEntries.insert(*decoded.addressTaken);
+            if (decoded.addressTaken && functionEntries.insert(*decoded.addressTaken).second) {
+                takenEntries.insert(*decoded.addressTaken);
+                if (references && !references->functions.contains(*decoded.addressTaken))
+                    references->taken.insert(*decoded.addressTaken);
+            }
             if (decoded.addressTaken && *decoded.addressTaken >= 0) {
                 const auto address = *decoded.addressTaken;
                 if (std::size_t(address) < executableEnd(address, image.size(), regions)) {
@@ -1447,6 +1842,46 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
                 branches[destination].push_back(pc);
             }
             retry |= !jump->destinations.empty();
+        }
+        if (!retry) {
+            // Function entries bound tables among the code, and the addresses code takes there.
+            std::set<Address> boundaries(references->data.begin(), references->data.end());
+            boundaries.insert(functionEntries.begin(), functionEntries.end());
+            for (const auto& table : references->tables)
+                boundaries.insert(Address(table.start));
+            for (auto& [pc, instruction] : instructions) {
+                auto* jump = instruction.end ? std::get_if<Jump>(&*instruction.end) : nullptr;
+                if (!jump || !jump->destinations.empty())
+                    continue;
+                recoverTable(pc, *jump, &boundaries);
+                for (const auto destination : jump->destinations) {
+                    addEntry(destination);
+                    branches[destination].push_back(pc);
+                }
+                retry |= !jump->destinations.empty();
+            }
+        }
+        // longjmp resumes the callers of setjmp-like functions at their return addresses, which therefore
+        // become routines of their own.
+        if (architecture == Architecture::X86_64) {
+            std::map<Address, bool> setjmpLike;
+            for (const auto& [pc, instruction] : instructions) {
+                const auto* call = instruction.end ? std::get_if<Call>(&*instruction.end) : nullptr;
+                const auto* target = call ? std::get_if<Immediate>(&call->target) : nullptr;
+                if (!target || references->functions.contains(call->resume))
+                    continue;
+                auto [known, inserted] = setjmpLike.try_emplace(Address(target->value));
+                if (inserted)
+                    known->second = readsReturnAddress(instructions, known->first);
+                if (!known->second)
+                    continue;
+                references->functions.insert(call->resume);
+                functionEntries.insert(call->resume);
+                takenEntries.erase(call->resume);
+                references->taken.erase(call->resume);
+                addEntry(call->resume);
+                retry = true;
+            }
         }
     }
     }

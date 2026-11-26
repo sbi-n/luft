@@ -1,6 +1,7 @@
 #include "analysis.h"
 
 #include <algorithm>
+#include <limits>
 #include <ranges>
 #include <stdexcept>
 
@@ -28,12 +29,14 @@ std::optional<Address> jumpTarget(const Block& block) {
     return {};
 }
 
-LoopExits recoverLoops(const Graph& graph) {
+LoopExits recoverLoops(const Graph& graph, const std::set<Address>& functionEntries,
+    std::map<Address, std::set<Address>>* bodies, std::size_t maxBlocks) {
     std::map<Address, std::vector<Address>> forward, backward;
     for (const auto& [pc, block] : graph) {
         auto& edges = forward[pc];
         visitEdges(block, [&](Address target) { edges.push_back(target); });
-        if (const auto* call = std::get_if<Call>(&block.end))
+        // After a call that never returns, the next instruction often starts another function.
+        if (const auto* call = std::get_if<Call>(&block.end); call && !functionEntries.contains(call->resume))
             edges.push_back(call->resume);
         for (const auto target : edges)
             backward[target].push_back(pc);
@@ -94,27 +97,120 @@ LoopExits recoverLoops(const Graph& graph) {
     while (!pending.empty()) {
         auto component = std::move(pending.back());
         pending.pop_back();
-        if (component.size() > 16)
-            continue;
         std::set<Address> entries, exits;
         for (const auto node : component) {
             for (const auto predecessor : backward[node])
                 if (!component.contains(predecessor))
                     entries.insert(node);
+            if (functionEntries.contains(node))
+                entries.insert(node);
             for (const auto target : forward[node])
                 if (!component.contains(target))
                     exits.insert(canonicalExit(target));
         }
-        if (entries.size() != 1 || exits.empty() || exits.size() > 4)
-            continue;
-        const auto header = *entries.begin();
-        loops.emplace(header, std::vector<Address>(exits.begin(), exits.end()));
-        // Removing a natural loop's header exposes the loops nested inside it.
-        component.erase(header);
+        if (component.size() <= maxBlocks && entries.size() == 1 && !exits.empty() && exits.size() <= 4) {
+            const auto header = *entries.begin();
+            loops.emplace(header, std::vector<Address>(exits.begin(), exits.end()));
+            if (bodies)
+                (*bodies)[header] = component;
+            // Removing a natural loop's header exposes the loops nested inside it.
+            component.erase(header);
+        } else {
+            // A cycle too large or with several entries stays unstructured; removing where it is entered exposes
+            // the loops nested inside it.
+            if (entries.empty() || entries.size() == component.size())
+                continue;
+            for (const auto node : entries)
+                component.erase(node);
+        }
         for (auto& child : components(component))
             pending.push_back(std::move(child));
     }
     return loops;
+}
+
+std::map<Address, Address> postDominators(const Graph& graph, const std::set<Address>& entries) {
+    // Cooper, Harvey, and Kennedy's dominator algorithm on the reversed graph, rooted at a virtual exit node.
+    std::vector<Address> addresses;
+    addresses.reserve(graph.size());
+    for (const auto& [pc, block] : graph)
+        addresses.push_back(pc);
+    const auto exit = addresses.size();
+    const auto index = [&](Address target) {
+        const auto found = std::ranges::lower_bound(addresses, target);
+        return found != addresses.end() && *found == target ? std::size_t(found - addresses.begin()) : exit;
+    };
+    std::vector<std::vector<std::size_t>> successors(exit + 1), predecessors(exit + 1);
+    for (std::size_t node = 0; node < exit; ++node) {
+        const auto& block = graph.at(addresses[node]);
+        auto& edges = successors[node];
+        if (std::holds_alternative<Trap>(block.end))
+            continue;
+        const auto tail = jumpTarget(block);
+        const auto* call = std::get_if<Call>(&block.end);
+        if ((tail && entries.contains(*tail)) || (call && entries.contains(call->resume)))
+            edges.push_back(exit);
+        else
+            visitSuccessors(block, [&](Address target) { edges.push_back(index(target)); });
+        if (edges.empty())
+            edges.push_back(exit);
+        for (const auto target : edges)
+            predecessors[target].push_back(node);
+    }
+    // Reverse postorder of the reversed graph, from the exit along predecessor edges.
+    std::vector<std::size_t> order, number(exit + 1, exit + 1);
+    std::vector<std::pair<std::size_t, std::size_t>> work{{exit, 0}};
+    std::vector<bool> seen(exit + 1);
+    seen[exit] = true;
+    while (!work.empty()) {
+        auto& [node, next] = work.back();
+        if (next < predecessors[node].size()) {
+            const auto target = predecessors[node][next++];
+            if (!seen[target]) {
+                seen[target] = true;
+                work.emplace_back(target, 0);
+            }
+        } else {
+            order.push_back(node);
+            work.pop_back();
+        }
+    }
+    std::ranges::reverse(order);
+    for (std::size_t i = 0; i < order.size(); ++i)
+        number[order[i]] = i;
+    constexpr auto none = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> dominator(exit + 1, none);
+    dominator[exit] = exit;
+    const auto intersect = [&](std::size_t lhs, std::size_t rhs) {
+        while (lhs != rhs) {
+            while (number[lhs] > number[rhs])
+                lhs = dominator[lhs];
+            while (number[rhs] > number[lhs])
+                rhs = dominator[rhs];
+        }
+        return lhs;
+    };
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::size_t i = 1; i < order.size(); ++i) {
+            const auto node = order[i];
+            auto chosen = none;
+            for (const auto target : successors[node]) {
+                if (dominator[target] == none)
+                    continue;
+                chosen = chosen == none ? target : intersect(chosen, target);
+            }
+            if (chosen != none && dominator[node] != chosen) {
+                dominator[node] = chosen;
+                changed = true;
+            }
+        }
+    }
+    std::map<Address, Address> result;
+    for (std::size_t node = 0; node < exit; ++node)
+        if (dominator[node] != none && dominator[node] != exit)
+            result.emplace_hint(result.end(), addresses[node], addresses[dominator[node]]);
+    return result;
 }
 
 bool observesExitFlags(const Block& block, bool calls) {
@@ -149,6 +245,7 @@ bool writesFlags(const Effect& effect) {
         (byte && byte->flags) || std::holds_alternative<ByteShift>(effect) ||
         std::holds_alternative<Shift>(effect) ||
         (memory && memory->flags) || std::holds_alternative<FloatCompare>(effect) ||
+        std::holds_alternative<VectorTest>(effect) ||
         std::holds_alternative<ConditionalCompare>(effect) || std::holds_alternative<BitTest>(effect) ||
         std::holds_alternative<CompareExchange>(effect) || std::holds_alternative<FloatConditionalCompare>(effect) ||
         x87WritesFlags(effect) || (scan && !scan->leadingCount);
@@ -179,6 +276,7 @@ bool overwritesFlags(const Effect& effect) {
     return (binary && binary->flags) || (memory && memory->flags && !memory->keepCarry) ||
         (byte && byte->flags && !byte->keepCarry) || (exchange && exchange->add) ||
         std::holds_alternative<FloatCompare>(effect) || std::holds_alternative<ConditionalCompare>(effect) ||
+        std::holds_alternative<VectorTest>(effect) ||
         std::holds_alternative<CompareExchange>(effect) || std::holds_alternative<FloatConditionalCompare>(effect) ||
         x87WritesFlags(effect);
 }
@@ -227,7 +325,8 @@ bool writesRegister(const Effect& effect, unsigned reg) {
         [&](const Move& op) { return op.dst == reg || (reg == 4 && std::holds_alternative<StackTop>(op.src)); },
         [&](const ByteMove& op) { return registerValue(op.dst); },
         [&](const Exchange& op) { return op.src.index == reg || registerValue(op.dst); },
-        [&](const AtomicAdd& op) { return op.dst == reg; },
+        [&](const AtomicUpdate& op) { return op.dst == reg; },
+        [&](const CompareSwap& op) { return op.compare == reg; },
         [&](const Extend& op) { return op.dst == reg; },
         [&](const ConditionalMove& op) { return op.dst == reg; },
         [&](const Select& op) { return op.dst == reg; },
@@ -268,7 +367,7 @@ bool writesRegister(const Effect& effect, unsigned reg) {
         [&](const VectorSignMask& op) { return op.dst == reg; },
         [&](const VectorReduce& op) { return op.gp == reg; },
         [&](const FloatToInteger& op) { return op.dst == reg; },
-        [&](const InterleavedLoad4&) { return false; },
+        [&](const InterleavedTransfer&) { return false; },
         [](const auto&) { return false; },
     }, effect);
 }
@@ -310,7 +409,8 @@ static bool touchesStack(const Effect& effect, unsigned sp) {
         [&](const Move& m) { return m.dst == sp || value(m.src); },
         [&](const ByteMove& m) { return value(m.dst) || value(m.src); },
         [&](const Exchange& m) { return value(m.dst) || m.src.index == sp; },
-        [&](const AtomicAdd& op) { return stackAddress(op.address); },
+        [&](const AtomicUpdate& op) { return stackAddress(op.address); },
+        [&](const CompareSwap& op) { return stackAddress(op.address); },
         [&](const Extend& ext) { return ext.dst == sp || value(ext.src); },
         [&](const ConditionalMove& m) { return m.dst == sp || value(m.src); },
         [sp](const Select& m) { return m.dst == sp || m.yes.index == sp || m.no.index == sp; },
@@ -343,7 +443,9 @@ static bool touchesStack(const Effect& effect, unsigned sp) {
         [](const CpuId&) { return false; },
         [&](const VectorBinary& b) { return xmm(b.src); },
         [&](const VectorMove& m) { return xmm(m.src) || xmm(m.dst); },
-        [&](const InterleavedLoad4& m) { return stackAddress(m.address); },
+        [&](const InterleavedTransfer& m) { return stackAddress(m.address); },
+        [](const VectorTable&) { return false; },
+        [](const VectorFusedMultiply&) { return false; },
         [](const VectorSplat&) { return false; },
         [](const VectorWiden&) { return false; },
         [&](const VectorHalfMove& m) { return xmm(m.src) || xmm(m.dst); },
@@ -360,6 +462,7 @@ static bool touchesStack(const Effect& effect, unsigned sp) {
         [&](const IntegerToFloat& c) { return value(c.src); },
         [&](const FloatToInteger& c) { return c.dst == sp || xmm(c.src); },
         [&](const FloatingControl& c) { return stackAddress(c.address); },
+        [](const FloatingControlWrite&) { return false; },
         [&](const VectorLanes& v) { return xmm(v.rhs); },
         [&](const VectorFloatLanes& v) { return xmm(v.rhs); },
         [&](const VectorShiftLanes& v) { return v.countOperand && xmm(*v.countOperand); },
@@ -373,6 +476,8 @@ static bool touchesStack(const Effect& effect, unsigned sp) {
         [](const FloatConditionalCompare&) { return false; },
         [](const VectorLaneMove&) { return false; },
         [&](const VectorLaneLoad& v) { return stackAddress(v.address); },
+        [&](const VectorLaneStore& v) { return stackAddress(v.address); },
+        [&](const VectorTest& v) { return xmm(v.rhs); },
     }, effect);
 }
 

@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
+#include <deque>
 #include <format>
 #include <ranges>
 #include <set>
@@ -49,18 +51,22 @@ LuauWord wordLiteral(std::uint64_t word) {
 
 class StructuredFunction {
 public:
-    StructuredFunction(const Graph& graph, const std::set<Address>& addressTaken,
-        const LoopExits& loops, Data& data, Address entry, bool arm, CallingConvention convention,
-        std::span<const std::size_t> initializers, const ProgramOptions& program)
-        : graph(graph), addressTaken(addressTaken), data(data), entry(entry), arm(arm), convention(convention),
-          initializers(initializers), program(program), loops(loops),
+    StructuredFunction(const Graph& graph, const std::set<Address>& addressTaken, const std::set<Address>& entries,
+        const LoopExits& loops, const std::map<Address, std::set<Address>>& loopBodies,
+        const std::map<Address, Address>& postDominators, Data& data, Address entry, bool arm,
+        CallingConvention convention, std::span<const std::size_t> initializers, const ProgramOptions& program)
+        : graph(graph), addressTaken(addressTaken), entries(entries), data(data), entry(entry), arm(arm),
+          convention(convention),
+          initializers(initializers), program(program), loops(loops), loopBodies(loopBodies),
+          postDominators(postDominators),
           features(withProgramStack(detectFeatures(graph, entry, arm, initializers), program)),
           flagsAtEntry(features.flags ? liveFlagsAtEntry(graph, false) : std::set<Address>{}),
           useRoutineTable(graph.size() > 48) {
         for (const auto& [pc, block] : graph) {
-            visitEdges(block, [&](Address target) { ++predecessors[target]; });
-            if (const auto* call = std::get_if<Call>(&block.end))
-                ++predecessors[call->resume];
+            visitSuccessors(block, [&](Address target) {
+                ++predecessors[target];
+                predecessorBlocks[target].push_back(pc);
+            });
         }
     }
 
@@ -68,6 +74,11 @@ public:
         const auto result = reg(0);
         if (!data.landingPads.empty())
             includeFunctionPointers();
+        if (!data.tokenSlots.empty()) {
+            includeFunctionPointers();
+            for (const auto& [slot, import] : data.tokenSlots)
+                importTokens.emplace(Address(ImportToken + slot), import);
+        }
         addFunction(entry);
         for (const auto pc : initializers)
             addFunction(pc);
@@ -80,7 +91,12 @@ public:
                 active.clear();
                 regionEntry = target;
                 remaining = 256;
+                stop = nullptr;
+                structured.clear();
+                usesLoopExit = false;
                 region(target, 2, {});
+                if (usesLoopExit)
+                    body.insert(body.find('\n') + 1, "        local loopExit = 0\n");
                 body += "    end\n";
                 bodies.push_back(std::move(body));
             }
@@ -166,6 +182,8 @@ public:
             source += "    local functionPointers: {[number]: any} = resumeRoutines\n";
         if (usesSeh)
             source += exceptionHelpers();
+        if (usesThreads)
+            source += threadContexts();
         source += groupRoutines(bodies);
         if (usesFunctionPointers) {
             for (const auto target : addressTaken)
@@ -247,16 +265,27 @@ public:
     // (run() reports a failed one as an unmapped access). Writes below the stack, into the image, go to the
     // runtime's write, which enforces read-only data and page protection; so do reads there without mapped images,
     // which are checked against the embedded data.
+    //
+    // Where memory starts and the stack begins are known here: as constant locals, Luau folds them into each
+    // access. readAt and writeAt take a register and a constant displacement, which fold together with the base
+    // into one constant; a register with a nonzero high word goes through the runtime, which wraps the address.
     std::string inlineMemoryAccess() const {
         const bool strict = data.regions.empty();
-        return std::format(R"(    local guestBytes: buffer = buffer.create(0)
-    local guestBase: number, guestFloor: number = (process.watchMemory :: any)(function(bytes: buffer)
-        guestBytes = bytes
-    end)
-    local slowRead, slowWrite = read, write
-    local function read(size: number, at: number): (number, number)
-{}        local index = at - guestBase
-        if size == 8 then
+        // As makeMemory computes them: the stack starts at the image size rounded up to 16 bytes, and memory at
+        // the first data range when one lies lower.
+        const auto floor = (data.image.size() + 15) / 16 * 16;
+        auto base = floor;
+        for (const auto& [start, end] : data.emitted) {
+            if (start < end) {
+                base = std::min(base, start);
+                break;
+            }
+        }
+        const auto readBelowFloor = [&](std::string_view at) {
+            return strict ? std::format("        if {} < guestFloor then\n            return slowRead(size, {})\n"
+                "        end\n", at, at) : std::string();
+        };
+        constexpr std::string_view readIndex = R"(        if size == 8 then
             return buffer.readu32(guestBytes, index), buffer.readu32(guestBytes, index + 4)
         elseif size == 4 then
             return buffer.readu32(guestBytes, index), 0
@@ -265,13 +294,8 @@ public:
         end
         return buffer.readu16(guestBytes, index), 0
     end
-    local function write(size: number, at: number, lo: number, hi: number)
-        if at < guestFloor then
-            slowWrite(size, at, lo, hi)
-            return
-        end
-        local index = at - guestBase
-        if size == 8 then
+)";
+        constexpr std::string_view writeIndex = R"(        if size == 8 then
             buffer.writeu32(guestBytes, index, lo)
             buffer.writeu32(guestBytes, index + 4, hi)
         elseif size == 4 then
@@ -282,7 +306,120 @@ public:
             buffer.writeu16(guestBytes, index, lo)
         end
     end
-)", strict ? "        if at < guestFloor then\n            return slowRead(size, at)\n        end\n" : "");
+)";
+        std::string source = std::format(R"(    local guestBytes: buffer = buffer.create(0)
+    local guestBase = {}
+    local guestFloor = {}
+    do
+        local base: number, floor: number = (process.watchMemory :: any)(function(bytes: buffer)
+            guestBytes = bytes
+        end)
+        if base ~= guestBase or floor ~= guestFloor then
+            error("guest memory layout differs from the translation", 0)
+        end
+    end
+    local slowRead, slowWrite = read, write
+)", base, floor);
+        source += "    local function read(size: number, at: number): (number, number)\n";
+        source += readBelowFloor("at");
+        source += "        local index = at - guestBase\n";
+        source += readIndex;
+        source += R"(    local function write(size: number, at: number, lo: number, hi: number)
+        if at < guestFloor then
+            slowWrite(size, at, lo, hi)
+            return
+        end
+        local index = at - guestBase
+)";
+        source += writeIndex;
+        source += R"(    local function readAt(size: number, lo: number, hi: number, displacement: number): (number, number)
+        if hi ~= 0 then
+            return slowRead(size, (process.wrappedAddress :: any)(lo, hi, displacement))
+        end
+)";
+        source += readBelowFloor("lo + displacement");
+        source += "        local index = lo + (displacement - guestBase)\n";
+        source += readIndex;
+        source += R"(    local function writeAt(size: number, at: number, atHi: number, displacement: number, lo: number, hi: number)
+        if atHi ~= 0 then
+            slowWrite(size, (process.wrappedAddress :: any)(at, atHi, displacement), lo, hi)
+            return
+        end
+        local index = at + (displacement - guestBase)
+        if index < guestFloor - guestBase then
+            slowWrite(size, index + guestBase, lo, hi)
+            return
+        end
+)";
+        source += writeIndex;
+        // Most accesses move 8 bytes: these forms of readAt and writeAt leave Luau less to fold at each inlined call.
+        source += R"(    local function read8At(lo: number, hi: number, displacement: number): (number, number)
+        if hi ~= 0 then
+            return slowRead(8, (process.wrappedAddress :: any)(lo, hi, displacement))
+        end
+)";
+        source += readBelowFloor("lo + displacement");
+        source += R"(        local index = lo + (displacement - guestBase)
+        return buffer.readu32(guestBytes, index), buffer.readu32(guestBytes, index + 4)
+    end
+    local function write8At(at: number, atHi: number, displacement: number, lo: number, hi: number)
+        local index = at + (displacement - guestBase)
+        if atHi ~= 0 or index < guestFloor - guestBase then
+            slowWrite(8, if atHi ~= 0 then (process.wrappedAddress :: any)(at, atHi, displacement) else index + guestBase,
+                lo, hi)
+            return
+        end
+        buffer.writeu32(guestBytes, index, lo)
+        buffer.writeu32(guestBytes, index + 4, hi)
+    end
+)";
+        return source;
+    }
+
+    // Guest threads switch by saving every register of the one leaving and restoring those of the one entering.
+    std::string threadContexts() {
+        std::vector<std::string> names;
+        for (const auto index : std::set(registers)) {
+            const auto cell = reg(index);
+            names.push_back(cell.lo);
+            names.push_back(cell.hi);
+        }
+        bool spilledVectors = false;
+        for (const auto index : std::set(xmmRegisters)) {
+            if (index >= LocalVectorRegisters) {
+                spilledVectors = true;
+                continue;
+            }
+            for (const auto& lane : xmm(VectorRegister{index}))
+                names.push_back(lane);
+        }
+        if (features.flags)
+            for (const auto* flag : {"carry", "overflow", "negative", "zero", "parity"})
+                names.push_back(flag);
+        if (usesDirection)
+            names.push_back("direction");
+        if (usesFloatingControl) {
+            names.push_back("mxcsr");
+            names.push_back("x87Control");
+        }
+        std::string list;
+        for (const auto& name : names)
+            list += (list.empty() ? "" : ", ") + name;
+        std::string source = "    process.saveRegisters = function(): {any}\n";
+        source += std::format("        return {{{}{}}}\n", list, spilledVectors ? (list.empty() ? "" : ", ") + std::string("table.clone(vectorLanes)") : "");
+        source += "    end\n    process.restoreRegisters = function(saved: {any})\n";
+        for (std::size_t first = 0; first < names.size(); first += 32) {
+            std::string targets, values;
+            for (auto i = first; i < std::min(names.size(), first + 32); ++i) {
+                targets += (i == first ? "" : ", ") + names[i];
+                values += std::format("{}saved[{}]", i == first ? "" : ", ", i + 1);
+            }
+            source += std::format("        {} = {}\n", targets, values);
+        }
+        if (spilledVectors)
+            source += std::format("        table.move(saved[{}], 1, #vectorLanes, 1, vectorLanes)\n", names.size() + 1);
+        source += "    end\n";
+        return source;
     }
 
     // A Luau function holds at most 32767 child closures, and each closure that captures the entry's register
@@ -330,6 +467,7 @@ public:
 private:
     const Graph& graph;
     const std::set<Address>& addressTaken;
+    const std::set<Address>& entries;
     Data& data;
     Address entry;
     bool arm;
@@ -337,6 +475,8 @@ private:
     std::span<const std::size_t> initializers;
     const ProgramOptions& program;
     const LoopExits& loops;
+    const std::map<Address, std::set<Address>>& loopBodies;
+    const std::map<Address, Address>& postDominators;
     Features features;
 
     static Features withProgramStack(Features features, const ProgramOptions& program) {
@@ -384,6 +524,20 @@ private:
     std::vector<Address> pending;
     std::set<Address> active;
     std::map<Address, unsigned> predecessors;
+    std::map<Address, std::vector<Address>> predecessorBlocks;
+    // A branch whose arms meet again at `join` and enter no other block of the graph outside `inside`.
+    struct Join { Address join; std::set<Address> inside; };
+    // By branch and the header of the innermost loop around it (or no address outside loops).
+    std::map<std::pair<Address, Address>, std::optional<Join>> joins;
+    // Where paths of the branch being emitted meet again: reaching it ends the branch's arm, and the code after
+    // the arms continues there. `loops` is how many recovered loops enclose the branch. An arm that outlines a
+    // block of the region splits it: the outlined routine reaches the join too, so the join is outlined as well.
+    struct Stop { const Join* region; std::size_t loops; bool reached = false; bool split = false; };
+    Stop* stop = nullptr;
+    std::vector<Stop*> structured;
+    // The join about to be emitted after its branch's arms, which continues the routine although it has several
+    // predecessors.
+    std::optional<Address> continuing;
     Address regionEntry = 0;
     std::vector<Address> activeLoops;
     unsigned remaining = 0;
@@ -426,6 +580,139 @@ private:
         return std::format("{}, {}, {}, {}", lanes[0], lanes[1], lanes[2], lanes[3]);
     }
 
+    // Guest registers are the entry's locals, which routines reach as upvalues: each use is a GETUPVAL or SETUPVAL.
+    // A loop that cannot pass control to other code (it has no call, return, or closure) keeps the registers it
+    // uses in its own locals instead. It loads them as it starts and stores those it writes after it ends, which
+    // every way out of it reaches: it leaves only through `break`, or through an error that ends the guest.
+    void cacheLoopRegisters(std::size_t from, unsigned depth) {
+        // Registers used once gain nothing from the load and store; nested loops share Luau's 200 locals.
+        constexpr std::size_t MinUses = 2, MaxCached = 40, MaxNested = 120;
+        // Code that may run other routines, or read and write the registers itself: exit runs the exit callbacks,
+        // and the Windows exception helpers capture and restore register contexts.
+        static const std::set<std::string_view> barriers{"return", "function", "runGuestRoutine", "protectJump",
+            "checkUnwound", "routines", "functionPointers", "resumeRoutines", "callee", "unwindStack", "exitProcess",
+            "sehCapture", "sehRestore", "sehCall"};
+        const std::string_view text(body.data() + from, body.size() - from);
+        // Blocking calls let other guest threads run, which read and write the registers.
+        for (const std::string_view blocking : {"pthreadMutex", "libc.pthread_", "libc.yieldThread", "libc.nanosleep",
+                 "host.block", "host.createThread"})
+            if (text.find(blocking) != std::string_view::npos)
+                return;
+        const auto isRegister = [](std::string_view word) {
+            if (word == "carry" || word == "overflow" || word == "negative" || word == "zero" || word == "parity")
+                return true;
+            const auto digits = [&](std::size_t at, std::size_t end) {
+                return at < end && std::all_of(word.begin() + at, word.begin() + end, [](char c) { return c >= '0' && c <= '9'; });
+            };
+            if (word.size() >= 4 && word[0] == 'v' && (word.ends_with("lo") || word.ends_with("hi")))
+                return digits(1, word.size() - 2);
+            if (word.size() >= 4 && word[0] == 'x' && word[word.size() - 2] == '_')
+                return digits(1, word.size() - 2) && digits(word.size() - 1, word.size());
+            return false;
+        };
+        struct Use { std::size_t start, end; };
+        std::vector<Use> spans;
+        std::map<std::string_view, std::size_t> uses;
+        std::set<std::string_view> written;
+        std::size_t nested = 0;
+        for (std::size_t i = 0; i < text.size();) {
+            const char c = text[i];
+            if (c == '"') {
+                for (++i; i < text.size() && text[i] != '"'; i += text[i] == '\\' ? 2 : 1) {}
+                ++i;
+            } else if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') {
+                while (i < text.size() && text[i] != '\n')
+                    ++i;
+            } else if (std::isdigit(static_cast<unsigned char>(c))) {
+                while (i < text.size() && (std::isalnum(static_cast<unsigned char>(text[i])) || text[i] == '_' || text[i] == '.'))
+                    ++i;
+            } else if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+                const auto start = i;
+                while (i < text.size() && (std::isalnum(static_cast<unsigned char>(text[i])) || text[i] == '_'))
+                    ++i;
+                const auto word = text.substr(start, i - start);
+                if (start && (text[start - 1] == '.' || text[start - 1] == ':'))
+                    continue;
+                if (barriers.contains(word))
+                    return;
+                if (word == "local" && text.substr(i, 2) == " c" && i + 2 < text.size() &&
+                    std::isdigit(static_cast<unsigned char>(text[i + 2])))
+                    nested += std::ranges::count(text.substr(i, text.find('=', i) - i), ',') + 1;
+                if (!isRegister(word))
+                    continue;
+                spans.push_back({start, i});
+                ++uses[word];
+                // Assigned, alone or in a list: `name =`, `name, other =`, or a compound `name +=`.
+                for (auto at = i;;) {
+                    while (at < text.size() && text[at] == ' ')
+                        ++at;
+                    if (at < text.size() && text[at] == ',') {
+                        ++at;
+                        while (at < text.size() && text[at] == ' ')
+                            ++at;
+                        const auto next = at;
+                        while (at < text.size() && (std::isalnum(static_cast<unsigned char>(text[at])) || text[at] == '_'))
+                            ++at;
+                        if (at == next)
+                            break;
+                        continue;
+                    }
+                    while (at < text.size() && std::string_view("+-*/%^.").find(text[at]) != std::string_view::npos)
+                        ++at;
+                    if (at + 1 < text.size() && text[at] == '=' && text[at + 1] != '=')
+                        written.insert(word);
+                    break;
+                }
+            } else {
+                ++i;
+            }
+        }
+        std::vector<std::pair<std::size_t, std::string_view>> ranked;
+        for (const auto& [name, count] : uses)
+            if (count >= MinUses)
+                ranked.emplace_back(count, name);
+        std::ranges::sort(ranked, std::greater{});
+        const auto room = nested >= MaxNested ? 0 : std::min(MaxCached, MaxNested - nested);
+        if (ranked.size() > room)
+            ranked.resize(room);
+        if (ranked.empty())
+            return;
+        std::set<std::string_view> chosen;
+        for (const auto& [count, name] : ranked)
+            chosen.insert(name);
+        // Each loop names its locals apart: a loop nested in another cached loop stores into the outer copies.
+        const auto prefix = std::format("c{}_", ++cachedLoops);
+        std::string names, cached, stored, storedCached;
+        for (const auto name : chosen) {
+            names += (names.empty() ? "" : ", ") + std::string(name);
+            cached += (cached.empty() ? "" : ", ") + prefix + std::string(name);
+            if (written.contains(name)) {
+                stored += (stored.empty() ? "" : ", ") + std::string(name);
+                storedCached += (storedCached.empty() ? "" : ", ") + prefix + std::string(name);
+            }
+        }
+        const std::string indent(depth * 4, ' ');
+        std::string result = indent + "do\n" + indent + "    local " + cached + " = " + names + "\n";
+        std::size_t last = 0;
+        for (const auto& span : spans) {
+            if (!chosen.contains(text.substr(span.start, span.end - span.start)))
+                continue;
+            result.append(text.substr(last, span.start - last));
+            result += prefix;
+            last = span.start;
+        }
+        result.append(text.substr(last));
+        if (!stored.empty())
+            result += indent + "    " + stored + " = " + storedCached + "\n";
+        result += indent + "end\n";
+        body.resize(from);
+        body += result;
+    }
+
+    std::size_t cachedLoops = 0;
+    bool usesLoopExit = false;
+    bool usesThreads = false;
+
     void line(unsigned depth, std::string_view text) {
         body.append(depth * 4, ' ');
         body += text;
@@ -467,6 +754,31 @@ private:
         return "address(" + addressPair(addr, constants) + ")";
     }
 
+    // A register and a displacement for the readAt and writeAt that programs define, which fold the displacement
+    // into the memory base.
+    std::optional<std::string> registerAddress(const EffectiveAddress& addr, const Constants& constants) {
+        if (!isProgram() || addr.index != Zero || addr.base == Zero || knownAddress(addr, constants) ||
+            addr.displacement <= -4294967296 || addr.displacement >= 4294967296)
+            return std::nullopt;
+        needsMemory = true;
+        return std::format("{}, {}", reg(addr.base).pair(), addr.displacement);
+    }
+
+    // Reads `size` bytes of guest memory at a memory operand: a pair of words for 8 bytes, one word otherwise.
+    std::string memoryRead(unsigned size, const EffectiveAddress& addr, const Constants& constants) {
+        if (const auto at = registerAddress(addr, constants))
+            return size == 8 ? std::format("read8At({})", *at) : std::format("readAt({}, {})", size, *at);
+        return std::format("read({}, {})", size, memoryAddress(addr, constants));
+    }
+
+    // A statement that writes `value`, the low and high words, to guest memory at a memory operand.
+    std::string memoryWrite(unsigned size, const EffectiveAddress& addr, const Constants& constants,
+        std::string_view value) {
+        if (const auto at = registerAddress(addr, constants))
+            return size == 8 ? std::format("write8At({}, {})", *at, value) : std::format("writeAt({}, {}, {})", size, *at, value);
+        return std::format("write({}, {}, {})", size, memoryAddress(addr, constants), value);
+    }
+
     std::string memoryError(std::uint64_t at, unsigned size) {
         if (const auto* import = data.unresolved(at, size))
             return std::format("unresolved binary import or relocation for {} at guest address {}", import->name, at);
@@ -490,7 +802,7 @@ private:
                 data.materialize(*known, size);
         }
         needsMemory = true;
-        const auto expression = std::format("read({}, {})", size, memoryAddress(addr, constants));
+        const auto expression = memoryRead(size, addr, constants);
         return size == 8 ? expression : "(" + expression + ")";
     }
 
@@ -575,12 +887,14 @@ private:
         Lanes result{dst[0], dst[1], rhs[0], rhs[1]};
         if (binary.op == VectorOp::UnpackLowDwords) {
             result = {dst[0], rhs[0], dst[1], rhs[1]};
-        } else if (binary.op == VectorOp::DotUnsignedBytes) {
+        } else if (binary.op == VectorOp::DotUnsignedBytes || binary.op == VectorOp::DotSignedBytes) {
+            const auto byte = binary.op == VectorOp::DotSignedBytes ? "(bit32.bxor(bit32.extract({}, {}, 8), 128) - 128)"
+                                                                     : "bit32.extract({}, {}, 8)";
             for (unsigned lane = 0; lane < binary.size / 4; ++lane) {
                 auto sum = dst[lane];
                 for (unsigned bit = 0; bit < 32; bit += 8)
-                    sum += std::format(" + bit32.extract({}, {}, 8) * bit32.extract({}, {}, 8)",
-                        lhsLanes[lane], bit, rhs[lane], bit);
+                    sum += " + " + std::vformat(byte, std::make_format_args(lhsLanes[lane], bit)) + " * " +
+                        std::vformat(byte, std::make_format_args(rhs[lane], bit));
                 result[lane] = "(" + sum + ") % 4294967296";
             }
         } else if (binary.op == VectorOp::AccumulatePairs) {
@@ -719,7 +1033,7 @@ private:
         } else {
             const auto& at = std::get<Memory>(target).address;
             if (prepareWrite(depth, at, 1, constants))
-                line(depth, std::format("write(1, {}, {}, 0)", memoryAddress(at, constants), byte));
+                line(depth, memoryWrite(1, at, constants, std::string(byte) + ", 0"));
         }
     }
 
@@ -730,13 +1044,13 @@ private:
         line(depth, "do");
         line(depth + 1, "local valueLo, valueHi = " + word);
         line(depth + 1, std::format("{} = offset({}, -8)", sp.pair(), sp.pair()));
-        line(depth + 1, std::format("write(8, address({}), valueLo, valueHi)", sp.pair()));
+        line(depth + 1, memoryWrite(8, EffectiveAddress{4, 0}, {}, "valueLo, valueHi"));
         line(depth, "end");
     }
 
     void stackPop(unsigned depth) {
         const auto sp = reg(4);
-        line(depth, std::format("local savedLo, savedHi = read(8, address({}))", sp.pair()));
+        line(depth, "local savedLo, savedHi = " + memoryRead(8, EffectiveAddress{4, 0}, {}));
         line(depth, std::format("{} = offset({}, 8)", sp.pair(), sp.pair()));
     }
 
@@ -1018,8 +1332,7 @@ private:
             } else {
                 const auto& mem = std::get<Memory>(op.dst);
                 if (prepareWrite(depth + 1, mem.address, op.size, constants))
-                    line(depth + 1, std::format("write({}, {}, resultLo, resultHi)", op.size,
-                        memoryAddress(mem.address, constants)));
+                    line(depth + 1, memoryWrite(op.size, mem.address, constants, "resultLo, resultHi"));
             }
         }
         line(depth, "end");
@@ -1107,8 +1420,7 @@ private:
                     } else {
                         const auto& mem = std::get<Memory>(move.dst);
                         if (prepareWrite(depth, mem.address, 1, constants))
-                            line(depth, std::format("write(1, {}, {}, 0)", memoryAddress(mem.address, constants),
-                                byte));
+                            line(depth, memoryWrite(1, mem.address, constants, byte + ", 0"));
                     }
                 },
                 [&](const Exchange& exchange) {
@@ -1117,6 +1429,40 @@ private:
                     const auto* mem = std::get_if<Memory>(&exchange.dst);
                     if (mem && !prepareWrite(depth, mem->address, exchange.size, constants))
                         return;
+                    if (exchange.size == 1) {
+                        // Both bytes are read before either is written: they may be two bytes of one register.
+                        line(depth, "do");
+                        line(depth + 1, std::format("local sourceByte = bit32.extract({}, {}, 8)", source.lo, exchange.srcField));
+                        if (dst) {
+                            line(depth + 1, std::format("local oldByte = bit32.extract({}, {}, 8)", reg(dst->index).lo,
+                                exchange.dstField));
+                        } else {
+                            line(depth + 1, std::format("local at = {}", memoryAddress(mem->address, constants)));
+                            line(depth + 1, "local oldByte = (read(1, at))");
+                        }
+                        if (exchange.add) {
+                            needsAddFlags = true;
+                            line(depth + 1, "local newByte, _, c, o, n, z = addFlags(false, false, 1, oldByte, 0, sourceByte, 0)");
+                            if (setFlags) {
+                                line(depth + 1, "carry, overflow, negative, zero = c, o, n, z");
+                                if (features.parity)
+                                    line(depth + 1, "parity = evenParity(newByte)");
+                            }
+                        } else {
+                            line(depth + 1, "local newByte = sourceByte");
+                        }
+                        if (mem)
+                            line(depth + 1, "write(1, at, newByte, 0)");
+                        else
+                            line(depth + 1, std::format("{0} = bit32.replace({0}, newByte, {1}, 8)", reg(dst->index).lo,
+                                exchange.dstField));
+                        line(depth + 1, std::format("{0} = bit32.replace({0}, oldByte, {1}, 8)", source.lo, exchange.srcField));
+                        line(depth, "end");
+                        constants[exchange.src.index].reset();
+                        if (dst)
+                            constants[dst->index].reset();
+                        return;
+                    }
                     line(depth, "do");
                     if (dst) {
                         line(depth + 1, "local oldLo, oldHi = " + reg(dst->index).pair());
@@ -1147,19 +1493,84 @@ private:
                     constants[exchange.src.index].reset();
                     line(depth, "end");
                 },
-                [&](const AtomicAdd& op) {
+                [&](const AtomicUpdate& op) {
                     if (!prepareWrite(depth, op.address, op.size, constants))
                         return;
-                    needsAddFlags = true;
+                    const auto src = reg(op.src.index);
+                    const auto mask = op.size == 8 ? std::string("4294967295") : std::to_string((std::uint64_t(1) << (op.size * 8)) - 1);
+                    const unsigned bits = op.size * 8;
                     line(depth, "do");
                     line(depth + 1, "local at = address(" + addressPair(op.address, constants) + ")");
                     line(depth + 1, std::format("local oldLo, oldHi = read({}, at)", op.size));
-                    line(depth + 1, std::format("local lo, hi = addFlags(false, true, {}, oldLo, oldHi, {})",
-                        op.size, reg(op.src.index).pair()));
+                    line(depth + 1, std::format("local srcLo, srcHi = bit32.band({}, {}), {}", src.lo, mask,
+                        op.size == 8 ? src.hi : "0"));
+                    // Whether old orders above src, as unsigned or signed values of the operation's width.
+                    const auto above = [&](bool sign) {
+                        if (op.size == 8) {
+                            const auto high = [&](const std::string& word) {
+                                return sign ? std::format("bit32.bxor({}, 2147483648)", word) : word;
+                            };
+                            return std::format("({} > {} or ({} == {} and oldLo > srcLo))", high("oldHi"), high("srcHi"),
+                                high("oldHi"), high("srcHi"));
+                        }
+                        if (!sign)
+                            return std::string("oldLo > srcLo");
+                        return std::format("bit32.bxor(oldLo, {0}) > bit32.bxor(srcLo, {0})", std::uint64_t(1) << (bits - 1));
+                    };
+                    std::string combined;
+                    switch (op.op) {
+                        case AtomicOp::Add:
+                            combined = op.size == 8 ? "local sum = oldLo + srcLo\n"
+                                "local lo, hi = sum % 4294967296, (oldHi + srcHi + math.floor(sum / 4294967296)) % 4294967296"
+                                : std::format("local lo, hi = (oldLo + srcLo) % {}, 0", std::uint64_t(1) << bits);
+                            break;
+                        case AtomicOp::Clear:
+                            combined = "local lo, hi = bit32.band(oldLo, bit32.bnot(srcLo)), bit32.band(oldHi, bit32.bnot(srcHi))";
+                            break;
+                        case AtomicOp::Xor: combined = "local lo, hi = bit32.bxor(oldLo, srcLo), bit32.bxor(oldHi, srcHi)"; break;
+                        case AtomicOp::Set: combined = "local lo, hi = bit32.bor(oldLo, srcLo), bit32.bor(oldHi, srcHi)"; break;
+                        case AtomicOp::Swap: combined = "local lo, hi = srcLo, srcHi"; break;
+                        case AtomicOp::SignedMax: case AtomicOp::UnsignedMax:
+                            combined = std::format("local lo, hi = if {} then oldLo else srcLo, if {} then oldHi else srcHi",
+                                above(op.op == AtomicOp::SignedMax), above(op.op == AtomicOp::SignedMax));
+                            break;
+                        case AtomicOp::SignedMin: case AtomicOp::UnsignedMin:
+                            combined = std::format("local lo, hi = if {} then srcLo else oldLo, if {} then srcHi else oldHi",
+                                above(op.op == AtomicOp::SignedMin), above(op.op == AtomicOp::SignedMin));
+                            break;
+                    }
+                    std::size_t start = 0;
+                    while (start < combined.size()) {
+                        const auto end = combined.find('\n', start);
+                        line(depth + 1, combined.substr(start, end == std::string::npos ? std::string::npos : end - start));
+                        if (end == std::string::npos)
+                            break;
+                        start = end + 1;
+                    }
                     line(depth + 1, std::format("write({}, at, lo, hi)", op.size));
                     if (op.dst != Zero) {
-                        assign(depth + 1, op.dst, op.size, op.size == 8 ? "oldLo, oldHi" : "oldLo");
+                        assign(depth + 1, op.dst, op.size == 8 ? 8 : 4, op.size == 8 ? "oldLo, oldHi" : "oldLo");
                         constants[op.dst].reset();
+                    }
+                    line(depth, "end");
+                },
+                [&](const CompareSwap& op) {
+                    if (!prepareWrite(depth, op.address, op.size, constants))
+                        return;
+                    const auto compare = reg(op.compare);
+                    const auto value = reg(op.value.index);
+                    const auto mask = op.size == 8 ? std::string("4294967295") : std::to_string((std::uint64_t(1) << (op.size * 8)) - 1);
+                    line(depth, "do");
+                    line(depth + 1, "local at = address(" + addressPair(op.address, constants) + ")");
+                    line(depth + 1, std::format("local oldLo, oldHi = read({}, at)", op.size));
+                    line(depth + 1, std::format("if oldLo == bit32.band({}, {}) and oldHi == {} then", compare.lo, mask,
+                        op.size == 8 ? compare.hi : "0"));
+                    line(depth + 2, std::format("write({}, at, bit32.band({}, {}), {})", op.size, value.lo, mask,
+                        op.size == 8 ? value.hi : "0"));
+                    line(depth + 1, "end");
+                    if (op.compare != Zero) {
+                        assign(depth + 1, op.compare, op.size == 8 ? 8 : 4, op.size == 8 ? "oldLo, oldHi" : "oldLo");
+                        constants[op.compare].reset();
                     }
                     line(depth, "end");
                 },
@@ -1186,6 +1597,15 @@ private:
                 },
                 [&](const ConditionalMove& move) {
                     const auto dst = reg(move.dst);
+                    if (move.size == 2) {
+                        line(depth, "do");
+                        line(depth + 1, "local operand = " + value(move.src, 2, constants));
+                        line(depth + 1, std::format("if {} then {} = bit32.replace({}, operand, 0, 16) end",
+                            X64Conditions[move.condition], dst.lo, dst.lo));
+                        line(depth, "end");
+                        constants[move.dst].reset();
+                        return;
+                    }
                     const auto source = value(move.src, move.size, constants);
                     line(depth, "do");
                     line(depth + 1, "local operandLo, operandHi = " + source + (move.size == 4 ? ", 0" : ""));
@@ -1339,16 +1759,14 @@ private:
                     } else {
                         const auto& mem = std::get<Memory>(set.dst);
                         if (prepareWrite(depth, mem.address, 1, constants))
-                            line(depth, std::format("write(1, {}, {}, 0)", memoryAddress(mem.address, constants),
-                                byte));
+                            line(depth, memoryWrite(1, mem.address, constants, byte + ", 0"));
                     }
                 },
                 [&](const Binary& op) { binary(depth, op, constants, setFlags); },
                 [&](const MemoryBinary& op) { memoryBinary(depth, op, constants, setFlags && op.flags); },
                 [&](const Store& store) {
                     if (prepareWrite(depth, store.address, store.size, constants))
-                        line(depth, std::format("write({}, {}, {})", store.size,
-                            memoryAddress(store.address, constants), value(store.src, 8, constants)));
+                        line(depth, memoryWrite(store.size, store.address, constants, value(store.src, 8, constants)));
                 },
                 [&](const PairTransfer& pair) {
                     auto second = pair.address;
@@ -1365,8 +1783,7 @@ private:
                                     line(depth + 2, joinLanes(lanes) + " = lo, hi, 0, 0");
                                     line(depth + 1, "end");
                                 } else if (prepareWrite(depth + 1, address, pair.size, constants)) {
-                                    line(depth + 1, std::format("write({}, {}, {}, {})", pair.size,
-                                        memoryAddress(address, constants), lanes[0], lanes[1]));
+                                    line(depth + 1, memoryWrite(pair.size, address, constants, lanes[0] + ", " + lanes[1]));
                                 }
                             } else if (pair.load) {
                                 if (auto source = readVector(depth + 1, VectorMemory{address, false}, constants))
@@ -1394,10 +1811,8 @@ private:
                         constants[pair.second] = pair.second == Zero ? Constants::value_type(0) : std::nullopt;
                     } else if (prepareWrite(depth + 1, pair.address, pair.size, constants) &&
                         prepareWrite(depth + 1, second, pair.size, constants)) {
-                        line(depth + 1, std::format("write({}, {}, {})",
-                            pair.size, memoryAddress(pair.address, constants), reg(pair.first).pair()));
-                        line(depth + 1, std::format("write({}, {}, {})",
-                            pair.size, memoryAddress(second, constants), reg(pair.second).pair()));
+                        line(depth + 1, memoryWrite(pair.size, pair.address, constants, reg(pair.first).pair()));
+                        line(depth + 1, memoryWrite(pair.size, second, constants, reg(pair.second).pair()));
                     }
                     if (pair.writeback) {
                         const auto cell = reg(pair.address.base);
@@ -1656,6 +2071,18 @@ private:
                 },
                 [&](const ByteSwap& op) {
                     const auto source = reg(op.src.index);
+                    if (op.unit) {
+                        // Within words the halves keep their places; within halfwords the bytes of each trade.
+                        const auto swap = [&](const std::string& word) {
+                            return op.unit == 4 ? "bit32.byteswap(" + word + ")" : std::format(
+                                "bit32.bor(bit32.lshift(bit32.band({0}, 0x00ff00ff), 8), bit32.band(bit32.rshift({0}, 8), 0x00ff00ff))",
+                                word);
+                        };
+                        assign(depth, op.dst, op.size, op.size == 8 ? swap(source.lo) + ", " + swap(source.hi) : swap(source.lo));
+                        if (op.dst != Zero)
+                            constants[op.dst].reset();
+                        return;
+                    }
                     const std::string helper = op.reverseBits ? "reverseBits" : "bit32.byteswap";
                     needsShift |= op.reverseBits;
                     const auto lo = helper + "(" + source.lo + ")";
@@ -1685,7 +2112,7 @@ private:
                         } else {
                             const auto& at = std::get<Memory>(bit.target).address;
                             if (prepareWrite(depth + 1, at, bit.size, constants))
-                                line(depth + 1, std::format("write({}, {}, lo, hi)", bit.size, memoryAddress(at, constants)));
+                                line(depth + 1, memoryWrite(bit.size, at, constants, "lo, hi"));
                         }
                     }
                     line(depth, "end");
@@ -1758,6 +2185,26 @@ private:
                     needsAddFlags = true;
                     const auto accumulator = reg(0);
                     const auto source = reg(exchange.src.index);
+                    if (exchange.size == 1) {
+                        line(depth, "do");
+                        line(depth + 1, "local at = address(" + addressPair(exchange.address, constants) + ")");
+                        line(depth + 1, "local oldByte = (read(1, at))");
+                        line(depth + 1, std::format("local _, _, c, o, n, z = addFlags(true, false, 1, bit32.band({}, 255), 0, oldByte, 0)",
+                            accumulator.lo));
+                        if (setFlags) {
+                            line(depth + 1, "carry, overflow, negative, zero = c, o, n, z");
+                            if (features.parity)
+                                line(depth + 1, std::format("parity = evenParity(({} - oldByte) % 256)", accumulator.lo));
+                        }
+                        line(depth + 1, "if z then");
+                        line(depth + 2, std::format("write(1, at, bit32.extract({}, {}, 8), 0)", source.lo, exchange.srcField));
+                        line(depth + 1, "else");
+                        line(depth + 2, std::format("{0} = bit32.replace({0}, oldByte, 0, 8)", accumulator.lo));
+                        line(depth + 1, "end");
+                        line(depth, "end");
+                        constants[0].reset();
+                        return;
+                    }
                     line(depth, "do");
                     line(depth + 1, "local at = address(" + addressPair(exchange.address, constants) + ")");
                     line(depth + 1, std::format("local oldLo, oldHi = read({}, at)", exchange.size));
@@ -1796,17 +2243,86 @@ private:
                         constants[index].reset();
                 },
                 [&](const VectorBinary& binary) { vectorBinary(depth, binary, constants); },
-                [&](const InterleavedLoad4& load) {
-                    for (unsigned reg = 0; reg < 4; ++reg) {
-                        const auto dst = xmm(VectorRegister{(load.first.index + reg) % 32});
-                        for (unsigned lane = 0; lane < 16 / load.elementSize; ++lane) {
-                            auto address = load.address;
-                            address.displacement += (lane * 4 + reg) * load.elementSize;
-                            const auto word = lane * (load.elementSize / 4);
-                            const auto fields = load.elementSize == 8 ? dst[word] + ", " + dst[word + 1] : dst[word];
-                            line(depth, fields + " = " + read(address, load.elementSize, constants));
+                [&](const InterleavedTransfer& op) {
+                    const unsigned elements = op.size / op.elementSize;
+                    const auto at = [&](unsigned reg, unsigned element) {
+                        auto address = op.address;
+                        address.displacement += (element * op.count + reg) * op.elementSize;
+                        return address;
+                    };
+                    for (unsigned reg = 0; reg < op.count; ++reg) {
+                        const auto lanes = xmm(VectorRegister{(op.first.index + reg) % 32});
+                        if (op.store) {
+                            for (unsigned element = 0; element < elements; ++element) {
+                                std::string value;
+                                if (op.elementSize == 8)
+                                    value = lanes[element * 2] + ", " + lanes[element * 2 + 1];
+                                else if (op.elementSize == 4)
+                                    value = lanes[element] + ", 0";
+                                else
+                                    value = std::format("bit32.extract({}, {}, {}), 0", lanes[element * op.elementSize / 4],
+                                        element * op.elementSize % 4 * 8, op.elementSize * 8);
+                                const auto address = at(reg, element);
+                                if (prepareWrite(depth, address, op.elementSize, constants))
+                                    line(depth, memoryWrite(op.elementSize, address, constants, value));
+                            }
+                            continue;
+                        }
+                        if (op.elementSize == 8) {
+                            for (unsigned element = 0; element < elements; ++element)
+                                line(depth, std::format("{}, {} = {}", lanes[element * 2], lanes[element * 2 + 1],
+                                    read(at(reg, element), 8, constants)));
+                            continue;
+                        }
+                        Lanes words{"0", "0", "0", "0"};
+                        const unsigned perWord = 4 / op.elementSize;
+                        for (unsigned word = 0; word < op.size / 4; ++word) {
+                            for (unsigned part = 0; part < perWord; ++part) {
+                                const auto value = "(" + read(at(reg, word * perWord + part), op.elementSize, constants) + ")";
+                                words[word] = part == 0 ? value : std::format("bit32.bor({}, bit32.lshift({}, {}))",
+                                    words[word], value, part * op.elementSize * 8);
+                            }
+                        }
+                        line(depth, joinLanes(lanes) + " = " + joinLanes(words));
+                    }
+                },
+                [&](const VectorFusedMultiply& op) {
+                    // Like scalar FMADD, the product and the sum are computed in a double and rounded once to the lane.
+                    needsFloating = true;
+                    const auto dst = xmm(op.dst), a = xmm(op.a), b = xmm(op.b);
+                    const auto lane = [&](const Lanes& lanes, unsigned index) {
+                        return op.element == 8 ? std::format("decodeFloat(8, {}, {})", lanes[index * 2], lanes[index * 2 + 1])
+                                               : std::format("decodeFloat(4, {}, 0)", lanes[index]);
+                    };
+                    const unsigned count = op.size / op.element;
+                    line(depth, "do");
+                    Lanes result{"0", "0", "0", "0"};
+                    for (unsigned index = 0; index < count; ++index) {
+                        const auto product = std::format("{}{} * {}", op.negateProduct ? "-" : "", lane(a, index),
+                            lane(b, op.bLane.value_or(index)));
+                        const auto expression = std::format("encodeFloat({}, {} + {})", op.element, lane(dst, index), product);
+                        if (op.element == 8) {
+                            line(depth + 1, std::format("local lane{0}Lo, lane{0}Hi = {1}", index, expression));
+                            result[index * 2] = std::format("lane{}Lo", index);
+                            result[index * 2 + 1] = std::format("lane{}Hi", index);
+                        } else {
+                            line(depth + 1, std::format("local lane{} = ({})", index, expression));
+                            result[index] = std::format("lane{}", index);
                         }
                     }
+                    line(depth + 1, joinLanes(dst) + " = " + joinLanes(result));
+                    line(depth, "end");
+                },
+                [&](const VectorTable& op) {
+                    needsVector = true;
+                    const auto indices = xmm(op.indices);
+                    const auto dst = xmm(op.dst);
+                    std::string tables;
+                    for (unsigned reg = 0; reg < op.count; ++reg)
+                        tables += ", " + joinLanes(xmm(VectorRegister{(op.table.index + reg) % 32}));
+                    const auto kept = op.extend ? joinLanes(dst) : std::string("0, 0, 0, 0");
+                    line(depth, std::format("{} = vectorTable({}, {}, {}, {}{})", joinLanes(dst), op.count * 16, op.size,
+                        joinLanes(indices), kept, tables));
                 },
                 [&](const VectorSplat& op) {
                     const auto src = reg(op.src.index);
@@ -1820,17 +2336,32 @@ private:
                 [&](const VectorWiden& op) {
                     const auto src = xmm(op.src);
                     const unsigned base = op.upper ? 2 : 0;
+                    // An element `bits` wide at bit `at` of a word, zero- or sign-extended to 32 bits.
+                    const auto element = [&](const std::string& word, unsigned at, unsigned bits) {
+                        return op.sign ? std::format("bit32.arshift(bit32.lshift({}, {}), {})", word, 32 - at - bits, 32 - bits)
+                                       : std::format("bit32.extract({}, {}, {})", word, at, bits);
+                    };
+                    const auto shifted = [&](const std::string& value) {
+                        return op.shift ? std::format("bit32.lshift({}, {})", value, op.shift) : value;
+                    };
                     Lanes result;
-                    if (op.bits == 16) {
+                    if (op.bits == 8) {
                         for (unsigned lane = 0; lane < 4; ++lane) {
-                            const auto value = std::format("bit32.extract({}, {}, 16)", src[base + lane / 2], (lane % 2) * 16);
-                            result[lane] = op.shift ? std::format("bit32.lshift({}, {})", value, op.shift) : value;
+                            const auto& word = src[base + lane / 2];
+                            const auto low = element(word, (lane % 2) * 16, 8);
+                            const auto high = element(word, (lane % 2) * 16 + 8, 8);
+                            result[lane] = std::format("bit32.bor(bit32.band({}, 65535), bit32.lshift({}, 16))",
+                                shifted(low), shifted(high));
                         }
+                    } else if (op.bits == 16) {
+                        for (unsigned lane = 0; lane < 4; ++lane)
+                            result[lane] = shifted(element(src[base + lane / 2], (lane % 2) * 16, 16));
                     } else {
                         for (unsigned lane = 0; lane < 2; ++lane) {
                             const auto& value = src[base + lane];
-                            result[lane * 2] = op.shift ? std::format("bit32.lshift({}, {})", value, op.shift) : value;
-                            result[lane * 2 + 1] = op.shift ? std::format("bit32.rshift({}, {})", value, 32 - op.shift) : "0";
+                            result[lane * 2] = shifted(value);
+                            result[lane * 2 + 1] = op.sign ? std::format("bit32.arshift({}, {})", value, 32 - op.shift)
+                                : op.shift ? std::format("bit32.rshift({}, {})", value, 32 - op.shift) : "0";
                         }
                     }
                     line(depth, joinLanes(xmm(op.dst)) + " = " + joinLanes(result));
@@ -1862,7 +2393,7 @@ private:
                         } else {
                             const auto& addr = std::get<VectorMemory>(move.dst).address;
                             if (prepareWrite(depth, addr, move.size, constants))
-                                line(depth, std::format("write({}, {}, {})", move.size, memoryAddress(addr, constants), source));
+                                line(depth, memoryWrite(move.size, addr, constants, source));
                         }
                         return;
                     }
@@ -1925,7 +2456,7 @@ private:
                     } else {
                         const auto& at = std::get<VectorMemory>(move.dst).address;
                         if (prepareWrite(depth, at, 8, constants))
-                            line(depth, std::format("write(8, {}, {})", memoryAddress(at, constants), data));
+                            line(depth, memoryWrite(8, at, constants, data));
                     }
                 },
                 [&](const VectorShiftBytes& shift) {
@@ -2048,6 +2579,25 @@ private:
                     }
                     line(depth, "end");
                 },
+                [&](const VectorTest& test) {
+                    if (!setFlags)
+                        return;
+                    needsVector = true;
+                    line(depth, "do");
+                    if (const auto rhs = operandLanes(depth + 1, test.rhs, constants, "rhs")) {
+                        const auto lhs = xmm(test.lhs);
+                        std::string both, inverse;
+                        for (unsigned lane = 0; lane < 4; ++lane) {
+                            both += std::format("{}bit32.band({}, {}) == 0", lane ? " and " : "", lhs[lane], (*rhs)[lane]);
+                            inverse += std::format("{}bit32.band(bit32.bnot({}), {}) == 0", lane ? " and " : "", lhs[lane],
+                                (*rhs)[lane]);
+                        }
+                        line(depth + 1, std::format("zero, carry, overflow, negative = {}, {}, false, false", both, inverse));
+                        if (features.parity)
+                            line(depth + 1, "parity = false");
+                    }
+                    line(depth, "end");
+                },
                 [&](const FloatCompare& compare) {
                     needsFloating = true;
                     line(depth, "do");
@@ -2103,16 +2653,29 @@ private:
                         input));
                     constants[op.dst].reset();
                 },
+                [&](const FloatingControlWrite& control) {
+                    if (control.src == Zero)
+                        return;
+                    const auto value = reg(control.src);
+                    line(depth, std::format("if {} ~= 0 or {} ~= 0 then error(\"unsupported guest floating-point control mode\", 0) end",
+                        value.lo, value.hi));
+                },
                 [&](const FloatingControl& control) {
                     usesFloatingControl = true;
-                    const auto cell = control.size == 4 ? "mxcsr" : "x87Control";
+                    // FLDCW and FNSTCW share the x87 unit's control word, whose rounding and precision fields it
+                    // follows; only unmasked exceptions are unsupported. MXCSR must keep its default.
+                    const bool x87 = control.size == 2;
+                    if (x87)
+                        needsX87 = true;
+                    const auto cell = x87 ? "x87Control" : "mxcsr";
                     if (control.load) {
                         line(depth, std::string(cell) + " = " + read(control.address, control.size, constants));
-                        const auto check = control.size == 4 ? "bit32.band(mxcsr, 0xffffffc0) ~= 0x1f80" : "x87Control ~= 0x037f";
+                        const auto check = x87 ? "bit32.band(x87Control, 0x3f) ~= 0x3f" : "bit32.band(mxcsr, 0xffffffc0) ~= 0x1f80";
                         line(depth, std::format("if {} then error(\"unsupported guest floating-point control mode\", 0) end", check));
+                        if (x87)
+                            line(depth, "fpu.control = x87Control");
                     } else if (prepareWrite(depth, control.address, control.size, constants)) {
-                        line(depth, std::format("write({}, {}, {}, 0)", control.size,
-                            memoryAddress(control.address, constants), cell));
+                        line(depth, memoryWrite(control.size, control.address, constants, x87 ? "fpu.control, 0" : "mxcsr, 0"));
                     }
                 },
                 [&](const VectorLanes& op) {
@@ -2242,7 +2805,10 @@ private:
                         Lanes result;
                         for (unsigned lane = 0; lane < 4; ++lane) {
                             auto bits = mask[lane];
-                            if (op.laneSign) {
+                            if (op.laneSign && op.element == 1) {
+                                // Each byte's top bit, spread over the byte.
+                                bits = std::format("(bit32.band(bit32.rshift({}, 7), 16843009) * 255)", mask[lane]);
+                            } else if (op.laneSign) {
                                 const auto top = op.element == 8 ? mask[lane | 1] : mask[lane];
                                 bits = "(if " + top + " >= 2147483648 then 4294967295 else 0)";
                             }
@@ -2350,6 +2916,19 @@ private:
                     line(depth, std::format("{0} = bit32.replace({0}, bit32.extract({1}, {2}, {3}), {4}, {3})", dst[to / 32],
                         src[from / 32], from % 32, bits, to % 32));
                 },
+                [&](const VectorLaneStore& op) {
+                    const auto src = xmm(op.src);
+                    std::string value;
+                    if (op.element == 8)
+                        value = src[op.lane * 2] + ", " + src[op.lane * 2 + 1];
+                    else if (op.element == 4)
+                        value = src[op.lane] + ", 0";
+                    else
+                        value = std::format("bit32.extract({}, {}, {}), 0", src[op.lane * op.element / 4],
+                            op.lane * op.element % 4 * 8, op.element * 8);
+                    if (prepareWrite(depth, op.address, op.element, constants))
+                        line(depth, memoryWrite(op.element, op.address, constants, value));
+                },
                 [&](const VectorLaneLoad& op) {
                     const auto dst = xmm(op.dst);
                     const auto value = read(op.address, op.element, constants);
@@ -2421,7 +3000,180 @@ private:
         line(depth, "if budget < 0 then error(\"guest instruction limit exceeded\", 0) end");
     }
 
+    // Where the arms of the branch or jump table ending at `pc` meet again, when they form a single-entry region:
+    // every block they reach before the branch's post-dominator, and the post-dominator itself, is entered only
+    // from inside. The routine then continues at the join after the arms instead of outlining it, which saves a
+    // trip through runGuestRoutine and emits the join once.
+    // The region between the branch at `pc` and `join`: the blocks its arms reach before the join. It qualifies
+    // when it has no other entry: neither the join nor any block in it is entered from outside, so no other
+    // routine reaches the join through it.
+    // Inside a recovered loop the region stays in its body: its arms continue the loop at the header and leave it
+    // at its exits.
+    std::optional<Join> singleEntry(Address pc, Address join, const std::set<Address>* body, Address header) const {
+        if (join == pc || !graph.contains(join) || entries.contains(join) || data.landingPads.contains(join))
+            return std::nullopt;
+        if (body && (join == header || !body->contains(join)))
+            return std::nullopt;
+        constexpr std::size_t Limit = 512;
+        std::set<Address> inside;
+        std::vector<Address> work;
+        // Control flow into another function's entry, such as a tail jump, leaves the region: if that function's
+        // code came back to the region or the join, the block it entered would have an outside predecessor.
+        const auto visit = [&](Address node) {
+            visitSuccessors(graph.at(node), [&](Address target) {
+                if (body && (target == header || !body->contains(target)))
+                    return;
+                if (target != join && target != pc && graph.contains(target) && !entries.contains(target) &&
+                    inside.insert(target).second)
+                    work.push_back(target);
+            });
+        };
+        visit(pc);
+        while (!work.empty() && inside.size() <= Limit) {
+            const auto node = work.back();
+            work.pop_back();
+            visit(node);
+        }
+        if (inside.size() > Limit)
+            return std::nullopt;
+        const auto enclosed = [&](Address node) {
+            if (node != join && data.landingPads.contains(node))
+                return false;
+            const auto from = predecessorBlocks.find(node);
+            return from == predecessorBlocks.end() || std::ranges::all_of(from->second, [&](Address source) {
+                return source == pc || inside.contains(source);
+            });
+        };
+        if (!enclosed(join) || !std::ranges::all_of(inside, enclosed))
+            return std::nullopt;
+        return Join{join, std::move(inside)};
+    }
+
+    // Where the arms of the branch or jump table ending at `pc` meet again: its post-dominator, or, where some
+    // paths leave through another exit, the nearest block that several paths enter, if its region has a single
+    // entry. Any choice is correct, since an arm that never reaches the join ends in a return or another
+    // transfer of its own; this one keeps routines from duplicating code.
+    const Join* structuredJoin(Address pc) {
+        const auto header = activeLoops.empty() ? ~Address(0) : activeLoops.back();
+        const auto* body = activeLoops.empty() ? nullptr : &loopBodies.at(header);
+        if (const auto cached = joins.find({pc, header}); cached != joins.end())
+            return cached->second ? &*cached->second : nullptr;
+        auto& result = joins[{pc, header}];
+        if (const auto found = postDominators.find(pc); found != postDominators.end())
+            result = singleEntry(pc, found->second, body, header);
+        if (!result) {
+            constexpr std::size_t Candidates = 4, Search = 64;
+            std::vector<Address> order;
+            std::set<Address> seen{pc};
+            visitSuccessors(graph.at(pc), [&](Address target) {
+                if (graph.contains(target) && seen.insert(target).second)
+                    order.push_back(target);
+            });
+            std::size_t tried = 0;
+            for (std::size_t i = 0; i < order.size() && i < Search && tried < Candidates && !result; ++i) {
+                const auto node = order[i];
+                if (body && (node == header || !body->contains(node)))
+                    continue;
+                if (const auto found = predecessors.find(node); found != predecessors.end() && found->second > 1) {
+                    ++tried;
+                    result = singleEntry(pc, node, body, header);
+                }
+                if (entries.contains(node))
+                    continue;
+                visitSuccessors(graph.at(node), [&](Address target) {
+                    if (graph.contains(target) && seen.insert(target).second)
+                        order.push_back(target);
+                });
+            }
+        }
+        return result ? &*result : nullptr;
+    }
+
+    static bool jumpBufferImport(std::string_view name) {
+        return name.find("setjmp") != std::string_view::npos;
+    }
+
+    // Whether the loop headed at `header` calls setjmp, which a recovered loop cannot hold: such a loop stays
+    // unstructured.
+    bool savesJumpBuffer(Address header) {
+        if (const auto cached = jumpBufferLoops.find(header); cached != jumpBufferLoops.end())
+            return cached->second;
+        bool saves = false;
+        if (const auto body = loopBodies.find(header); body != loopBodies.end()) {
+            for (const auto node : body->second) {
+                const auto* call = std::get_if<Call>(&graph.at(node).end);
+                if (!call)
+                    continue;
+                const auto* import = findImport(call->target, Constants{}, true);
+                if (!import)
+                    if (const auto start = resolveTarget(call->target, Constants{}))
+                        if (const auto thunk = followThunk(*start))
+                            import = findImport(Immediate{std::uint64_t(thunk->target)}, Constants{}, true);
+                if (import && jumpBufferImport(importName(*import)))
+                    saves = true;
+            }
+        }
+        return jumpBufferLoops[header] = saves;
+    }
+    std::map<Address, bool> jumpBufferLoops;
+
+    // Whether the code from `pc` to the end of the region is small enough to emit once per path that reaches it.
+    bool smallTail(const Join& region, Address pc) {
+        const auto key = std::pair{&region, pc};
+        if (const auto found = tails.find(key); found != tails.end())
+            return found->second;
+        constexpr std::size_t MaxBlocks = 6, MaxEffects = 24;
+        std::set<Address> seen{pc};
+        std::vector<Address> work{pc};
+        std::size_t effects = 0;
+        bool small = true;
+        while (!work.empty() && small) {
+            const auto node = work.back();
+            work.pop_back();
+            const auto& block = graph.at(node);
+            effects += block.effects.size() + 1;
+            small = seen.size() <= MaxBlocks && effects <= MaxEffects && !std::holds_alternative<Call>(block.end);
+            visitSuccessors(block, [&](Address target) {
+                if (region.inside.contains(target) && seen.insert(target).second)
+                    work.push_back(target);
+            });
+        }
+        return tails[key] = small;
+    }
+    std::map<std::pair<const Join*, Address>, bool> tails;
+
+    // Emits the arms of a branch or jump table, each by `arm`, then continues at their join when they have one.
+    void arms(Address pc, unsigned depth, const auto& arm) {
+        const auto* region = structuredJoin(pc);
+        // A join that is a routine already, or will be, is not emitted a second time here.
+        if (region && functions.contains(region->join))
+            region = nullptr;
+        if (!region) {
+            arm();
+            return;
+        }
+        Stop inner{region, activeLoops.size()};
+        auto* outer = std::exchange(stop, &inner);
+        structured.push_back(&inner);
+        arm();
+        structured.pop_back();
+        stop = outer;
+        if (!inner.reached)
+            return;
+        if (inner.split) {
+            outline(depth, region->join);
+            return;
+        }
+        continuing = region->join;
+        this->region(region->join, depth, {});
+    }
+
     void region(Address pc, unsigned depth, Constants constants) {
+        const bool continued = std::exchange(continuing, std::nullopt) == pc;
+        if (stop && stop->region->join == pc && stop->loops == activeLoops.size()) {
+            stop->reached = true;
+            return;
+        }
         constants[Zero] = 0;
         if (!activeLoops.empty()) {
             const auto header = activeLoops.back();
@@ -2432,7 +3184,7 @@ private:
             }
             if (const auto exit = std::ranges::find(exits, pc); exit != exits.end()) {
                 if (exits.size() > 1)
-                    line(depth, std::format("loopExit_{:x} = {}", header, exit - exits.begin() + 1));
+                    line(depth, std::format("loopExit = {}", exit - exits.begin() + 1));
                 line(depth, "break");
                 return;
             }
@@ -2446,24 +3198,26 @@ private:
             return;
         }
         if (const auto loop = loops.find(pc); loop != loops.end() &&
-            (activeLoops.empty() || activeLoops.back() != pc)) {
+            (activeLoops.empty() || activeLoops.back() != pc) && !savesJumpBuffer(pc)) {
             const auto& exits = loop->second;
             const auto outerRemaining = remaining;
             remaining = 96;
             activeLoops.push_back(pc);
-            if (exits.size() > 1)
-                line(depth, std::format("local loopExit_{:x} = 0", pc));
+            // Which exit left a loop is read as soon as it ends, so one local serves every loop of a routine.
+            usesLoopExit |= exits.size() > 1;
+            const auto loopStart = body.size();
             line(depth, "while true do");
             tick(depth + 1, 1);
             region(pc, depth + 1, {});
             line(depth, "end");
+            cacheLoopRegisters(loopStart, depth);
             activeLoops.pop_back();
             remaining = outerRemaining;
             if (exits.size() == 1) {
                 region(exits.front(), depth, {});
             } else {
                 for (std::size_t i = 0; i < exits.size(); ++i) {
-                    line(depth, std::format("{} loopExit_{:x} == {} then", i == 0 ? "if" : "elseif", pc, i + 1));
+                    line(depth, std::format("{} loopExit == {} then", i == 0 ? "if" : "elseif", i + 1));
                     region(exits[i], depth + 1, {});
                 }
                 line(depth, "else");
@@ -2475,8 +3229,15 @@ private:
         active.insert(pc);
         // Share branch joins instead of duplicating their continuations.
         const auto join = predecessors.find(pc);
-        if (activeLoops.empty() && pc != regionEntry && (remaining == 0 ||
-            (join != predecessors.end() && join->second > 1))) {
+        // A join inside a structured branch's region is entered only from that region: each arm that reaches it
+        // emits its own copy, which ends at the region's join, within the routine's budget.
+        const bool enclosed = stop && stop->loops == activeLoops.size() && stop->region->inside.contains(pc) &&
+            smallTail(*stop->region, pc);
+        // Landing pads and function entries are routines of their own, entered by unwinding and calls: code that
+        // reaches one otherwise, such as a tail jump or the padding after a call that never returns, shares it.
+        const bool shared = data.landingPads.contains(pc) || entries.contains(pc);
+        if (activeLoops.empty() && pc != regionEntry && (remaining == 0 || shared ||
+            (!continued && !enclosed && join != predecessors.end() && join->second > 1))) {
             outline(depth, pc);
             active.erase(pc);
             return;
@@ -2493,6 +3254,7 @@ private:
                 const auto exit = taken ? branch->other : branch->taken;
                 auto loopConstants = Constants{};
                 loopConstants[Zero] = 0;
+                const auto loopStart = body.size();
                 line(depth, "while true do");
                 std::size_t count = 0;
                 for (const auto address : loop) {
@@ -2508,6 +3270,7 @@ private:
                 for (const auto address : loop)
                     effects(depth + 1, address, graph.at(address), loopConstants);
                 line(depth, "end");
+                cacheLoopRegisters(loopStart, depth);
                 region(exit, depth, {});
                 active.erase(pc);
                 return;
@@ -2526,29 +3289,69 @@ private:
         }
         effects(depth, pc, block, constants);
         if (target) {
-            const auto* imported = arm ? findImport(Immediate{std::uint64_t(*target)}, constants, true) : nullptr;
+            auto destination = *target;
+            const auto* imported = arm ? findImport(Immediate{std::uint64_t(destination)}, constants, true) : nullptr;
+            // A tail jump through thunks continues at their final target, with the registers they load.
+            if (!imported)
+                if (const auto thunk = followThunk(destination)) {
+                    const auto* final = arm ? findImport(Immediate{std::uint64_t(thunk->target)}, Constants{}, true) : nullptr;
+                    if (final || graph.contains(thunk->target)) {
+                        for (const auto& [index, word] : thunk->writes)
+                            assign(depth, index, 8, wordLiteral(word).pair());
+                        destination = thunk->target;
+                        imported = final;
+                    }
+                }
             if (imported && tailImport(depth, *imported))
                 returnFromFunction(depth, Return{Register{30}});
             else
-                region(*target, depth, constants);
+                region(destination, depth, destination == *target ? constants : Constants{});
         } else if (branch) {
-            line(depth, "if " + condition(branch->condition) + " then");
-            region(branch->taken, depth + 1, constants);
-            line(depth, "else");
-            region(branch->other, depth + 1, constants);
-            line(depth, "end");
+            arms(pc, depth, [&] {
+                line(depth, "if " + condition(branch->condition) + " then");
+                region(branch->taken, depth + 1, constants);
+                line(depth, "else");
+                region(branch->other, depth + 1, constants);
+                line(depth, "end");
+            });
         } else if (const auto* call = std::get_if<Call>(&block.end)) {
             const auto* imported = findImport(call->target, constants, true);
-            const auto name = imported ? importName(*imported) : std::string_view{};
+            auto name = imported ? importName(*imported) : std::string_view{};
+            const auto jumpBuffer = [&](std::string_view name) {
+                return name == "_setjmp" || name == "setjmp" || name == "_setjmpex" || name == "__sigsetjmp" ||
+                    name == "sigsetjmp";
+            };
+            // A call through thunks calls their final target: the registers they load are set to the same values.
+            std::optional<Thunk> thunk;
+            if (!imported)
+                if (const auto start = resolveTarget(call->target, constants))
+                    thunk = followThunk(*start);
+            if (thunk) {
+                const auto* final = findImport(Immediate{std::uint64_t(thunk->target)}, Constants{}, true);
+                if (final && jumpBuffer(importName(*final)))
+                    thunk.reset();
+                else if (final) {
+                    imported = final;
+                    name = importName(*final);
+                }
+            }
+            const auto thunkWrites = [&] {
+                if (thunk)
+                    for (const auto& [index, word] : thunk->writes)
+                        assign(depth, index, 8, wordLiteral(word).pair());
+            };
             if ((convention != CallingConvention::Microsoft || (imported && runtimeLibrary(imported->library))) &&
-                (name == "_setjmp" || name == "setjmp" || name == "_setjmpex" || name == "__sigsetjmp" || name == "sigsetjmp")) {
+                jumpBuffer(name)) {
                 emitSetjmp(depth, call->resume);
-            } else if (callResume = call->resume; imported && emitImport(depth, *imported)) {
+            } else if (callResume = call->resume; imported && (thunkWrites(), emitImport(depth, *imported))) {
                 callResume.reset();
                 region(call->resume, depth, {});
-            } else if (const auto callee = resolveTarget(call->target, constants)) {
+            } else if (const auto callee = thunk ? std::optional<Address>(thunk->target) :
+                resolveTarget(call->target, constants)) {
                 addFunction(*callee);
                 callPrologue(depth, call->resume);
+                if (!imported)
+                    thunkWrites();
                 callRoutine(depth, routine(*callee), call->resume);
                 region(call->resume, depth, {});
             } else if (callResume = call->resume; emitImport(depth, call->target, constants)) {
@@ -2556,7 +3359,7 @@ private:
                 region(call->resume, depth, {});
             } else if (const auto* direct = findImport(call->target, constants)) {
                 trap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
-            } else if (!imported && !addressTaken.empty() &&
+            } else if (!imported && (!addressTaken.empty() || !data.tokenSlots.empty()) &&
                 (std::holds_alternative<Register>(call->target) || std::holds_alternative<Memory>(call->target))) {
                 emitFunctionPointer(depth, call->target, call->resume, constants);
             } else {
@@ -2565,23 +3368,25 @@ private:
         } else if (const auto* jump = std::get_if<Jump>(&block.end)) {
             if (!jump->destinations.empty()) {
                 const auto selector = reg(std::get<Register>(jump->target).index);
-                bool first = true;
-                for (const auto destination : jump->destinations) {
-                    line(depth, std::format("{} {} == {} and {} == 0 then", first ? "if" : "elseif",
-                        selector.lo, destination, selector.hi));
-                    region(destination, depth + 1, {});
-                    first = false;
-                }
-                line(depth, "else");
-                trap(depth + 1, std::format("guest jump table target is outside the resolved cases at {:#x}", pc));
-                line(depth, "end");
+                arms(pc, depth, [&] {
+                    bool first = true;
+                    for (const auto destination : jump->destinations) {
+                        line(depth, std::format("{} {} == {} and {} == 0 then", first ? "if" : "elseif",
+                            selector.lo, destination, selector.hi));
+                        region(destination, depth + 1, {});
+                        first = false;
+                    }
+                    line(depth, "else");
+                    trap(depth + 1, std::format("guest jump table target is outside the resolved cases at {:#x}", pc));
+                    line(depth, "end");
+                });
             } else if (const auto target = resolveTarget(jump->target, constants))
                 region(*target, depth, constants);
             else if (tailImport(depth, jump->target, constants))
                 returnFromFunction(depth, arm ? Return{Register{30}} : Return{StackTop{}});
             else if (const auto* direct = findImport(jump->target, constants))
                 trap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
-            else if (!addressTaken.empty() && (std::holds_alternative<Register>(jump->target) ||
+            else if ((!addressTaken.empty() || !data.tokenSlots.empty()) && (std::holds_alternative<Register>(jump->target) ||
                 (std::holds_alternative<Memory>(jump->target) && !findImport(jump->target, constants, true)))) {
                 includeFunctionPointers();
                 needsMemory = true;
@@ -2607,6 +3412,9 @@ private:
     }
 
     void outline(unsigned depth, Address pc) {
+        for (auto* enclosing : structured)
+            if (enclosing->region->inside.contains(pc))
+                enclosing->split = true;
         addFunction(pc);
         tick(depth, 1);
         line(depth, "return " + routine(pc));
@@ -2672,9 +3480,16 @@ private:
         needsJumpFrames = true;
         needsMemory = true;
         const auto environment = reg(argumentRegisters(arm, convention)[0]);
+        // The registers each ABI preserves across calls, which longjmp restores: Windows x64 adds RSI and RDI to
+        // System V's, and XMM6-XMM15 whole; AAPCS64 keeps the low halves of V8-V15.
         constexpr std::array x64Saved{3u, 4u, 5u, 12u, 13u, 14u, 15u};
+        constexpr std::array windowsSaved{3u, 4u, 5u, 6u, 7u, 12u, 13u, 14u, 15u};
         constexpr std::array armSaved{19u, 20u, 21u, 22u, 23u, 24u, 25u, 26u, 27u, 28u, 29u, 30u, 31u};
-        const auto nonvolatile = arm ? std::span<const unsigned>(armSaved) : std::span<const unsigned>(x64Saved);
+        const bool windows = convention == CallingConvention::Microsoft;
+        const auto nonvolatile = arm ? std::span<const unsigned>(armSaved)
+            : windows ? std::span<const unsigned>(windowsSaved) : std::span<const unsigned>(x64Saved);
+        const unsigned firstVector = arm ? 8 : 6, savedLanes = arm ? 2 : 4;
+        const bool savesVectors = arm || windows;
         line(depth, "do");
         if (arm)
             assign(depth + 1, 30, 8, wordLiteral(resume).pair());
@@ -2682,30 +3497,33 @@ private:
             const auto saved = reg(index);
             line(depth + 1, std::format("local saved{}lo, saved{}hi = {}", index, index, saved.pair()));
         }
-        if (arm) {
-            for (unsigned index = 8; index <= 15; ++index) {
-                const auto vector = xmm(VectorRegister{index});
-                line(depth + 1, std::format("local savedVector{}Lo, savedVector{}Hi = {}, {}",
-                    index, index, vector[0], vector[1]));
-            }
+        // Vector lanes go in one table: a routine has at most 200 locals.
+        if (savesVectors) {
+            std::string lanes;
+            for (unsigned index = firstVector; index <= 15; ++index)
+                for (unsigned lane = 0; lane < savedLanes; ++lane)
+                    lanes += (lanes.empty() ? "" : ", ") + xmm(VectorRegister{index})[lane];
+            line(depth + 1, "local savedVectors = {" + lanes + "}");
         }
         line(depth + 1, "local escaped: number? = nil");
         line(depth + 1, std::format("protectJump(jumpFrames, address({}), function(jumpValue: number): ()",
             environment.pair()));
         assign(depth + 2, 0, 8, "jumpValue, 0");
         line(depth + 2, "local function resumeRoutine(expectedReturn: number): any");
+        // The resumed code runs in its own function: it cannot fall through to a join outside it.
+        auto* outer = std::exchange(stop, nullptr);
         region(resume, depth + 3, {});
+        stop = outer;
         line(depth + 2, "end");
         line(depth + 2, "escaped = runGuestRoutine(resumeRoutine, expectedReturn)");
         line(depth + 1, "end, function()");
         for (const auto index : nonvolatile)
             line(depth + 2, std::format("{} = saved{}lo, saved{}hi", reg(index).pair(), index, index));
-        if (arm) {
-            for (unsigned index = 8; index <= 15; ++index) {
-                const auto vector = xmm(VectorRegister{index});
-                line(depth + 2, std::format("{}, {} = savedVector{}Lo, savedVector{}Hi",
-                    vector[0], vector[1], index, index));
-            }
+        if (savesVectors) {
+            unsigned slot = 0;
+            for (unsigned index = firstVector; index <= 15; ++index)
+                for (unsigned lane = 0; lane < savedLanes; ++lane)
+                    line(depth + 2, std::format("{} = savedVectors[{}]", xmm(VectorRegister{index})[lane], ++slot));
         }
         line(depth + 1, "end)");
         line(depth + 1, "return escaped");
@@ -2738,8 +3556,24 @@ private:
 
     // Placeholder addresses for imports loaded into registers. They lie above all guest memory, and calls
     // through them reach generated routines that perform the import.
-    static constexpr std::uint64_t ImportToken = 0xf0000000ull;
+    static constexpr std::uint64_t ImportToken = luau::ImportTokenBase;
     std::map<Address, const GuestImport*> importTokens;
+    // Runtime functions that guest code calls through pointers the runtime hands it, such as a malloc zone's: each
+    // is an import the binary need not have, with a token past every real import slot.
+    std::deque<GuestImport> syntheticImports;
+    std::map<std::string_view, Address> syntheticTokens;
+
+    Address syntheticToken(std::string_view name) {
+        if (const auto known = syntheticTokens.find(name); known != syntheticTokens.end())
+            return known->second;
+        const auto start = MaxExecutableSize + 16 * syntheticImports.size();
+        syntheticImports.push_back(GuestImport{start, 8, name, true});
+        const auto token = Address(ImportToken + start);
+        importTokens.emplace(token, &syntheticImports.back());
+        syntheticTokens.emplace(name, token);
+        includeFunctionPointers();
+        return token;
+    }
 
     const GuestImport* importSlot(const Value& source, const Constants& constants) const {
         const auto* memory = std::get_if<Memory>(&source);
@@ -2836,6 +3670,10 @@ private:
         auto name = import.name;
         if (import.leadingUnderscore && name.starts_with('_'))
             name.remove_prefix(1);
+        // Darwin names variants of a function with suffixes, such as realpath$DARWIN_EXTSN and, on x86-64,
+        // stat$INODE64: each is the current interface.
+        if (program.darwin)
+            name = name.substr(0, name.find('$'));
         return name;
     }
 
@@ -3193,6 +4031,40 @@ private:
         const auto arguments = argumentRegisters(arm, convention);
         if (emitMathImport(depth, name) || emitRuntimeImport(depth, name))
             return true;
+        // Compilers probe the stack before allocating a frame larger than a page. Every page of the guest stack is
+        // mapped, and the probe preserves every register.
+        if (name == "__chkstk_darwin" || name == "___chkstk_darwin")
+            return true;
+        if (name == "fcntl" || name == "fcntl64") {
+            // The third argument is variadic, which Darwin's ARM64 convention passes on the stack.
+            needsMemory = needsProcess = true;
+            const auto third = arm && program.darwin ? std::format("read(8, {})", argumentStack()) : reg(arguments[2]).pair();
+            assign(depth, 0, 8, std::format("libc.fcntl({}, {}, {})", reg(arguments[0]).lo, reg(arguments[1]).lo, third));
+            return true;
+        }
+        if (name == "malloc_default_zone" || name == "malloc_create_zone" || name == "malloc_zone_from_ptr") {
+            // Every Darwin malloc zone is the one heap's: a malloc_zone_t whose functions callers may also call
+            // through the structure, as SQLite calls its size function.
+            static constexpr std::array<std::pair<unsigned, std::string_view>, 9> functions{{{16, "malloc_zone_size"},
+                {24, "malloc_zone_malloc"}, {32, "malloc_zone_calloc"}, {40, "malloc_zone_valloc"},
+                {48, "malloc_zone_free"}, {56, "malloc_zone_realloc"}, {64, "malloc_destroy_zone"},
+                {112, "malloc_zone_memalign"}, {120, "malloc_zone_free_definite_size"}}};
+            needsMemory = needsHeap = needsProcess = true;
+            std::string fields;
+            for (const auto& [offset, function] : functions)
+                fields += std::format(" write(8, zone + {}, {})", offset, wordLiteral(syntheticToken(function)).pair());
+            line(depth, "if not host.zone then");
+            line(depth + 1, "local zone = resize(0, 0, 192, 0)" + fields);
+            line(depth + 1, "writeString(zone + 160, \"DefaultMallocZone\\0\") write(8, zone + 72, zone + 160, 0) "
+                "write(4, zone + 104, 9, 0) host.zone = zone");
+            line(depth, "end");
+            if (name == "malloc_zone_from_ptr")
+                assign(depth, 0, 8, std::format("if (process.heapLength :: any)(address({})) then host.zone else 0, 0",
+                    reg(arguments[0]).pair()));
+            else
+                assign(depth, 0, 8, "host.zone, 0");
+            return true;
+        }
         if (!arm && !import.leadingUnderscore && name == "__tls_get_addr") {
             std::string valid;
             for (const auto& region : data.regions) {
@@ -3239,11 +4111,31 @@ private:
             assign(depth, 0, 4, std::format("pthreadMutex({}, {})", quoted(name), reg(arguments[0]).pair()));
             return true;
         }
-        if (name == "pthread_cond_broadcast" || name == "pthread_cond_signal") {
-            // There are no waiters in the single-threaded guest.
-            needsMemory = true;
-            line(depth, "do local _ = read(1, address(" + reg(arguments[0]).pair() + ")) end");
-            assign(depth, 0, 4, "0");
+        if (name == "pthread_create") {
+            // The thread's function runs in a coroutine of its own (host.createThread), from the top of a new stack,
+            // with its argument and a return address that ends the thread.
+            includeFunctionPointers();
+            needsMemory = needsProcess = true;
+            usesThreads = true;
+            line(depth, "do");
+            line(depth + 1, std::format("local callee = functionPointers[address({})]", reg(arguments[2]).pair()));
+            line(depth + 1, "if not callee then error(\"unknown guest thread function\", 0) end");
+            line(depth + 1, std::format("local argLo, argHi = {}", reg(arguments[3]).pair()));
+            line(depth + 1, "local thread = host.createThread(function(stackTop: number): (number, number)");
+            if (arm) {
+                assign(depth + 2, 31, 8, "stackTop, 0");
+                assign(depth + 2, 30, 8, "4294967295, 0");
+            } else {
+                assign(depth + 2, 4, 8, "stackTop - 8, 0");
+                line(depth + 2, std::format("write(8, {}, 4294967295, 0)", reg(4).lo));
+            }
+            assign(depth + 2, arguments[0], 8, "argLo, argHi");
+            line(depth + 2, "runGuestRoutine(callee, 4294967295)");
+            line(depth + 2, "return " + reg(0).pair());
+            line(depth + 1, "end)");
+            line(depth + 1, std::format("if thread then write(8, address({}), thread.id, 0) end", reg(arguments[0]).pair()));
+            assign(depth + 1, 0, 4, std::format("if thread then 0 else {}", program.darwin ? 35 : 11));
+            line(depth, "end");
             return true;
         }
         if (!import.leadingUnderscore && (name == "__newlocale" || name == "newlocale")) {
@@ -3333,11 +4225,12 @@ private:
             line(depth, "end");
             return true;
         }
-        if (name == "pthread_once" && !import.leadingUnderscore) {
+        if (name == "pthread_once") {
+            // glibc's pthread_once_t is an int that starts at zero; Darwin's is a signature, then a word that does.
             includeFunctionPointers();
             needsMemory = true;
             line(depth, "do");
-            line(depth + 1, "local control = address(" + reg(arguments[0]).pair() + ")");
+            line(depth + 1, std::format("local control = address({}){}", reg(arguments[0]).pair(), program.darwin ? " + 8" : ""));
             line(depth + 1, "local state = read(4, control)");
             line(depth + 1, "if state == 0 then");
             line(depth + 2, "local callback = functionPointers[address(" + reg(arguments[1]).pair() + ")]");
@@ -3346,7 +4239,9 @@ private:
             runCallback(depth + 2, "callback");
             line(depth + 2, "write(4, control, 2, 0)");
             line(depth + 1, "elseif bit32.band(state, 2) == 0 then");
-            line(depth + 2, "error(\"recursive guest pthread_once\", 0)");
+            // Another guest thread is running the callback, unless this one is.
+            line(depth + 2, "if not process.blockUntil then error(\"recursive guest pthread_once\", 0) end");
+            line(depth + 2, "process.blockUntil(function() return read(4, control) == 2 end)");
             line(depth + 1, "end");
             assign(depth + 1, 0, 4, "0");
             line(depth, "end");
@@ -3459,7 +4354,8 @@ private:
                 reg(arguments[0]).pair(), reg(arguments[1]).pair(), reg(arguments[2]).pair()));
             return true;
         }
-        if (name == "memset" || name == "bzero") {
+        // Darwin's x86-64 compilers call bzero as __bzero.
+        if (name == "memset" || name == "bzero" || name == "__bzero") {
             needsMemory = true;
             const auto dst = reg(arguments[0]);
             const auto value = reg(arguments[1]);
@@ -3614,10 +4510,9 @@ private:
         std::string ints, floats;
         for (const auto index : arguments)
             ints += (ints.empty() ? "" : ", ") + reg(index).pair();
-        for (unsigned index = 0; index < 8; ++index) {
-            const auto lanes = xmm(VectorRegister{index});
-            floats += (floats.empty() ? "" : ", ") + lanes[0] + ", " + lanes[1];
-        }
+        // Four lanes per register: AArch64 Linux passes a long double in a whole vector register.
+        for (unsigned index = 0; index < 8; ++index)
+            floats += (floats.empty() ? "" : ", ") + joinLanes(xmm(VectorRegister{index}));
         return std::format("registerArguments({}, {}, {{{}}}, {}, {{{}}}, 0)", variadicKind(), argumentStack(), ints,
             named, floats);
     }
@@ -3649,12 +4544,12 @@ private:
         needsMemory = true;
         const auto arguments = argumentRegisters(arm, convention);
         const auto arg = [&](unsigned index) { return reg(arguments[index]); };
-        const bool windows = convention == CallingConvention::Microsoft;
+        const auto platform = convention == CallingConvention::Microsoft ? 1 : program.darwin ? 2 : 0;
         line(depth, "do");
         const auto reader = form->list ? std::format("listArguments({}, {})", variadicKind(), arg(form->format + 1).pair())
                                        : variadicArguments(form->format + 1);
         line(depth + 1, std::format("local text = formatGuest(guestString(address({})), {}, {})", arg(form->format).pair(),
-            reader, windows));
+            reader, platform));
         switch (form->kind) {
             case Out: line(depth + 1, "hostWrite(1, text)"); break;
             case Stream: line(depth + 1, std::format("hostWrite(streamDescriptor({}), text)", arg(0).pair())); break;
@@ -3677,6 +4572,44 @@ private:
         }
         assign(depth + 1, 0, 4, "#text");
         line(depth, "end");
+        return true;
+    }
+
+    bool emitScanImport(unsigned depth, std::string_view name) {
+        // Input kinds: standard input, a FILE stream, a string.
+        enum Kind { In, Stream, String };
+        struct Form { std::string_view name; Kind kind; unsigned format; bool list; };
+        static constexpr std::array forms{
+            Form{"scanf", In, 0, false}, Form{"vscanf", In, 0, true}, Form{"fscanf", Stream, 1, false},
+            Form{"vfscanf", Stream, 1, true}, Form{"sscanf", String, 1, false}, Form{"vsscanf", String, 1, true},
+            Form{"sscanf_l", String, 2, false}, Form{"fscanf_l", Stream, 2, false}, Form{"scanf_l", In, 1, false},
+        };
+        auto base = name;
+        for (const std::string_view prefix : {"__isoc99_", "__isoc23_"})
+            if (base.starts_with(prefix))
+                base.remove_prefix(prefix.size());
+        const auto form = std::ranges::find(forms, base, &Form::name);
+        if (form == forms.end())
+            return false;
+        needsProcess = true;
+        needsMemory = true;
+        needsFloating = true;
+        const auto arguments = argumentRegisters(arm, convention);
+        const auto arg = [&](unsigned index) { return reg(arguments[index]); };
+        const auto platform = convention == CallingConvention::Microsoft ? 1 : program.darwin ? 2 : 0;
+        const auto reader = form->list ? std::format("listArguments({}, {})", variadicKind(), arg(form->format + 1).pair())
+                                       : variadicArguments(form->format + 1);
+        const auto format = arg(form->format).pair();
+        std::string call;
+        switch (form->kind) {
+            case In: call = std::format("libc.scanStream(0, {}, {}, {})", format, reader, platform); break;
+            case Stream:
+                call = std::format("libc.scanStream(streamDescriptor({}), {}, {}, {})", arg(0).pair(), format, reader,
+                    platform);
+                break;
+            case String: call = std::format("libc.scanString({}, {}, {}, {})", arg(0).pair(), format, reader, platform); break;
+        }
+        assign(depth, 0, 4, std::format("({}) % 4294967296", call));
         return true;
     }
 
@@ -3740,12 +4673,14 @@ private:
             const bool search = name == "bsearch";
             // qsort(base, count, size, compare); bsearch(key, base, count, size, compare).
             const auto base = arg(search ? 1 : 0), count = arg(search ? 2 : 1), size = arg(search ? 3 : 2);
-            const auto compare = arg(search ? 4 : 3);
+            // Windows x64 passes a fifth argument on the stack, above the caller's shadow space.
+            const auto compare = search && convention == CallingConvention::Microsoft ?
+                std::format("stackArgument({}, 4)", argumentStack()) : arg(search ? 4 : 3).pair();
             line(depth, "do");
             line(depth + 1, std::format("local first, count, size = address({}), address({}), address({})", base.pair(),
                 count.pair(), size.pair()));
             line(depth + 1, std::format("local key = address({})", arg(0).pair()));
-            line(depth + 1, std::format("local comparator = functionPointers[address({})]", compare.pair()));
+            line(depth + 1, std::format("local comparator = functionPointers[address({})]", compare));
             line(depth + 1, "if not comparator then error(\"unknown guest comparison function\", 0) end");
             line(depth + 1, "local function order(left: number, right: number): number");
             assign(depth + 2, arguments[0], 8, "left, 0");
@@ -3892,9 +4827,67 @@ private:
         struct Entry { std::string_view name; std::string_view target; unsigned arguments; };
         static constexpr std::array entries{
             Entry{"write", "write", 3}, Entry{"read", "read", 3}, Entry{"open", "open", 2}, Entry{"open64", "open", 2},
-            Entry{"openat", "openat", 3}, Entry{"close", "close", 1}, Entry{"lseek", "lseek", 3},
-            Entry{"lseek64", "lseek", 3}, Entry{"fstat", "fstat", 2}, Entry{"fstat64", "fstat", 2},
-            Entry{"stat", "stat", 2}, Entry{"stat64", "stat", 2}, Entry{"lstat", "stat", 2}, Entry{"isatty", "isatty", 1},
+            Entry{"openat", "openat", 3}, Entry{"openat64", "openat", 3}, Entry{"close", "close", 1},
+            Entry{"lseek", "lseek", 3}, Entry{"lseek64", "lseek", 3}, Entry{"fstat", "fstat", 2},
+            Entry{"fstat64", "fstat", 2}, Entry{"stat", "stat", 2}, Entry{"stat64", "stat", 2}, Entry{"lstat", "stat", 2},
+            Entry{"lstat64", "stat", 2}, Entry{"fstatat", "fstatat", 3}, Entry{"fstatat64", "fstatat", 3},
+            Entry{"newfstatat", "fstatat", 3}, Entry{"isatty", "isatty", 1},
+            // The file system's paths and directories.
+            Entry{"access", "access", 2}, Entry{"faccessat", "faccessat", 3}, Entry{"eaccess", "access", 2},
+            Entry{"unlink", "unlink", 1}, Entry{"unlinkat", "unlinkat", 3}, Entry{"rmdir", "rmdir", 1},
+            Entry{"remove", "remove", 1}, Entry{"mkdir", "mkdir", 1}, Entry{"mkdirat", "mkdirat", 2},
+            Entry{"rename", "rename", 2}, Entry{"renameat", "renameat", 4}, Entry{"getcwd", "getcwd", 2},
+            Entry{"chdir", "chdir", 1}, Entry{"fchdir", "fchdir", 1}, Entry{"realpath", "realpath", 2},
+            Entry{"__realpath_chk", "realpath", 2}, Entry{"readlink", "readlink", 1},
+            Entry{"readlinkat", "readlinkat", 2}, Entry{"symlink", "symlink", 0}, Entry{"symlinkat", "symlink", 0},
+            Entry{"link", "link", 2}, Entry{"chmod", "touchPath", 1}, Entry{"lchmod", "touchPath", 1},
+            Entry{"chown", "touchPath", 1}, Entry{"lchown", "touchPath", 1}, Entry{"utime", "touchPath", 1},
+            Entry{"utimes", "touchPath", 1}, Entry{"lutimes", "touchPath", 1}, Entry{"fchmod", "touchDescriptor", 1},
+            Entry{"fchown", "touchDescriptor", 1}, Entry{"futimes", "touchDescriptor", 1},
+            Entry{"futimens", "touchDescriptor", 1}, Entry{"fsync", "touchDescriptor", 1},
+            Entry{"fdatasync", "touchDescriptor", 1}, Entry{"fchmodat", "touchPathAt", 2},
+            Entry{"fchownat", "touchPathAt", 2}, Entry{"utimensat", "touchPathAt", 2},
+            Entry{"ftruncate", "ftruncate", 2}, Entry{"ftruncate64", "ftruncate", 2}, Entry{"truncate", "truncate", 2},
+            Entry{"opendir", "opendir", 1}, Entry{"fdopendir", "fdopendir", 1}, Entry{"readdir", "readdir", 1},
+            Entry{"readdir64", "readdir", 1}, Entry{"closedir", "closedir", 1}, Entry{"rewinddir", "rewinddir", 1},
+            Entry{"dirfd", "dirfd", 1}, Entry{"mkstemp", "mkstemp", 1}, Entry{"mkostemp", "mkstemp", 1},
+            Entry{"mkstemp64", "mkstemp", 1}, Entry{"mkdtemp", "mkdtemp", 1}, Entry{"tmpnam", "tmpnam", 1},
+            Entry{"tmpfile", "tmpfile", 0}, Entry{"tmpfile64", "tmpfile", 0},
+            // Calendar time and sleeping.
+            Entry{"gmtime_r", "gmtime_r", 2}, Entry{"localtime_r", "localtime_r", 2}, Entry{"gmtime", "gmtime", 1},
+            Entry{"localtime", "localtime", 1}, Entry{"_gmtime64", "gmtime", 1}, Entry{"_localtime64", "localtime", 1},
+            Entry{"_gmtime64_s", "gmtime_s", 2}, Entry{"_localtime64_s", "localtime_s", 2},
+            Entry{"mktime", "mktime", 1}, Entry{"_mktime64", "mktime", 1}, Entry{"timelocal", "mktime", 1},
+            Entry{"timegm", "timegm", 1}, Entry{"_mkgmtime64", "timegm", 1}, Entry{"_time64", "time", 1},
+            Entry{"strftime", "strftime", 4}, Entry{"strftime_l", "strftime", 4}, Entry{"__strftime_l", "strftime", 4},
+            Entry{"nanosleep", "nanosleep", 2}, Entry{"clock_nanosleep", "yieldThread", 0}, Entry{"usleep", "yieldThread", 0},
+            Entry{"sleep", "yieldThread", 0}, Entry{"tzset", "success", 0}, Entry{"_tzset", "success", 0},
+            // Guest threads (pthread_create is emitted on its own), no terminal, and memory without page protection.
+            Entry{"pthread_join", "pthread_join", 2}, Entry{"pthread_detach", "pthread_detach", 1},
+            Entry{"pthread_exit", "pthread_exit", 1}, Entry{"pthread_cond_timedwait", "pthread_cond_timedwait", 2},
+            Entry{"pthread_cond_signal", "pthread_cond_signal", 1}, Entry{"pthread_cond_broadcast", "pthread_cond_broadcast", 1},
+            Entry{"pthread_yield", "yieldThread", 0}, Entry{"thrd_yield", "yieldThread", 0},
+            Entry{"pthread_get_stackaddr_np", "pthread_get_stackaddr_np", 0},
+            Entry{"pthread_get_stacksize_np", "pthread_get_stacksize_np", 0},
+            Entry{"mmap", "mmap", 6}, Entry{"mmap64", "mmap", 6}, Entry{"munmap", "munmap", 2},
+            Entry{"mprotect", "success", 0}, Entry{"madvise", "success", 0}, Entry{"posix_madvise", "success", 0},
+            // Each stream call runs whole before another guest thread does, so stream locks have nothing to do.
+            Entry{"flockfile", "success", 0}, Entry{"funlockfile", "success", 0}, Entry{"ftrylockfile", "success", 0},
+            Entry{"_lock_file", "success", 0}, Entry{"_unlock_file", "success", 0},
+            Entry{"msync", "success", 0}, Entry{"mlock", "success", 0}, Entry{"munlock", "success", 0},
+            Entry{"sys_icache_invalidate", "success", 0}, Entry{"__clear_cache", "success", 0},
+            Entry{"sysctlbyname", "notFound", 0}, Entry{"sysctl", "notFound", 0},
+            Entry{"tcgetattr", "notTerminal", 0}, Entry{"tcsetattr", "notTerminal", 0}, Entry{"ioctl", "notTerminal", 0},
+            Entry{"select", "notSupported", 0}, Entry{"poll", "notSupported", 0},
+            Entry{"__darwin_check_fd_set_overflow", "one", 0},
+            // Assertions, message catalogs, and C locale collation.
+            Entry{"__assert_rtn", "assertDarwin", 4}, Entry{"__assert_fail", "assertGlibc", 4},
+            Entry{"catopen", "notSupported", 0}, Entry{"catgets", "catgets", 4}, Entry{"catclose", "success", 0},
+            Entry{"strxfrm", "strxfrm", 3}, Entry{"strxfrm_l", "strxfrm", 3},
+            Entry{"getwc", "fgetc", 1}, Entry{"fgetwc", "fgetc", 1}, Entry{"getwchar", "getchar", 0},
+            Entry{"ungetwc", "ungetc", 2}, Entry{"fputwc", "fputc", 2}, Entry{"putwc", "fputc", 2},
+            Entry{"copyfile_state_alloc", "copyfile_state_alloc", 0}, Entry{"copyfile_state_free", "success", 0},
+            Entry{"fcopyfile", "fcopyfile", 2},
             Entry{"fopen", "fopen", 2}, Entry{"fopen64", "fopen", 2}, Entry{"fdopen", "fdopen", 2},
             Entry{"fclose", "fclose", 1}, Entry{"fileno", "fileno", 1}, Entry{"fwrite", "fwrite", 4},
             Entry{"fwrite_unlocked", "fwrite", 4}, Entry{"fread", "fread", 4}, Entry{"fread_unlocked", "fread", 4},
@@ -3918,7 +4911,25 @@ private:
             Entry{"atoll", "atol", 1}, Entry{"time", "time", 1}, Entry{"clock", "clock", 0},
             Entry{"clock_gettime", "clock_gettime", 2}, Entry{"gettimeofday", "gettimeofday", 2},
             Entry{"setlocale", "setlocale", 2}, Entry{"getpid", "getpid", 0}, Entry{"sysconf", "sysconf", 1},
-            Entry{"signal", "signal", 2}, Entry{"sigaction", "sigaction", 3},
+            Entry{"getuid", "getuid", 0}, Entry{"geteuid", "getuid", 0}, Entry{"getgid", "getgid", 0},
+            Entry{"getegid", "getgid", 0}, Entry{"getpwuid", "getpwuid", 1}, Entry{"getpwnam", "getpwuid", 1},
+            Entry{"random", "random", 0}, Entry{"srandom", "srandom", 1}, Entry{"srandomdev", "srandomdev", 0},
+            Entry{"rand", "rand", 0}, Entry{"srand", "srand", 1}, Entry{"getrusage", "getrusage", 2},
+            Entry{"confstr", "confstr", 3}, Entry{"raise", "raise", 1}, Entry{"system", "system", 1},
+            Entry{"popen", "popen", 2}, Entry{"pclose", "pclose", 1}, Entry{"pread", "pread", 4},
+            Entry{"pread64", "pread", 4}, Entry{"pwrite", "pwrite", 4}, Entry{"pwrite64", "pwrite", 4},
+            Entry{"memset_pattern4", "memset_pattern4", 3}, Entry{"memset_pattern8", "memset_pattern8", 3},
+            Entry{"memset_pattern16", "memset_pattern16", 3}, Entry{"strlcpy", "strlcpy", 3},
+            Entry{"strlcat", "strlcat", 3}, Entry{"__strlcpy_chk", "strlcpy", 3}, Entry{"__strlcat_chk", "strlcat", 3},
+            Entry{"abs", "abs", 1}, Entry{"labs", "labs", 1}, Entry{"llabs", "llabs", 1}, Entry{"imaxabs", "llabs", 1},
+            // File system controls and the host's identity are unavailable; whole-file locks always succeed.
+            Entry{"statfs", "statfs", 2}, Entry{"fstatfs", "fstatfs", 2}, Entry{"statfs64", "statfs", 2},
+            Entry{"fstatfs64", "fstatfs", 2}, Entry{"fsctl", "notSupported", 0}, Entry{"ffsctl", "notSupported", 0},
+            Entry{"gethostuuid", "notSupported", 0}, Entry{"flock", "success", 0},
+            Entry{"signal", "signal", 2}, Entry{"sigaction", "sigaction", 3}, Entry{"__sysv_signal", "signal", 2},
+            Entry{"bsd_signal", "signal", 2}, Entry{"sigemptyset", "sigemptyset", 1}, Entry{"sigfillset", "sigfillset", 1},
+            Entry{"sigaddset", "sigaddset", 2}, Entry{"sigdelset", "sigdelset", 2}, Entry{"sigismember", "sigismember", 2},
+            Entry{"sigprocmask", "sigprocmask", 3}, Entry{"pthread_sigmask", "sigprocmask", 3},
             Entry{"pthread_self", "pthread_self", 0}, Entry{"pthread_mach_thread_np", "pthread_mach_thread_np", 1},
             Entry{"pthread_equal", "pthread_equal", 2}, Entry{"pthread_key_create", "pthread_key_create", 2},
             Entry{"pthread_key_delete", "success", 1}, Entry{"pthread_getspecific", "pthread_getspecific", 1},
@@ -3929,7 +4940,7 @@ private:
             Entry{"pthread_cond_wait", "pthread_cond_wait", 2}, Entry{"pthread_rwlock_init", "success", 2},
             Entry{"pthread_rwlock_destroy", "success", 1}, Entry{"pthread_rwlock_rdlock", "success", 1},
             Entry{"pthread_rwlock_wrlock", "success", 1}, Entry{"pthread_rwlock_unlock", "success", 1},
-            Entry{"sched_yield", "success", 0},
+            Entry{"sched_yield", "yieldThread", 0},
             Entry{"__maskrune", "__maskrune", 2}, Entry{"__maskrune_l", "__maskrune", 2},
             Entry{"__toupper", "__toupper", 1}, Entry{"__tolower", "__tolower", 1},
             Entry{"__toupper_l", "__toupper", 1}, Entry{"__tolower_l", "__tolower", 1},
@@ -3946,8 +4957,17 @@ private:
             Entry{"wcslen", "wcslen", 1}, Entry{"localeconv", "localeconv", 0}, Entry{"localeconv_l", "localeconv", 0},
             Entry{"strspn", "strspn", 2}, Entry{"strcspn", "strcspn", 2}, Entry{"strpbrk", "strpbrk", 2},
             Entry{"strncpy", "strncpy", 3}, Entry{"strncat", "strncat", 3}, Entry{"strdup", "strdup", 1},
+            Entry{"_strdup", "strdup", 1},
             Entry{"strerror", "strerror", 1}, Entry{"strerror_r", "strerror_r", 3}, Entry{"__xpg_strerror_r", "strerror_r", 3},
+            Entry{"strerror_l", "strerror", 1}, Entry{"_strerror", "strerror", 1},
             Entry{"aligned_alloc", "aligned_alloc", 2}, Entry{"posix_memalign", "posix_memalign", 3},
+            Entry{"malloc_size", "allocationSize", 1}, Entry{"malloc_usable_size", "allocationSize", 1},
+            Entry{"_msize", "allocationSize", 1}, Entry{"malloc_good_size", "zoneGoodSize", 1},
+            Entry{"malloc_zone_size", "zoneSize", 2}, Entry{"malloc_zone_malloc", "zoneMalloc", 2},
+            Entry{"malloc_zone_calloc", "zoneCalloc", 3}, Entry{"malloc_zone_valloc", "zoneValloc", 2},
+            Entry{"malloc_zone_free", "zoneFree", 2}, Entry{"malloc_zone_free_definite_size", "zoneFree", 3},
+            Entry{"malloc_zone_realloc", "zoneRealloc", 3}, Entry{"malloc_zone_memalign", "zoneMemalign", 3},
+            Entry{"malloc_destroy_zone", "success", 1}, Entry{"malloc_set_zone_name", "success", 2},
             Entry{"mach_absolute_time", "mach_absolute_time", 0}, Entry{"mach_timebase_info", "mach_timebase_info", 1},
             Entry{"dlopen", "failure", 0}, Entry{"dlsym", "failure", 0}, Entry{"dladdr", "failure", 0},
             Entry{"_dyld_register_func_for_remove_image", "success", 0},
@@ -3955,23 +4975,60 @@ private:
             Entry{"_dl_find_object", "dl_find_object", 2}, Entry{"__getauxval", "failure", 1},
             Entry{"getauxval", "failure", 1}, Entry{"gettext", "gettext", 1}, Entry{"dgettext", "dgettext", 2},
             Entry{"dcgettext", "dgettext", 3},
-            Entry{"isspace", "isspace", 1}, Entry{"strcoll_l", "strcoll", 2}, Entry{"strcoll", "strcoll", 2},
+            Entry{"isspace", "isspace", 1}, Entry{"isdigit", "isdigit", 1}, Entry{"isupper", "isupper", 1},
+            Entry{"islower", "islower", 1}, Entry{"isalpha", "isalpha", 1}, Entry{"isalnum", "isalnum", 1},
+            Entry{"isxdigit", "isxdigit", 1}, Entry{"isblank", "isblank", 1}, Entry{"iscntrl", "iscntrl", 1},
+            Entry{"isprint", "isprint", 1}, Entry{"isgraph", "isgraph", 1}, Entry{"ispunct", "ispunct", 1},
+            Entry{"strcoll_l", "strcoll", 2}, Entry{"strcoll", "strcoll", 2},
+            Entry{"__ctype_b_loc", "ctype_b_loc", 0}, Entry{"__ctype_toupper_loc", "ctype_toupper_loc", 0},
+            Entry{"__ctype_tolower_loc", "ctype_tolower_loc", 0}, Entry{"strstr", "strstr", 2}, Entry{"strtok", "strtok", 2}, Entry{"strtok_r", "strtok_r", 3},
+            Entry{"__strtok_r", "strtok_r", 3}, Entry{"strtok_s", "strtok_r", 3}, Entry{"strnlen", "strnlen", 2},
+            Entry{"strcasecmp", "strcasecmp", 2}, Entry{"strncasecmp", "strncasecmp", 3},
+            Entry{"_stricmp", "strcasecmp", 2}, Entry{"_strnicmp", "strncasecmp", 3},
+            Entry{"strcasecmp_l", "strcasecmp", 2}, Entry{"strncasecmp_l", "strncasecmp", 3},
         };
         const auto arguments = argumentRegisters(arm, convention);
-        if (name == "strtod" || name == "strtof" || name == "atof" || name == "__isoc23_strtod" ||
-            name == "__isoc23_strtof" || name == "strtold") {
+        if (name == "difftime" || name == "_difftime64") {
+            needsFloating = true;
+            const auto lanes = xmm(VectorRegister{0});
+            line(depth, std::format("{}, {} = encodeFloat(8, signed64({}) - signed64({}))", lanes[0], lanes[1],
+                reg(arguments[0]).pair(), reg(arguments[1]).pair()));
+            line(depth, std::format("{}, {} = 0, 0", lanes[2], lanes[3]));
+            return true;
+        }
+        // The locale variants (strtod_l) take the C locale's behavior.
+        auto conversion = name;
+        if (conversion.ends_with("_l"))
+            conversion.remove_suffix(2);
+        if (conversion == "strtod" || conversion == "strtof" || conversion == "atof" || conversion == "__isoc23_strtod" ||
+            conversion == "__isoc23_strtof" || conversion == "strtold") {
             needsProcess = true;
             needsFloating = true;
-            const auto end = name == "atof" ? std::string("0, 0") : reg(arguments[1]).pair();
-            const unsigned size = name.ends_with('f') && name != "atof" ? 4 : 8;
+            const auto end = conversion == "atof" ? std::string("0, 0") : reg(arguments[1]).pair();
+            const unsigned size = conversion.ends_with('f') && conversion != "atof" ? 4 : 8;
             const auto lanes = xmm(VectorRegister{0});
             line(depth, std::format("{}, {} = encodeFloat({}, libc.strtod({}, {}))", lanes[0], lanes[1], size,
                 reg(arguments[0]).pair(), end));
             line(depth, std::format("{}, {} = 0, 0", lanes[2], lanes[3]));
             return true;
         }
-        const auto entry = std::ranges::find(entries, name, &Entry::name);
-        if (entry == entries.end())
+        // Windows: long is 32 bits wide, and msvcrt names the 64-bit conversions itself.
+        static constexpr std::array windowsEntries{
+            Entry{"strtol", "strtolNarrow", 3}, Entry{"strtoul", "strtoulNarrow", 3},
+            Entry{"_strtoi64", "strtol", 3}, Entry{"_strtoui64", "strtoul", 3}, Entry{"_atoi64", "atol", 1},
+        };
+        // glibc: its headers point XSI strerror_r at __xpg_strerror_r, so strerror_r is the GNU function.
+        static constexpr std::array glibcEntries{Entry{"strerror_r", "strerror_gnu", 3}};
+        const bool glibc = convention != CallingConvention::Microsoft && !program.darwin;
+        const Entry* entry = nullptr;
+        if (const auto windows = std::ranges::find(windowsEntries, name, &Entry::name);
+            convention == CallingConvention::Microsoft && windows != windowsEntries.end())
+            entry = &*windows;
+        else if (const auto gnu = std::ranges::find(glibcEntries, name, &Entry::name); glibc && gnu != glibcEntries.end())
+            entry = &*gnu;
+        else if (const auto common = std::ranges::find(entries, name, &Entry::name); common != entries.end())
+            entry = &*common;
+        if (!entry)
             return false;
         needsProcess = true;
         needsMemory = true;
@@ -3984,7 +5041,15 @@ private:
 
     // C runtime helpers shared by every platform.
     bool emitRuntimeImport(unsigned depth, std::string_view name) {
-        if (emitFormatImport(depth, name) || emitProcessImport(depth, name) || emitLibraryImport(depth, name))
+        // _FORTIFY_SOURCE variants take the destination's size as an extra argument and copy the same way.
+        static constexpr std::array<std::pair<std::string_view, std::string_view>, 5> fortified{{
+            {"__strcpy_chk", "strcpy"}, {"__stpcpy_chk", "stpcpy"}, {"__strcat_chk", "strcat"},
+            {"__strncpy_chk", "strncpy"}, {"__strncat_chk", "strncat"}}};
+        for (const auto& [checked, plain] : fortified)
+            if (name == checked)
+                name = plain;
+        if (emitFormatImport(depth, name) || emitScanImport(depth, name) || emitProcessImport(depth, name) ||
+            emitLibraryImport(depth, name))
             return true;
         const auto arguments = argumentRegisters(arm, convention);
         const auto arg = [&](unsigned index) { return reg(arguments[index]); };
@@ -3993,7 +5058,9 @@ private:
             return true;
         }
         if (name == "abort") {
-            trap(depth, "guest called abort");
+            // The process ends as SIGABRT ends one, with status 134 and without running exit callbacks.
+            needsProcess = true;
+            line(depth, "exitProcess(134, false)");
             return true;
         }
         if (name == "__memcpy_chk" || name == "__memmove_chk") {
@@ -4087,6 +5154,8 @@ private:
             line(depth, "do");
             line(depth + 1, std::format("local descriptor = address({})", descriptor.pair()));
             line(depth + 1, "local base = address(read(8, descriptor + 8))");
+            // Each guest thread but the main one has its own copy of the variables.
+            line(depth + 1, "if process.threadLocal then base = process.threadLocal(base) end");
             assign(depth + 1, 0, 8, "base + address(read(8, descriptor + 16)), 0");
             line(depth, "end");
             return true;
@@ -4109,6 +5178,69 @@ private:
             return true;
         }
         return false;
+    }
+
+    // A block that only loads constants, including words of read-only data, into registers and jumps to an address
+    // they determine: a dyld stub, a PLT entry with a read-only slot, or a function that is a single tail jump.
+    struct Thunk { Address target; std::vector<std::pair<unsigned, std::uint64_t>> writes; };
+    std::optional<Thunk> followThunk(Address start) const {
+        Thunk result{start, {}};
+        for (int hop = 0; hop < 4; ++hop) {
+            const auto found = graph.find(result.target);
+            if (found == graph.end())
+                break;
+            const auto& block = found->second;
+            const auto* jump = std::get_if<Jump>(&block.end);
+            if (!jump || !jump->destinations.empty() || !block.hasTerminator)
+                break;
+            Constants known{};
+            known[Zero] = 0;
+            std::vector<std::pair<unsigned, std::uint64_t>> writes;
+            bool simple = true;
+            for (const auto& effect : block.effects) {
+                if (std::holds_alternative<Nop>(effect))
+                    continue;
+                const auto* move = std::get_if<Move>(&effect);
+                if (!move || move->size < 4 || move->dst == Zero || move->dst >= RegisterCount) {
+                    simple = false;
+                    break;
+                }
+                std::optional<std::uint64_t> value;
+                if (const auto* imm = std::get_if<Immediate>(&move->src))
+                    value = imm->value;
+                else if (const auto* source = std::get_if<Register>(&move->src))
+                    value = known[source->index];
+                else if (const auto* addr = std::get_if<EffectiveAddress>(&move->src))
+                    value = knownAddress(*addr, known);
+                else if (const auto* mem = std::get_if<Memory>(&move->src))
+                    if (const auto at = knownAddress(mem->address, known))
+                        value = data.immutableWord(*at, move->size);
+                if (!value) {
+                    simple = false;
+                    break;
+                }
+                if (move->size == 4)
+                    value = std::uint32_t(*value);
+                known[move->dst] = value;
+                writes.emplace_back(move->dst, *value);
+            }
+            if (!simple)
+                break;
+            std::optional<Address> next = resolveTarget(jump->target, known);
+            if (const auto* mem = std::get_if<Memory>(&jump->target))
+                if (const auto at = knownAddress(mem->address, known))
+                    if (const auto word = data.immutableWord(*at, 8); word && graph.contains(Address(*word)))
+                        next = Address(*word);
+            // Only lifted code continues the thunk; anything else, such as an unbound weak symbol's zero, is
+            // reached through the thunk itself as before.
+            if (!next || *next == result.target || !graph.contains(*next))
+                break;
+            result.target = *next;
+            result.writes.insert(result.writes.end(), writes.begin(), writes.end());
+        }
+        if (result.target == start)
+            return std::nullopt;
+        return result;
     }
 
     std::optional<Address> resolveTarget(const Value& target, const Constants& constants) const {
@@ -4140,7 +5272,18 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     std::span<const std::uint8_t> image, std::span<const ir::CodeRange> code, CallingConvention convention,
     const ProgramOptions& program) {
     const bool arm = architecture == Architecture::Arm64;
-    const auto loops = recoverLoops(graph);
+    // Where guest functions start: other code reaches them through calls, pointers, and tail jumps.
+    std::set<Address> entries = references.functions;
+    for (const auto& [pc, block] : graph)
+        if (const auto* call = std::get_if<Call>(&block.end))
+            if (const auto* target = std::get_if<Immediate>(&call->target))
+                entries.insert(Address(target->value));
+    for (const auto& entry : exports)
+        entries.insert(entry.offset);
+    entries.insert(initializers.begin(), initializers.end());
+    std::map<Address, std::set<Address>> loopBodies;
+    const auto loops = recoverLoops(graph, entries, &loopBodies);
+    const auto joins = postDominators(graph, entries);
     Data data{image, regions, imports, code, objects, {}};
     data.unwindObjects = program.unwindObjects;
     for (const auto& pad : program.landingPads)
@@ -4154,6 +5297,12 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     for (const auto& table : references.tables)
         if (!data.unresolved(table.start, unsigned(table.size)))
             data.materialize(table.start, unsigned(table.size));
+    // A program's import slots hold their tokens, so pointers to imports that code loads from tables at run time,
+    // such as C++ vtables and SQLite's system calls, stay callable. Translation still resolves known slots directly.
+    if (!regions.empty() && program.startup != Startup::Library)
+        for (const auto& import : imports)
+            if (import.callable && import.size == 8 && !import.copy && data.readable(import.start, 8))
+                data.tokenSlots.emplace(import.start, &import);
     bool memory = false;
     bool flags = false;
     bool stackGuard = false;
@@ -4180,8 +5329,8 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
             functions.emplace(entry, std::move(*direct));
         } else {
             structured = true;
-            StructuredFunction emitter(graph, references.functions, loops, data, entry, arm, convention, initializers,
-                program);
+            StructuredFunction emitter(graph, references.functions, entries, loops, loopBodies, joins, data, entry,
+                arm, convention, initializers, program);
             auto body = emitter.lower();
             memory |= emitter.usesMemory();
             flags |= emitter.usesFlags();
@@ -4214,7 +5363,7 @@ std::string lowerModule(const ir::Graph& graph, const ir::References& references
     if (x87)
         memory = floating = vector = true;
     const RuntimeFeatures runtime{flags, shifts, division, multiply, jumpFrames, memory, stackGuard, heap, floating, prime,
-        structured, decimal, vector, process, x87, seh, landingPads};
+        structured, decimal, vector, process, x87, seh, landingPads, arm, convention == CallingConvention::Microsoft};
     return printModule(functions, exports, runtime, data, program);
 }
 }

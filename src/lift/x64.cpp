@@ -130,6 +130,14 @@ Instruction decodeXmmEscape(Reader& reader, unsigned prefix, unsigned escape, un
     };
     if (prefix != 0x66)
         unsupported();
+    if (escape == 0x3a && (opcode == 0x08 || opcode == 0x09)) {
+        // ROUNDPS and ROUNDPD with the immediate's mode, or the default one (nearest) when it says MXCSR's.
+        const auto operand = operandAt(1);
+        const auto control = unsigned(reader.read(1));
+        constexpr std::array modes{FloatLaneOp::RoundEven, FloatLaneOp::Floor, FloatLaneOp::Ceil, FloatLaneOp::Truncate};
+        return {VectorFloatLanes{control & 4 ? FloatLaneOp::RoundEven : modes[control & 3], opcode == 0x09 ? 8u : 4u, reg,
+            operand, reg}};
+    }
     if (escape == 0x3a && (opcode == 0x0a || opcode == 0x0b)) {
         const auto operand = operandAt(1);
         const auto control = unsigned(reader.read(1));
@@ -160,8 +168,49 @@ Instruction decodeXmmEscape(Reader& reader, unsigned prefix, unsigned escape, un
         }
         return {VectorPermute{reg, reg, operand, bytes}};
     }
+    if (escape == 0x3a && (opcode == 0x20 || opcode == 0x22)) {
+        // PINSRB, PINSRD, and PINSRQ insert a general register's low element, or one from memory, into a lane.
+        const unsigned size = opcode == 0x20 ? 1 : rex & 8 ? 8 : 4;
+        if (mode == 3)
+            return {VectorTransfer{Register{rmReg}, reg, true, size, unsigned(reader.read(1)) & (16 / size - 1)}};
+        const auto address = x64Address(reader, mode, rm, rex, 1);
+        return {VectorLaneLoad{size, reg, unsigned(reader.read(1)) & (16 / size - 1), address}};
+    }
+    if (escape == 0x3a && opcode >= 0x14 && opcode <= 0x16) {
+        // PEXTRB, PEXTRW, PEXTRD, and PEXTRQ copy a lane into a general register, zero-extended, or to memory.
+        const unsigned size = opcode == 0x14 ? 1 : opcode == 0x15 ? 2 : rex & 8 ? 8 : 4;
+        if (mode == 3)
+            return {VectorTransfer{Register{rmReg}, reg, false, size, unsigned(reader.read(1)) & (16 / size - 1)}};
+        const auto address = x64Address(reader, mode, rm, rex, 1);
+        return {VectorLaneStore{size, reg, unsigned(reader.read(1)) & (16 / size - 1), address}};
+    }
+    if (escape == 0x38 && ((opcode >= 0x20 && opcode <= 0x25) || (opcode >= 0x30 && opcode <= 0x35))) {
+        // PMOVSX and PMOVZX (BW, BD, BQ, WD, WQ, DQ) widen the source's low elements one or more times.
+        constexpr std::array<std::pair<unsigned, unsigned>, 6> forms{{{8, 1}, {8, 2}, {8, 3}, {16, 1}, {16, 2}, {32, 1}}};
+        const auto [bits, steps] = forms[opcode & 7];
+        const bool sign = opcode < 0x30;
+        const auto source = operandAt(0);
+        std::vector<Effect> effects;
+        VectorRegister from = reg;
+        if (const auto* memory = std::get_if<VectorMemory>(&source)) {
+            // The low 16 bytes widen into 16: a load of 16 >> steps bytes.
+            effects.push_back(VectorMove{VectorRegister{VectorTemp}, *memory, 16u >> steps});
+            from = VectorRegister{VectorTemp};
+        } else {
+            from = std::get<VectorRegister>(source);
+        }
+        for (unsigned step = 0; step < steps; ++step) {
+            effects.push_back(VectorWiden{reg, from, bits << step, 0, false, sign});
+            from = reg;
+        }
+        Instruction instruction{effects.front()};
+        instruction.after.assign(effects.begin() + 1, effects.end());
+        return instruction;
+    }
     if (escape == 0x38 && opcode == 0x00)
         return {VectorLanes{LaneOp::ShuffleBytes, 1, reg, operandAt(0)}};
+    if (escape == 0x38 && opcode == 0x17)
+        return {VectorTest{reg, operandAt(0)}};
     if (escape == 0x38 && opcode == 0x2b)
         return {VectorLanes{LaneOp::PackUnsigned, 4, reg, operandAt(0)}};
     if (escape == 0x38 && opcode == 0x29)
@@ -170,6 +219,48 @@ Instruction decodeXmmEscape(Reader& reader, unsigned prefix, unsigned escape, un
         return {VectorLanes{LaneOp::GreaterSigned, 8, reg, operandAt(0)}};
     if (escape == 0x38 && (opcode == 0x14 || opcode == 0x15))
         return {VectorBlend{reg, operandAt(0), reg, VectorRegister{0}, true, opcode == 0x15 ? 8u : 4u}};
+    if (escape == 0x38 && opcode == 0x10)
+        return {VectorBlend{reg, operandAt(0), reg, VectorRegister{0}, true, 1}};
+    if (escape == 0x38 && opcode == 0x40)
+        return {VectorLanes{LaneOp::Mul, 4, reg, operandAt(0)}};
+    if (escape == 0x38 && opcode >= 0x38 && opcode <= 0x3f) {
+        // PMINSB/D, PMINUW/D, PMAXSB/D, PMAXUW/D.
+        constexpr std::array<std::pair<LaneOp, unsigned>, 8> forms{{{LaneOp::MinSigned, 1}, {LaneOp::MinSigned, 4},
+            {LaneOp::MinUnsigned, 2}, {LaneOp::MinUnsigned, 4}, {LaneOp::MaxSigned, 1}, {LaneOp::MaxSigned, 4},
+            {LaneOp::MaxUnsigned, 2}, {LaneOp::MaxUnsigned, 4}}};
+        const auto [op, element] = forms[opcode - 0x38];
+        return {VectorLanes{op, element, reg, operandAt(0)}};
+    }
+    if (escape == 0x3a && opcode == 0x0e) {
+        // PBLENDW: each immediate bit takes a word from the source.
+        const auto operand = operandAt(1);
+        const auto control = unsigned(reader.read(1));
+        std::array<std::uint8_t, 16> bytes{};
+        for (unsigned i = 0; i < 16; ++i)
+            bytes[i] = std::uint8_t((control >> (i / 2) & 1 ? 16 : 0) + i);
+        return {VectorPermute{reg, reg, operand, bytes}};
+    }
+    if (escape == 0x3a && opcode == 0x21) {
+        // INSERTPS: a float from the source (a register's lane, or memory) into a lane, then zeroed lanes.
+        if (mode == 3) {
+            const auto control = unsigned(reader.read(1));
+            std::array<std::uint8_t, 16> bytes{};
+            for (unsigned i = 0; i < 16; ++i) {
+                const unsigned lane = i / 4;
+                bytes[i] = control >> lane & 1 ? 255 : lane == (control >> 4 & 3) ? std::uint8_t(16 + (control >> 6) * 4 + i % 4)
+                                                                                     : std::uint8_t(i);
+            }
+            return {VectorPermute{reg, reg, VectorRegister{rmReg}, bytes}};
+        }
+        const auto address = x64Address(reader, mode, rm, rex, 1);
+        const auto control = unsigned(reader.read(1));
+        Instruction instruction{VectorLaneLoad{4, reg, control >> 4 & 3, address}};
+        std::array<std::uint8_t, 16> bytes{};
+        for (unsigned i = 0; i < 16; ++i)
+            bytes[i] = control >> (i / 4) & 1 ? 255 : std::uint8_t(i);
+        instruction.after.push_back(VectorPermute{reg, reg, reg, bytes});
+        return instruction;
+    }
     unsupported();
 }
 
@@ -373,6 +464,26 @@ Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned
     }
     if (prefix == 0x66 && opcode == 0xc5 && mode == 3)
         return {VectorTransfer{Register{reg.index}, VectorRegister{rmReg}, false, 2, unsigned(reader.read(1) & 7)}};
+    if ((prefix == 0xf2 && opcode == 0x12) || (prefix == 0xf3 && (opcode == 0x12 || opcode == 0x16))) {
+        // MOVDDUP copies the low double into both halves, reading eight bytes from memory; MOVSLDUP and MOVSHDUP
+        // copy the even or odd floats into each pair.
+        if (prefix == 0xf2 && mode != 3)
+            return {VectorLaneLoad{8, reg, 0, x64Address(reader, mode, rm, rex), true, 16}};
+        const auto source = operandAt(false);
+        std::array<std::uint8_t, 16> bytes{};
+        for (unsigned i = 0; i < 16; ++i) {
+            const unsigned from = prefix == 0xf2 ? i % 8 : (i / 8) * 8 + (opcode == 0x16 ? 4 : 0) + i % 4;
+            bytes[i] = std::uint8_t(16 + from);
+        }
+        return {VectorPermute{reg, reg, source, bytes}};
+    }
+    if (prefix == 0x66 && opcode == 0xc4) {
+        // PINSRW inserts a general register's low word, or one from memory, into a lane.
+        if (mode == 3)
+            return {VectorTransfer{Register{rmReg}, reg, true, 2, unsigned(reader.read(1) & 7)}};
+        const auto address = x64Address(reader, mode, rm, rex, 1);
+        return {VectorLaneLoad{2, reg, unsigned(reader.read(1) & 7), address}};
+    }
 
     if ((prefix == 0xf3 && opcode == 0x7e) || (prefix == 0x66 && opcode == 0xd6)) {
         const VectorOperand operand = mode == 3 ? VectorOperand(VectorRegister{rmReg})
@@ -408,13 +519,49 @@ Instruction decodeXmm(Reader& reader, unsigned prefix, unsigned opcode, unsigned
 
 Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
     auto opcode = reader.read(1);
-    while (prefix == 0x66 && opcode == 0x66)
+    // LOCK after the operand-size prefix: one guest thread needs no bus lock.
+    while (prefix == 0x66 && (opcode == 0x66 || opcode == 0xf0))
         opcode = reader.read(1);
     unsigned rex = 0;
     const bool rexPresent = opcode >= 0x40 && opcode <= 0x4f;
     if (rexPresent) {
         rex = opcode & 15;
         opcode = reader.read(1);
+    }
+    if (prefix == 0x66 && !(rex & 8) && opcode == 0x0f) {
+        // XADD and CMPXCHG on words.
+        const auto at = reader.pc;
+        const auto extension = reader.read(1);
+        if (extension >= 0x40 && extension <= 0x4f) {
+            // CMOVcc on words: the destination's other bits stay.
+            const auto modrm = reader.read(1);
+            const unsigned mode = modrm >> 6;
+            const unsigned rm = modrm & 7;
+            const unsigned dst = unsigned((modrm >> 3) & 7) + (rex & 4) * 2;
+            const Value src = mode == 3 ? Value(Register{rm + (rex & 1) * 8}) : Value(Memory{x64Address(reader, mode, rm, rex)});
+            return {ConditionalMove{2, dst, src, unsigned(extension & 15)}};
+        }
+        if (extension == 0xc1 || extension == 0xb1) {
+            const auto modrm = reader.read(1);
+            const unsigned mode = modrm >> 6;
+            const unsigned rm = modrm & 7;
+            const unsigned source = unsigned((modrm >> 3) & 7) + (rex & 4) * 2;
+            if (extension == 0xb1) {
+                if (mode == 3)
+                    unsupported();
+                return {CompareExchange{2, x64Address(reader, mode, rm, rex), Register{source}}};
+            }
+            const Value target = mode == 3 ? Value(Register{rm + (rex & 1) * 8}) : Value(Memory{x64Address(reader, mode, rm, rex)});
+            return {Exchange{2, target, Register{source}, true}};
+        }
+        reader.pc = at;
+    }
+    if (prefix == 0x66 && !(rex & 8) && opcode == 0x87) {
+        const auto modrm = reader.read(1);
+        const unsigned mode = modrm >> 6;
+        const unsigned rm = modrm & 7;
+        const Value target = mode == 3 ? Value(Register{rm + (rex & 1) * 8}) : Value(Memory{x64Address(reader, mode, rm, rex)});
+        return {Exchange{2, target, Register{unsigned((modrm >> 3) & 7) + (rex & 4) * 2}}};
     }
     if (prefix == 0xf3 && (opcode == 0xaa || opcode == 0xab))
         return {RepeatStore{opcode == 0xaa ? 1u : (rex & 8) ? 8u : 4u}};
@@ -568,6 +715,13 @@ Instruction decodeX64Prefix(Reader& reader, unsigned prefix) {
             Value(Memory{x64Address(reader, mode, rm, rex)});
         return {MemoryBinary{group ? BinaryOp::Sub : BinaryOp::Add, 2, target, Immediate{1}, true, true}};
     }
+    // TEST and the ALU operations on AX with a 16-bit immediate.
+    if (prefix == 0x66 && !(rex & 8) && opcode == 0xa9)
+        return {MemoryBinary{BinaryOp::And, 2, Register{0}, Immediate{reader.read(2)}, false}};
+    if (prefix == 0x66 && !(rex & 8) && (opcode & 0xc7) == 5 && x64Operations[opcode >> 3]) {
+        const auto op = opcode >> 3;
+        return {MemoryBinary{*x64Operations[op], 2, Register{0}, immediate(signExtend(reader.read(2), 16)), op != 7}};
+    }
     const bool registerAlu = (opcode & 0xc5) == 1 && x64Operations[opcode >> 3].has_value();
     const bool carryAlu = (opcode & 0xf5) == 0x11;
     if (prefix == 0x66 && !(rex & 8) &&
@@ -654,6 +808,16 @@ Instruction decodeX64(Reader& reader) {
     const bool address32 = opcode == 0x67;
     if (address32)
         opcode = reader.read(1);
+    if (opcode == 0xf2) {
+        // MPX's BND prefix on a call, jump, or return (as in PLT entries) changes nothing without bounds checking.
+        const auto at = reader.pc;
+        const auto next = reader.read(1);
+        const auto group = next == 0xff ? (reader.read(1) >> 3) & 7 : 0;
+        reader.pc = at;
+        if (next == 0xe8 || next == 0xe9 || next == 0xeb || next == 0xc3 || next == 0xc2 ||
+            (next >= 0x70 && next <= 0x7f) || (next == 0xff && group >= 2 && group <= 5))
+            return decodeX64(reader);
+    }
     if (opcode == 0x66 || opcode == 0xf2 || opcode == 0xf3)
         return decodeX64Prefix(reader, opcode);
     unsigned rex = 0;
@@ -741,6 +905,20 @@ Instruction decodeX64(Reader& reader) {
         }
         case 0x0f: {
             const auto extension = reader.read(1);
+            if (extension == 0xc0 || extension == 0xb0) {
+                // XADD and CMPXCHG on bytes.
+                const auto modrm = reader.read(1);
+                const unsigned mode = modrm >> 6;
+                const unsigned rm = modrm & 7;
+                const auto [reg, regField] = byteRegister(unsigned((modrm >> 3) & 7) + (rex & 4) * 2, rexPresent);
+                if (mode == 3 && (locked || extension == 0xb0))
+                    unsupported();
+                if (extension == 0xb0)
+                    return {CompareExchange{1, x64Address(reader, mode, rm, rex), reg, regField}};
+                const auto [rmByte, rmField] = byteRegister(rm + (rex & 1) * 8, rexPresent);
+                const Value target = mode == 3 ? Value(rmByte) : Value(Memory{x64Address(reader, mode, rm, rex)});
+                return {Exchange{1, target, reg, true, rmField, regField}};
+            }
             if (extension == 0xc1) {
                 const auto modrm = reader.read(1);
                 const unsigned mode = modrm >> 6;
@@ -901,7 +1079,7 @@ Instruction decodeX64(Reader& reader) {
     const bool byteAlu = ((opcode & 0xc5) == 0 && x64Operations[opcode >> 3].has_value()) || byteCarry;
     const bool carryAlu = (opcode & 0xf5) == 0x11;
     if (!registerAlu && !byteAlu && !carryAlu && opcode != 0x69 && opcode != 0x6b && opcode != 0x80 && opcode != 0x81 && opcode != 0x83 &&
-        opcode != 0x84 && opcode != 0x85 && opcode != 0x87 &&
+        opcode != 0x84 && opcode != 0x85 && opcode != 0x86 && opcode != 0x87 &&
         opcode != 0x88 && opcode != 0x89 && opcode != 0x8a &&
         opcode != 0x8b && opcode != 0x8d &&
         opcode != 0xc0 && opcode != 0xc1 && opcode != 0xc6 && opcode != 0xc7 &&
@@ -969,6 +1147,12 @@ Instruction decodeX64(Reader& reader) {
     if (opcode == 0x87) {
         const Value target = mode == 3 ? Value(Register{dst}) : Value(Memory{x64Address(reader, mode, rm, rex)});
         return {Exchange{size, target, Register{src}}};
+    }
+    if (opcode == 0x86) {
+        const auto [reg, regField] = byteRegister(src, rexPresent);
+        const auto [rmByte, rmField] = byteRegister(dst, rexPresent);
+        const Value target = mode == 3 ? Value(rmByte) : Value(Memory{x64Address(reader, mode, rm, rex)});
+        return {Exchange{1, target, reg, false, rmField, regField}};
     }
     if (opcode == 0xf6 && group == 2) {
         const auto [target, field] = byteRegister(dst, rexPresent);

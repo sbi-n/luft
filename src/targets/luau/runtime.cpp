@@ -64,11 +64,13 @@ local function addFlags(subtract: boolean, arm: boolean, size: number,
     alo: number, ahi: number, blo: number, bhi: number, carryIn: boolean?): (number, number, boolean, boolean, boolean, boolean)
     local sign = if subtract then -1 else 1
     local sum = alo + sign * (blo + (if carryIn then 1 else 0))
-    if size == 2 then
-        local lo = sum % 65536
-        local negative = lo >= 32768
-        local carry = if subtract then sum < 0 else sum >= 65536
-        return lo, 0, carry, ((alo >= 32768) ~= (blo >= 32768)) == subtract and negative ~= (alo >= 32768), negative, lo == 0
+    if size <= 2 then
+        local modulus = if size == 1 then 256 else 65536
+        local half = modulus // 2
+        local lo = sum % modulus
+        local negative = lo >= half
+        local carry = if subtract then sum < 0 else sum >= modulus
+        return lo, 0, carry, ((alo >= half) ~= (blo >= half)) == subtract and negative ~= (alo >= half), negative, lo == 0
     end
     local upper = ahi + sign * bhi + math.floor(sum / 4294967296)
     local lo = sum % 4294967296
@@ -104,7 +106,8 @@ end
 -- library code, are never resumed.
 local function runGuestRoutine(action: GuestRoutine, expectedReturn: number, frameStack: number?): any
     local nextAction: any = action
-    -- run() sets the yield callback before the guest starts; it does not change while routines run.
+    -- run() sets the yield callback before the guest starts. Creating a guest thread replaces it with one that
+    -- returns a guest thread's turn to the main thread, which yields to the host.
     local yield = process.yield
     while true do
         if yield then
@@ -344,6 +347,32 @@ end
 constexpr std::string_view VectorOperators[] = {R"(
 local laneA, laneB, laneR = buffer.create(16), buffer.create(16), buffer.create(16)
 
+-- TBL and TBX: each byte of the index lanes selects a byte of the table, `limit` bytes of lanes t0 onward. An
+-- index past the table keeps the byte of the `kept` lanes, which are zero for TBL.
+local vectorTable: (limit: number, size: number, i0: number, i1: number, i2: number, i3: number, k0: number,
+    k1: number, k2: number, k3: number, ...number) -> (number, number, number, number)
+do
+    local bytes = buffer.create(64)
+    local function lane(limit: number, indices: number, kept: number): number
+        local result = 0
+        for shift = 0, 24, 8 do
+            local index = bit32.extract(indices, shift, 8)
+            local byte = if index < limit then buffer.readu8(bytes, index) else bit32.extract(kept, shift, 8)
+            result = bit32.replace(result, byte, shift, 8)
+        end
+        return result
+    end
+    vectorTable = function(limit, size, i0, i1, i2, i3, k0, k1, k2, k3, ...)
+        for word = 1, limit // 4 do
+            buffer.writeu32(bytes, (word - 1) * 4, (select(word, ...)))
+        end
+        if size == 8 then
+            return lane(limit, i0, k0), lane(limit, i1, k1), 0, 0
+        end
+        return lane(limit, i0, k0), lane(limit, i1, k1), lane(limit, i2, k2), lane(limit, i3, k3)
+    end
+end
+
 local function storeLanes(target: buffer, a: number, b: number, c: number, d: number)
     buffer.writeu32(target, 0, a)
     buffer.writeu32(target, 4, b)
@@ -410,12 +439,17 @@ local function wideLanes(op: number, alo: number, ahi: number, blo: number, bhi:
         local sum = if op == 0 then alo + blo else alo - blo
         local high = if op == 0 then ahi + bhi else ahi - bhi
         return sum % 4294967296, (high + math.floor(sum / 4294967296)) % 4294967296
-    elseif op == 20 then
+    elseif op == 20 or op == 27 then
         local al, ah = alo % 65536, math.floor(alo / 65536)
         local bl, bh = blo % 65536, math.floor(blo / 65536)
         local cross = al * bh + ah * bl
         local lower = al * bl + cross % 65536 * 65536
         local upper = ah * bh + math.floor(cross / 65536) + math.floor(lower / 4294967296)
+        if op == 27 then
+            -- A negative factor is its unsigned value less 2^32: the product loses the other factor times 2^32.
+            if alo >= 2147483648 then upper -= blo end
+            if blo >= 2147483648 then upper -= alo end
+        end
         return lower % 4294967296, upper % 4294967296
     end
     local sa, sb = ahi, bhi
@@ -437,6 +471,23 @@ end
 
 local function laneOperation(op: number, element: number, size: number, a0: number, a1: number, a2: number, a3: number,
     b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+    if op >= 28 and op <= 32 then
+        -- Pairwise: lane i combines lanes 2i and 2i + 1 of the first operand followed by the second.
+        if element == 8 then
+            local r0, r1 = wideLanes(0, a0, a1, a2, a3)
+            local r2, r3 = wideLanes(0, b0, b1, b2, b3)
+            return r0, r1, r2, r3
+        end
+        storeLanes(laneA, a0, a1, a2, a3)
+        storeLanes(laneB, b0, b1, b2, b3)
+        local half, signed = size / 2, op == 29 or op == 31
+        for at = 0, size - element, element do
+            local source, from = if at < half then laneA else laneB, (at % half) * 2
+            local x, y = readLane(source, from, element, signed), readLane(source, from + element, element, signed)
+            writeLane(laneR, at, element, if op == 28 then x + y elseif op <= 30 then math.max(x, y) else math.min(x, y))
+        end
+        return loadLanes(laneR, size)
+    end
     if element == 8 then
         local r0, r1 = wideLanes(op, a0, a1, b0, b1)
         if size == 8 then return r0, r1, 0, 0 end
@@ -548,6 +599,26 @@ local function vectorFloatLanes(op: number, element: number, size: number, a0: n
             elseif op == 15 then set = x > y
             else set = x >= y end
             writeMaskLane(laneR, at, element, set)
+        elseif op >= 23 then
+            -- Rounding to an integer keeps the sign of zero, NaN, and infinity.
+            local result
+            if y ~= y or y == math.huge or y == -math.huge then
+                result = y
+            elseif op == 25 then
+                result = math.floor(y)
+            elseif op == 26 then
+                result = math.ceil(y)
+            elseif op == 27 then
+                result = if y >= 0 then math.floor(y) else math.ceil(y)
+            else
+                local magnitude = math.abs(y)
+                local whole = math.floor(magnitude)
+                local fraction = magnitude - whole
+                if fraction > 0.5 or (fraction == 0.5 and (op == 24 or whole % 2 == 1)) then whole += 1 end
+                result = if y < 0 then -whole else whole
+            end
+            if result == 0 and (y < 0 or 1 / y < 0) then result = -0.0 end
+            writeFloatLane(laneR, at, element, result)
         else
             local result
             if op == 19 or op == 20 then
@@ -1414,7 +1485,8 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     local freeBlocks: {[number]: {number}} = {}
     local nextAllocation = heapStart
     local criticalSections: {[number]: number} = {}
-    local pthreadLocks: {[number]: boolean} = {}
+    -- Each held pthread mutex's owning thread and how many times it holds it.
+    local pthreadLocks: {[number]: {owner: number, count: number}} = {}
     local srwLocks: {[number]: number} = {}
     local pageProtection: {[number]: number} = {}
     local classicLocale = 0
@@ -1538,6 +1610,8 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             freeBlocks[length] = {at}
         end
     end
+    -- An allocation's usable size, which malloc_size and malloc_usable_size report.
+    process.heapLength = function(at: number): number? return heapLengths[at] end
     local function resize(lo: number, hi: number, size: number, sizeHi: number): (number, number)
         local at = address(lo, hi)
         local length = heapLengths[at]
@@ -1552,9 +1626,8 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
             return 0, 0
         end
         if length and size <= length and size * 2 > length then
-            -- Shrinking or growing within the rounded block keeps the allocation.
-            local used = heapSizes[at]
-            if size > used then buffer.fill(memory, at - memoryBase + used, 0, size - used) end
+            -- Shrinking or growing within the rounded block keeps the allocation, and every byte of it: malloc_size
+            -- reports the whole block as usable.
             heapSizes[at] = size
             return at, 0
         end
@@ -1585,7 +1658,7 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         heapSizes[start] = size
         heapLengths[start] = needed
         if length then
-            buffer.copy(memory, start - memoryBase, memory, at - memoryBase, math.min(size, heapSizes[at]))
+            buffer.copy(memory, start - memoryBase, memory, at - memoryBase, math.min(size, length))
             release(at)
         end
         return start, 0
@@ -1600,6 +1673,8 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
     end
     local errnoCell = 0
     local function errnoAddress(): number
+        -- Each guest thread has its own errno.
+        if process.threadErrno then return process.threadErrno end
         if errnoCell == 0 then
             errnoCell = resize(0, 0, 8, 0)
             write(8, errnoCell, 0, 0)
@@ -1799,20 +1874,30 @@ local function makeMemory(imageSize: number, data: {DataRange}, heapEnabled: boo
         end
         return 0
     end
+    -- Mutexes count their owner's locks, as recursive ones do (relocking any other kind is undefined). Locking one
+    -- that another guest thread holds waits for it, through process.blockUntil once threads exist.
     local function pthreadMutex(op: string, lo: number, hi: number): number
         local at = address(lo, hi)
         if at == 0 then return 22 end
         locate(at, 1, false)
+        local me = if process.threadId then process.threadId() else 0
+        local held = pthreadLocks[at]
         if op == "pthread_mutex_unlock" then
-            if not pthreadLocks[at] then return 1 end
-            pthreadLocks[at] = nil
-        else
-            if pthreadLocks[at] then
-                if op == "pthread_mutex_trylock" then return 16 end
-                error("recursive guest pthread mutex lock", 0)
-            end
-            pthreadLocks[at] = true
+            if not held or held.owner ~= me then return 1 end
+            held.count -= 1
+            if held.count == 0 then pthreadLocks[at] = nil end
+            return 0
         end
+        if held and held.owner == me then
+            held.count += 1
+            return 0
+        end
+        if held then
+            if op == "pthread_mutex_trylock" then return 16 end
+            if not process.blockUntil then error("guest locks a mutex that nothing can release", 0) end
+            process.blockUntil(function() return pthreadLocks[at] == nil end)
+        end
+        pthreadLocks[at] = {owner = me, count = 1}
         return 0
     end
     local function srwLock(op: string, shared: boolean, lo: number, hi: number): number
@@ -2128,7 +2213,16 @@ local function sehUnwind(targetFrame: number, targetIp: number, record: number, 
     sehCopy(final, frame)
     sehSetRegister(final, 0, returnValue)
     local resume = targetIp
-    if read(4, record) == 0x80000029 then
+    if read(4, record) == 0x80000026 and read(4, record + 24) >= 1 then
+        -- STATUS_LONGJUMP: ExceptionInformation[0] is the _JUMP_BUFFER whose nonvolatile registers setjmp saved.
+        local buffer = (read(8, record + 32))
+        for index, offset in {[3] = 8, [4] = 16, [5] = 24, [6] = 32, [7] = 40, [12] = 48, [13] = 56, [14] = 64, [15] = 72} do
+            writeString(final + 0x78 + index * 8, readString(buffer + offset, 8))
+        end
+        writeString(final + 0x1a0 + 6 * 16, readString(buffer + 0x60, 160))
+        write(4, final + 0x34, read(4, buffer + 0x58), 0)
+        write(4, final + 0x118, read(4, buffer + 0x58), 0)
+    elseif read(4, record) == 0x80000029 then
         -- STATUS_UNWIND_CONSOLIDATE: ExceptionInformation[0] is the callback.
         local continuation, escaped = sehCallWith("consolidate", final, cursor, call, (read(8, record + 32)), record, 0,
             0, 0, SehConsolidateReturn)
@@ -2189,7 +2283,9 @@ end
 // Host services for translated programs: arguments, standard streams, a file system, and C library I/O.
 // Each libc entry takes and returns guest words as (lo, hi) pairs.
 constexpr std::string_view ProcessOperators[] = {R"luau(
-type HostFile = {path: string, data: buffer, size: number, at: number, writable: boolean, readable: boolean}
+type FileContents = {data: buffer, size: number, inode: number, links: number}
+type HostFile = {path: string, contents: FileContents, at: number, writable: boolean, readable: boolean,
+    append: boolean?, directory: boolean?}
 
 local host = {
     args = {"program"} :: {string},
@@ -2198,7 +2294,8 @@ local host = {
     stdinAt = 1,
     output = {{}, {}} :: {{string}},
     writers = {} :: {[number]: ((string) -> ())?},
-    files = {} :: {[string]: string},
+    files = {} :: {[string]: FileContents},
+    nextInode = 4,
     descriptors = {} :: {[number]: HostFile?},
     nextDescriptor = 3,
     streams = {} :: {[number]: number},
@@ -2206,7 +2303,113 @@ local host = {
     pushback = {} :: {[number]: number},
     environment = 0,
     strings = {} :: {[string]: number},
+    -- The guest sees a POSIX file system: the run's files, by absolute path, under a working directory; the
+    -- directories that hold them; and the directories the guest makes. `names` keeps how the run named its files.
+    cwd = "/work",
+    directories = {} :: {[string]: boolean},
+    names = {} :: {[string]: string},
+    directoryStreams = {} :: {[number]: {path: string, entries: {{name: string, directory: boolean}}, at: number, fd: number?}},
+    -- Guest threads besides the main one, which runs them while it waits (see host.block).
+    threads = {} :: {any},
+    current = nil :: any,
+    mainThread = nil :: any,
 }
+host.mainThread = {id = 0x1000, main = true, keys = {}, finished = false}
+host.current = host.mainThread
+process.threadId = function() return host.current.id end
+
+-- An absolute path without "." or ".." components, repeated slashes, or a trailing slash. The empty path names
+-- nothing (ENOENT), so it stays empty.
+function host.canonical(path: string): string
+    if path == "" then return "" end
+    if string.sub(path, 1, 1) ~= "/" then path = host.cwd .. "/" .. path end
+    local parts = {}
+    for part in string.gmatch(path, "[^/]+") do
+        if part == ".." then
+            if #parts > 0 then table.remove(parts) end
+        elseif part ~= "." then
+            table.insert(parts, part)
+        end
+    end
+    return "/" .. table.concat(parts, "/")
+end
+
+function host.parent(path: string): string
+    local parent = string.match(path, "^(.*)/[^/]*$") or ""
+    return if parent == "" then "/" else parent
+end
+
+function host.isDirectory(path: string): boolean
+    if path == "" then return false end
+    if path == "/" or host.directories[path] then return true end
+    if host.files[path] then return false end
+    local prefix = path .. "/"
+    for name in host.files do
+        if string.sub(name, 1, #prefix) == prefix then return true end
+    end
+    return false
+end
+
+-- A directory's entries, sorted by name: its files, and the directories below it.
+function host.children(path: string): {{name: string, directory: boolean}}
+    local prefix = if path == "/" then "/" else path .. "/"
+    local found: {[string]: boolean} = {}
+    local function visit(name: string, directory: boolean)
+        if string.sub(name, 1, #prefix) ~= prefix or #name == #prefix then return end
+        local rest = string.sub(name, #prefix + 1)
+        local first = string.match(rest, "^[^/]+") :: string
+        found[first] = found[first] or directory or #first < #rest
+    end
+    for name in host.files do visit(name, false) end
+    for name in host.directories do visit(name, true) end
+    local entries = {}
+    for name, directory in found do table.insert(entries, {name = name, directory = directory}) end
+    table.sort(entries, function(a, b) return a.name < b.name end)
+    return entries
+end
+
+function host.newFile(text: string): FileContents
+    local inode = host.nextInode
+    host.nextInode += 1
+    return {data = buffer.fromstring(text), size = #text, inode = inode, links = 1}
+end
+
+-- The run's files enter under their canonical paths; the result names them as the run did, or relative to the
+-- working directory.
+function host.load(files: {[string]: string}?, cwd: string?)
+    host.cwd = "/"
+    host.cwd = host.canonical(cwd or "/work")
+    host.files, host.names, host.directories = {}, {}, {}
+    -- Directories exist apart from the files in them: they stay when emptied, until removed.
+    local function hold(path: string)
+        while path ~= "/" and not host.directories[path] do
+            host.directories[path] = true
+            path = host.parent(path)
+        end
+    end
+    for name, text in files or {} do
+        local path = host.canonical(name)
+        host.files[path] = host.newFile(text)
+        host.names[path] = name
+        hold(host.parent(path))
+    end
+    hold(host.cwd)
+    -- Every POSIX system has a directory for temporary files, as tmpfile, tmpnam, and mkstemp callers expect.
+    hold("/tmp")
+end
+
+function host.results(): {[string]: string}
+    local results = {}
+    local prefix = if host.cwd == "/" then "/" else host.cwd .. "/"
+    for path, contents in host.files do
+        local name = host.names[path]
+        if not name then
+            name = if string.sub(path, 1, #prefix) == prefix then string.sub(path, #prefix + 1) else path
+        end
+        results[name] = buffer.readstring(contents.data, 0, contents.size)
+    end
+    return results
+end
 
 local function exitProcess(status: number, callbacks: boolean)
     if callbacks then
@@ -2226,15 +2429,18 @@ local function hostWrite(fd: number, text: string): boolean
     end
     local file = host.descriptors[fd]
     if not file or not file.writable then return false end
-    local finish = file.at + #text
-    if finish > buffer.len(file.data) then
-        local grown = buffer.create(math.max(finish, buffer.len(file.data) * 2, 64))
-        buffer.copy(grown, 0, file.data, 0, file.size)
-        file.data = grown
+    if #text == 0 then return true end
+    local contents = file.contents
+    local at = if file.append then contents.size else file.at
+    local finish = at + #text
+    if finish > buffer.len(contents.data) then
+        local grown = buffer.create(math.max(finish, buffer.len(contents.data) * 2, 64))
+        buffer.copy(grown, 0, contents.data, 0, contents.size)
+        contents.data = grown
     end
-    buffer.writestring(file.data, file.at, text)
+    buffer.writestring(contents.data, at, text)
     file.at = finish
-    file.size = math.max(file.size, finish)
+    contents.size = math.max(contents.size, finish)
     return true
 end
 
@@ -2246,31 +2452,51 @@ local function hostRead(fd: number, count: number): string?
     end
     local file = host.descriptors[fd]
     if not file or not file.readable then return nil end
-    local available = math.max(0, math.min(count, file.size - file.at))
-    local text = buffer.readstring(file.data, file.at, available)
+    local contents = file.contents
+    if file.at >= contents.size then return "" end
+    local available = math.min(count, contents.size - file.at)
+    local text = buffer.readstring(contents.data, file.at, available)
     file.at += available
     return text
 end
 
+-- A descriptor for `path`, or nil and the errno value (ENOENT, EEXIST, EISDIR, or ENOTDIR).
 local function hostOpen(path: string, readable: boolean, writable: boolean, create: boolean, truncate: boolean,
-    append: boolean): number?
+    append: boolean, exclusive: boolean?): (number?, number)
+    path = host.canonical(path)
+    if path == "" then return nil, 2 end
     local existing = host.files[path]
-    if not existing and not create then return nil end
-    local text = if truncate or not existing then "" else existing
-    local data = buffer.create(math.max(#text, 64))
-    buffer.writestring(data, 0, text)
+    if not existing and host.isDirectory(path) then
+        if writable then return nil, 21 end
+        local fd = host.nextDescriptor
+        host.nextDescriptor += 1
+        -- A directory's descriptor seeks over its size (stat's) but cannot be read (EISDIR).
+        host.descriptors[fd] = {path = path,
+            contents = {data = buffer.create(0), size = 4096, inode = host.inode(path), links = 1}, at = 0, writable = false,
+            readable = false, directory = true}
+        return fd, 0
+    end
+    if existing and create and exclusive then return nil, 17 end
+    if not existing then
+        if not create then return nil, 2 end
+        local parent = host.parent(path)
+        if not host.isDirectory(parent) then return nil, if host.files[parent] then 20 else 2 end
+        existing = host.newFile("")
+        host.files[path] = existing
+    elseif truncate then
+        existing.data = buffer.create(0)
+        existing.size = 0
+    end
     local fd = host.nextDescriptor
     host.nextDescriptor += 1
-    host.descriptors[fd] = {path = path, data = data, size = #text, at = if append then #text else 0,
-        writable = writable, readable = readable}
-    if writable then host.files[path] = text end
-    return fd
+    host.descriptors[fd] = {path = path, contents = existing, at = if append then existing.size else 0,
+        writable = writable, readable = readable, append = append}
+    return fd, 0
 end
 
 local function hostClose(fd: number): boolean
     local file = host.descriptors[fd]
     if not file then return fd >= 0 and fd <= 2 end
-    if file.writable then host.files[file.path] = buffer.readstring(file.data, 0, file.size) end
     host.descriptors[fd] = nil
     return true
 end
@@ -2278,7 +2504,7 @@ end
 local function hostSeek(fd: number, offset: number, whence: number): number?
     local file = host.descriptors[fd]
     if not file then return nil end
-    local base = if whence == 0 then 0 elseif whence == 1 then file.at else file.size
+    local base = if whence == 0 then 0 elseif whence == 1 then file.at else file.contents.size
     local position = base + offset
     if position < 0 then return nil end
     file.at = position
@@ -2293,10 +2519,17 @@ local function signed64(lo: number, hi: number): number
     return if hi >= 2147483648 then (hi - 4294967296) * 4294967296 + lo else hi * 4294967296 + lo
 end
 
+-- A NUL-terminated guest string, or at most `limit` bytes of one: printf's %.*s and strncpy take arrays that need
+-- no terminator, so a bounded read never looks past the limit.
 local function guestString(at: number, limit: number?): string
-    local length = stringLength(at, 0)
-    if limit then length = math.min(length, limit) end
-    return readString(at, length)
+    if limit then
+        local length = 0
+        while length < limit and read(1, at + length) ~= 0 do
+            length += 1
+        end
+        return readString(at, length)
+    end
+    return readString(at, stringLength(at, 0))
 end
 
 local function newGuestString(text: string): number
@@ -2346,10 +2579,201 @@ local function padded(text: string, width: number?, left: boolean, zero: boolean
     return string.rep(" ", width - length) .. prefix .. text
 end
 
-type Arguments = {nextInt: () -> (number, number), nextFloat: () -> number}
+)luau", R"luau(
+-- The exact decimal expansion of a finite, positive double, which every double has: its digits, without leading
+-- zeros, and where the decimal point lies relative to them. Limbs hold seven digits each, least significant first.
+local function exactDecimal(value: number): (string, number)
+    local mantissa, exponent = math.frexp(value)
+    mantissa *= 2 ^ 53
+    exponent -= 53
+    local limbs = {}
+    while mantissa > 0 do
+        local limb = mantissa % 10000000
+        table.insert(limbs, limb)
+        mantissa = (mantissa - limb) / 10000000
+    end
+    local function scale(factor: number)
+        local carry = 0
+        for i = 1, #limbs do
+            local product = limbs[i] * factor + carry
+            local limb = product % 10000000
+            limbs[i] = limb
+            carry = (product - limb) / 10000000
+        end
+        while carry > 0 do
+            local limb = carry % 10000000
+            table.insert(limbs, limb)
+            carry = (carry - limb) / 10000000
+        end
+    end
+    -- value = mantissa * 2^exponent; a negative exponent makes it mantissa * 5^-exponent / 10^-exponent.
+    -- Factors stay below 2^26 (or 5^12) so that each product is exact.
+    local remaining = math.abs(exponent)
+    while remaining > 0 do
+        local step = math.min(remaining, if exponent > 0 then 26 else 12)
+        scale(if exponent > 0 then 2 ^ step else 5 ^ step)
+        remaining -= step
+    end
+    local parts = {tostring(limbs[#limbs])}
+    for i = #limbs - 1, 1, -1 do
+        table.insert(parts, string.format("%07d", limbs[i]))
+    end
+    local digits = table.concat(parts)
+    return digits, #digits + math.min(exponent, 0)
+end
 
--- Formats a C format string. `long` is 32 bits wide on Windows.
-local function formatGuest(format: string, arguments: Arguments, windows: boolean): string
+-- Keeps the first `count` digits, rounded to nearest with ties to even; `count` may be negative or exceed the
+-- digits. Returns exactly max(count, 0) digits, or one more when rounding carries, and the new point.
+local function roundDigits(digits: string, point: number, count: number): (string, number)
+    if count >= #digits then
+        return digits .. string.rep("0", count - #digits), point
+    elseif count < 0 then
+        return "", point
+    end
+    local kept = string.sub(digits, 1, count)
+    local following = string.byte(digits, count + 1) - 48
+    local odd = count > 0 and (string.byte(digits, count) - 48) % 2 == 1
+    if following < 5 or (following == 5 and not odd and not string.find(digits, "[1-9]", count + 2)) then
+        return kept, point
+    end
+    local last = count
+    while last > 0 and string.byte(kept, last) == 57 do
+        last -= 1
+    end
+    if last == 0 then
+        return "1" .. string.rep("0", count), point + 1
+    end
+    return string.sub(kept, 1, last - 1) .. string.char(string.byte(kept, last) + 1) .. string.rep("0", count - last), point
+end
+
+-- printf's %f, %e, and %g of a finite, non-negative value, digit by digit: Luau's string.format takes precisions
+-- of at most two digits.
+local function exactFloat(value: number, conversion: string, precision: number, alternate: boolean): string
+    local digits, point = "", 1
+    if value > 0 then
+        digits, point = exactDecimal(value)
+    end
+    local function fixed(places: number): string
+        local kept, at = roundDigits(digits, point, point + places)
+        local whole, fraction
+        if at > 0 then
+            whole, fraction = string.sub(kept, 1, at), string.sub(kept, at + 1)
+        else
+            whole, fraction = "0", string.sub(string.rep("0", -at) .. kept, 1, places)
+        end
+        if whole == "" then whole = "0" end
+        fraction ..= string.rep("0", places - #fraction)
+        return whole .. (if places > 0 or alternate then "." else "") .. fraction
+    end
+    local function scientific(places: number): (string, number)
+        if value == 0 then
+            return "0" .. (if places > 0 or alternate then "." else "") .. string.rep("0", places), 0
+        end
+        local kept, at = roundDigits(digits, point, places + 1)
+        local mantissa = string.sub(kept, 1, 1) .. (if places > 0 or alternate then "." else "") ..
+            string.sub(kept, 2, places + 1)
+        return mantissa, at - 1
+    end
+    local function exponentText(exponent: number): string
+        return string.format("e%s%02d", if exponent < 0 then "-" else "+", math.abs(exponent))
+    end
+    if conversion == "f" then
+        return fixed(precision)
+    elseif conversion == "e" then
+        local mantissa, exponent = scientific(precision)
+        return mantissa .. exponentText(exponent)
+    end
+    local significant = if precision == 0 then 1 else precision
+    local _, exponent = scientific(significant - 1)
+    local text
+    if exponent < significant and exponent >= -4 then
+        text = fixed(significant - 1 - exponent)
+    else
+        local mantissa
+        mantissa, exponent = scientific(significant - 1)
+        text = mantissa
+    end
+    if not alternate and string.find(text, ".", 1, true) then
+        text = string.gsub(string.gsub(text, "0+$", ""), "%.$", "")
+    end
+    if exponent < significant and exponent >= -4 then
+        return text
+    end
+    return text .. exponentText(exponent)
+end
+
+-- printf's %a of a finite, non-negative value as glibc writes it: a leading 1 (0 for zero and subnormals), the
+-- fraction's hex digits without trailing zeros unless a precision rounds or pads them, and a binary exponent.
+-- %a's digits after "0x". glibc writes a subnormal as 0x0.<fraction>p-1022; Darwin (`normalize`) shifts its
+-- leading one bit into the integer digit, as for normal numbers.
+local function hexFloat(value: number, precision: number?, alternate: boolean, normalize: boolean): string
+    local lo, hi = encodeFloat(8, value)
+    local biased = bit32.extract(hi, 20, 11)
+    local fraction = bit32.band(hi, 0xfffff) * 4294967296 + lo
+    local leading = if biased == 0 then 0 else 1
+    local exponent = if value == 0 then 0 elseif biased == 0 then -1022 else biased - 1023
+    if normalize and biased == 0 and fraction ~= 0 then
+        while fraction < 2 ^ 52 do
+            fraction *= 2
+            exponent -= 1
+        end
+        fraction -= 2 ^ 52
+        leading = 1
+    end
+    local digits = string.format("%05x%08x", fraction // 4294967296, fraction % 4294967296)
+    if precision and precision < 13 then
+        local dropped = 2 ^ (4 * (13 - precision))
+        local kept = fraction // dropped
+        local rest = fraction - kept * dropped
+        if rest > dropped / 2 or (rest == dropped / 2 and kept % 2 == 1) then
+            kept += 1
+        end
+        if kept >= 2 ^ (4 * precision) then
+            leading += 1
+            kept = 0
+        end
+        digits = if precision > 0 then string.format("%0" .. precision .. "x", kept) else ""
+    elseif precision then
+        digits ..= string.rep("0", precision - 13)
+    else
+        digits = string.gsub(digits, "0+$", "")
+    end
+    return string.format("%d%s%sp%s%d", leading, if digits ~= "" or alternate then "." else "", digits,
+        if exponent < 0 then "-" else "+", math.abs(exponent))
+end
+
+-- printf's long double arguments as doubles: x86-64 System V passes the x87 80-bit format (a 64-bit mantissa
+-- with an explicit integer bit, then sign and exponent), AArch64 Linux IEEE quad precision (`quad`; words least
+-- significant first). Digits beyond a double's precision, and magnitudes beyond its range, are lost.
+local function decodeLongDouble(quad: boolean, w0: number, w1: number, w2: number, w3: number): number
+    local top = if quad then bit32.rshift(w3, 16) else bit32.band(w2, 0xffff)
+    local sign = if top >= 32768 then -1 else 1
+    local exponent = top % 32768
+    local mantissa, bits
+    if quad then
+        mantissa = (bit32.band(w3, 0xffff) * 4294967296 + w2) * 4294967296 + w1
+        bits = 80
+        if exponent == 32767 then
+            if mantissa == 0 and w0 == 0 then return sign * math.huge end
+            return decodeFloat(8, 0, if sign < 0 then 0xfff80000 else 0x7ff80000)
+        end
+        if exponent ~= 0 then mantissa += 2 ^ 80 end
+    else
+        mantissa = w1 * 4294967296 + w0
+        bits = 63
+        if exponent == 32767 then
+            if w1 % 2147483648 == 0 and w0 == 0 then return sign * math.huge end
+            return decodeFloat(8, 0, if sign < 0 then 0xfff80000 else 0x7ff80000)
+        end
+    end
+    return sign * math.ldexp(mantissa, math.max(exponent, 1) - 16383 - bits)
+end
+
+-- nextLong reads a long double, which is a double on Darwin arm64 and Windows.
+type Arguments = {nextInt: () -> (number, number), nextFloat: () -> number, nextLong: () -> number}
+)luau", R"luau(
+-- Formats a C format string for a platform: 0 glibc, 1 Windows (where `long` is 32 bits wide), 2 Darwin.
+local function formatGuest(format: string, arguments: Arguments, platform: number): string
     local out = {}
     local i, n = 1, #format
     local written = 0
@@ -2415,7 +2839,7 @@ local function formatGuest(format: string, arguments: Arguments, windows: boolea
             conversion == "o" then
             local lo, hi = arguments.nextInt()
             local wide = length == "ll" or length == "j" or length == "z" or length == "t" or length == "q" or
-                (length == "l" and not windows) or length == "I"
+                (length == "l" and platform ~= 1) or length == "I"
             local signed = conversion == "d" or conversion == "i"
             if not wide then
                 if length == "hh" then lo = lo % 256 elseif length == "h" then lo = lo % 65536 end
@@ -2452,29 +2876,43 @@ local function formatGuest(format: string, arguments: Arguments, windows: boolea
             local value = if lo == 0 and hi == 0 then "(null)" else guestString(address(lo, hi), precision)
             text = padded(value, width, left, false, "")
         elseif conversion == "p" then
+            -- glibc writes a null pointer as (nil); msvcrt writes sixteen uppercase digits without 0x.
             local lo, hi = arguments.nextInt()
-            text = padded(digitsOf(lo, hi, 16, false), width, left, false, "0x")
+            if platform == 1 then
+                text = padded(string.format("%08X%08X", hi, lo), width, left, false, "")
+            elseif platform == 0 and lo == 0 and hi == 0 then
+                text = padded("(nil)", width, left, false, "")
+            else
+                text = padded(digitsOf(lo, hi, 16, false), width, left, false, "0x")
+            end
         elseif conversion == "n" then
             local lo, hi = arguments.nextInt()
             write(4, address(lo, hi), written % 4294967296, 0)
         elseif string.find("fFeEgGaA", conversion, 1, true) then
-            local value = arguments.nextFloat()
-            if value ~= value or value == math.huge or value == -math.huge then
-                local word = if value ~= value then "nan" else "inf"
-                if string.find("FEGA", conversion, 1, true) then word = string.upper(word) end
-                local sign = if value == -math.huge or (value ~= value and 1 / value < 0) then "-"
-                    elseif string.find(flags, "+", 1, true) then "+" elseif string.find(flags, " ", 1, true) then " " else ""
-                text = padded(word, width, left, false, sign)
+            local value = if length == "L" then arguments.nextLong() else arguments.nextFloat()
+            local upper = string.find("FEGA", conversion, 1, true) ~= nil
+            local _, signWord = encodeFloat(8, value)
+            local prefix = if signWord >= 2147483648 then "-" elseif string.find(flags, "+", 1, true) then "+"
+                elseif string.find(flags, " ", 1, true) then " " else ""
+            local alternate = string.find(flags, "#", 1, true) ~= nil
+            local magnitude = math.abs(value)
+            if value ~= value or magnitude == math.huge then
+                -- Darwin's printf writes no sign for a NaN.
+                if value ~= value and platform == 2 then prefix = "" end
+                text = padded(if value ~= value then "nan" else "inf", width, left, false, prefix)
             elseif conversion == "a" or conversion == "A" then
-                local mantissa, exponent = math.frexp(math.abs(value))
-                local digits = string.format("%x", math.floor(mantissa * 2 ^ 53))
-                text = padded(string.format("0x%s.%sp%+d", string.sub(digits, 1, 1), string.sub(digits, 2), exponent - 1),
-                    width, left, zero, if value < 0 then "-" else "")
+                -- Zero padding goes after the 0x.
+                text = padded(hexFloat(magnitude, precision, alternate, platform == 2), width, left, zero, prefix .. "0x")
+            elseif (precision or 6) <= 99 then
+                -- The sign and the field width are added here: Luau's string.format takes at most two digits of width.
+                local spec = "%" .. (if alternate then "#" else "") .. (if precision then "." .. precision else "") ..
+                    (if conversion == "F" then "f" else conversion)
+                text = padded(string.format(spec, magnitude), width, left, zero, prefix)
             else
-                local spec = "%" .. string.gsub(flags, "'", "") .. (if width then tostring(width) else "") ..
-                    (if precision then "." .. precision else "") .. (if conversion == "F" then "f" else conversion)
-                text = string.format(spec, value)
+                text = padded(exactFloat(magnitude, string.lower(conversion), precision :: number, alternate), width,
+                    left, zero, prefix)
             end
+            if upper then text = string.upper(text) end
         else
             text = string.sub(format, percent, j - 1)
         end
@@ -2516,11 +2954,28 @@ local function registerArguments(kind: number, sp: number, ints: {number}, intIn
         if floatIndex < 8 then
             local index = floatIndex
             floatIndex += 1
-            return decodeFloat(8, floats[index * 2 + 1], floats[index * 2 + 2])
+            return decodeFloat(8, floats[index * 4 + 1], floats[index * 4 + 2])
         end
         return decodeFloat(8, fromStack())
     end
-    return {nextInt = nextInt, nextFloat = nextFloat}
+    local function nextLong(): number
+        if kind == 0 or kind == 1 then
+            if kind == 1 and floatIndex < 8 then
+                local index = floatIndex
+                floatIndex += 1
+                return decodeLongDouble(true, floats[index * 4 + 1], floats[index * 4 + 2], floats[index * 4 + 3],
+                    floats[index * 4 + 4])
+            end
+            -- In memory, 16-byte aligned.
+            stack = (stack + 15) // 16 * 16
+            local w0, w1 = read(8, stack)
+            local w2, w3 = read(8, stack + 8)
+            stack += 16
+            return decodeLongDouble(kind == 1, w0, w1, w2, w3)
+        end
+        return nextFloat()
+    end
+    return {nextInt = nextInt, nextFloat = nextFloat, nextLong = nextLong}
 end
 
 -- A va_list argument for the same ABI kinds.
@@ -2550,7 +3005,14 @@ local function listArguments(kind: number, lo: number, hi: number): Arguments
             overflow += 8
             return decodeFloat(8, a, b)
         end
-        return {nextInt = nextInt, nextFloat = nextFloat}
+        local function nextLong(): number
+            overflow = (overflow + 15) // 16 * 16
+            local w0, w1 = read(8, overflow)
+            local w2 = read(4, overflow + 8)
+            overflow += 16
+            return decodeLongDouble(false, w0, w1, w2, 0)
+        end
+        return {nextInt = nextInt, nextFloat = nextFloat, nextLong = nextLong}
     elseif kind == 1 then
         local stack = address(read(8, at))
         local grTop, vrTop = address(read(8, at + 8)), address(read(8, at + 16))
@@ -2575,7 +3037,21 @@ local function listArguments(kind: number, lo: number, hi: number): Arguments
             stack += 8
             return decodeFloat(8, a, b)
         end
-        return {nextInt = nextInt, nextFloat = nextFloat}
+        local function nextLong(): number
+            local at = 0
+            if vrOffs < 0 then
+                at = vrTop + vrOffs
+                vrOffs += 16
+            else
+                stack = (stack + 15) // 16 * 16
+                at = stack
+                stack += 16
+            end
+            local w0, w1 = read(8, at)
+            local w2, w3 = read(8, at + 8)
+            return decodeLongDouble(true, w0, w1, w2, w3)
+        end
+        return {nextInt = nextInt, nextFloat = nextFloat, nextLong = nextLong}
     end
     local cursor = at
     local function nextInt(): (number, number)
@@ -2583,7 +3059,8 @@ local function listArguments(kind: number, lo: number, hi: number): Arguments
         cursor += 8
         return a, b
     end
-    return {nextInt = nextInt, nextFloat = function(): number return decodeFloat(8, nextInt()) end}
+    local function nextFloat(): number return decodeFloat(8, nextInt()) end
+    return {nextInt = nextInt, nextFloat = nextFloat, nextLong = nextFloat}
 end
 
 -- Places the program's arguments and environment in guest memory.
@@ -2625,6 +3102,7 @@ end
 local libc = {}
 -- Platform details: Darwin and Linux differ in open() flags and struct stat.
 libc.darwin = false
+libc.windows = false
 libc.arm = false
 
 local function streamDescriptor(lo: number, hi: number): number
@@ -2650,31 +3128,82 @@ end
 
 function libc.read(fdLo, fdHi, bufLo, bufHi, countLo, countHi)
     local text = hostRead(signed32(fdLo), address(countLo, countHi))
-    if not text then setErrno(9); return result(-1) end
+    if not text then
+        local file = host.descriptors[signed32(fdLo)]
+        setErrno(if file and file.directory then 21 else 9)
+        return result(-1)
+    end
     writeString(address(bufLo, bufHi), text)
     return result(#text)
 end
 
-local function openFlags(flags: number): (boolean, boolean, boolean, boolean, boolean)
+-- open()'s access mode and flags, which Darwin and Linux (whose ARM64 O_DIRECTORY differs) number differently.
+local function openFlags(flags: number): (boolean, boolean, boolean, boolean, boolean, boolean, boolean)
     local access = flags % 4
     local create = bit32.btest(flags, if libc.darwin then 0x200 else 0x40)
     local truncate = bit32.btest(flags, if libc.darwin then 0x400 else 0x200)
     local append = bit32.btest(flags, if libc.darwin then 0x8 else 0x400)
-    return access ~= 1, access ~= 0, create, truncate, append
+    local exclusive = bit32.btest(flags, if libc.darwin then 0x800 else 0x80)
+    local directory = bit32.btest(flags, if libc.darwin then 0x100000 elseif libc.arm then 0x4000 else 0x10000)
+    return access ~= 1, access ~= 0, create, truncate, append, exclusive, directory
 end
 
-function libc.open(pathLo, pathHi, flagsLo, flagsHi)
-    local fd = hostOpen(guestString(address(pathLo, pathHi)), openFlags(flagsLo))
-    if not fd then setErrno(2); return result(-1) end
+-- errno values that Darwin and Linux number differently.
+function host.errno(name: string): number
+    local darwin = libc.darwin
+    if name == "ENOTEMPTY" then return if darwin then 66 else 39 end
+    if name == "ENOSYS" then return if darwin then 78 else 38 end
+    if name == "EAGAIN" then return if darwin then 35 else 11 end
+    if name == "ETIMEDOUT" then return if darwin then 60 else 110 end
+    if name == "ENOTSUP" then return if darwin then 45 else 95 end
+    if name == "ELOOP" then return if darwin then 62 else 40 end
+    error("unknown errno " .. name, 0)
+end
+
+-- Why a canonical path that does not exist is missing: ENOTDIR when a component leading to it is a file.
+function host.missing(path: string): number
+    local parent = host.parent(path)
+    while parent ~= "/" do
+        if host.files[parent] then return 20 end
+        parent = host.parent(parent)
+    end
+    return 2
+end
+
+-- A path relative to a directory descriptor, or to the working directory for AT_FDCWD.
+function host.at(dirfd: number, path: string): string?
+    if string.sub(path, 1, 1) == "/" or dirfd == (if libc.darwin then -2 else -100) then return host.canonical(path) end
+    local file = host.descriptors[dirfd]
+    if not file or not file.directory then return nil end
+    return host.canonical(file.path .. "/" .. path)
+end
+
+function host.openPath(path: string, flags: number): (number, number)
+    local readable, writable, create, truncate, append, exclusive, directory = openFlags(flags)
+    if directory and not host.isDirectory(host.canonical(path)) then
+        setErrno(if host.files[host.canonical(path)] then 20 else 2)
+        return result(-1)
+    end
+    local fd, failure = hostOpen(path, readable, writable, create, truncate, append, exclusive)
+    if not fd then setErrno(failure); return result(-1) end
     return result(fd)
 end
 
+function libc.open(pathLo, pathHi, flagsLo, flagsHi)
+    return host.openPath(guestString(address(pathLo, pathHi)), flagsLo)
+end
+
 function libc.openat(dirLo, dirHi, pathLo, pathHi, flagsLo, flagsHi)
-    return libc.open(pathLo, pathHi, flagsLo, flagsHi)
+    local path = host.at(signed32(dirLo), guestString(address(pathLo, pathHi)))
+    if not path then setErrno(9); return result(-1) end
+    return host.openPath(path, flagsLo)
 end
 
 function libc.close(fdLo, fdHi)
-    return result(if hostClose(signed32(fdLo)) then 0 else -1)
+    local fd = signed32(fdLo)
+    if hostClose(fd) then return result(0) end
+    setErrno(9)
+    return result(-1)
 end
 
 function libc.lseek(fdLo, fdHi, offsetLo, offsetHi, whenceLo, whenceHi)
@@ -2683,36 +3212,475 @@ function libc.lseek(fdLo, fdHi, offsetLo, offsetHi, whenceLo, whenceHi)
     return result(position)
 end
 
-local function writeStat(at: number, fd: number?)
-    local file = if fd then host.descriptors[fd] else nil
-    local size = if file then file.size else 0
-    local mode = if file then 0x81a4 else 0x2190
-    fillMemory(at, 0, 0, 144, 0)
+-- struct stat for a regular file, a directory, or a character device (the standard streams), in the layout of
+-- Darwin's 64-bit inode stat or Linux's on x86-64 or ARM64.
+local function writeStat(at: number, kind: string, size: number, inode: number, links: number?)
+    local mode = if kind == "file" then 0x81a4 elseif kind == "directory" then 0x41ed else 0x2190
+    local blocks = math.ceil(size / 512)
     if libc.darwin then
+        fillMemory(at, 0, 0, 144, 0)
+        write(4, at, 1, 0)
         write(2, at + 4, mode, 0)
+        write(2, at + 6, links or 1, 0)
+        write(8, at + 8, inode, 0)
         write(8, at + 96, result(size))
+        write(8, at + 104, result(blocks))
         write(4, at + 112, 4096, 0)
-    else
-        write(4, at + (if libc.arm then 16 else 24), mode, 0)
+    elseif libc.arm then
+        fillMemory(at, 0, 0, 128, 0)
+        write(8, at, 1, 0)
+        write(8, at + 8, inode, 0)
+        write(4, at + 16, mode, 0)
+        write(4, at + 20, links or 1, 0)
         write(8, at + 48, result(size))
         write(4, at + 56, 4096, 0)
+        write(8, at + 64, result(blocks))
+    else
+        fillMemory(at, 0, 0, 144, 0)
+        write(8, at, 1, 0)
+        write(8, at + 8, inode, 0)
+        write(8, at + 16, links or 1, 0)
+        write(4, at + 24, mode, 0)
+        write(8, at + 48, result(size))
+        write(8, at + 56, 4096, 0)
+        write(8, at + 64, result(blocks))
     end
+end
+
+function host.inode(path: string): number
+    local contents = host.files[path]
+    if contents then return contents.inode end
+    host.inodes = host.inodes or {}
+    local inodes = host.inodes :: {[string]: number}
+    if not inodes[path] then
+        inodes[path] = host.nextInode
+        host.nextInode += 1
+    end
+    return inodes[path]
+end
+
+-- Fills `at` for an existing path and returns 0, or sets errno and returns -1.
+function host.statPath(path: string, at: number): (number, number)
+    local contents = host.files[path]
+    if contents then
+        writeStat(at, "file", contents.size, contents.inode, contents.links)
+    elseif host.isDirectory(path) then
+        writeStat(at, "directory", 4096, host.inode(path))
+    else
+        setErrno(host.missing(path))
+        return result(-1)
+    end
+    return result(0)
 end
 
 function libc.fstat(fdLo, fdHi, statLo, statHi)
     local fd = signed32(fdLo)
-    if fd > 2 and not host.descriptors[fd] then setErrno(9); return result(-1) end
-    writeStat(address(statLo, statHi), if fd > 2 then fd else nil)
+    local file = host.descriptors[fd]
+    if fd >= 0 and fd <= 2 and not file then
+        writeStat(address(statLo, statHi), "device", 0, fd + 1)
+        return result(0)
+    end
+    if not file then setErrno(9); return result(-1) end
+    writeStat(address(statLo, statHi), if file.directory then "directory" else "file",
+        file.contents.size, file.contents.inode, file.contents.links)
     return result(0)
 end
 
 function libc.stat(pathLo, pathHi, statLo, statHi)
-    local path = guestString(address(pathLo, pathHi))
-    if not host.files[path] then setErrno(2); return result(-1) end
-    local fd = hostOpen(path, true, false, false, false, false)
-    writeStat(address(statLo, statHi), fd)
-    if fd then hostClose(fd) end
+    return host.statPath(host.canonical(guestString(address(pathLo, pathHi))), address(statLo, statHi))
+end
+
+function libc.fstatat(dirLo, dirHi, pathLo, pathHi, statLo, statHi)
+    local name = guestString(address(pathLo, pathHi))
+    -- AT_EMPTY_PATH: the descriptor itself.
+    if name == "" then return libc.fstat(dirLo, dirHi, statLo, statHi) end
+    local path = host.at(signed32(dirLo), name)
+    if not path then setErrno(9); return result(-1) end
+    return host.statPath(path, address(statLo, statHi))
+end
+
+function host.exists(path: string): boolean
+    return host.files[path] ~= nil or host.isDirectory(path)
+end
+
+function libc.access(pathLo, pathHi)
+    if host.exists(host.canonical(guestString(address(pathLo, pathHi)))) then return result(0) end
+    setErrno(2)
+    return result(-1)
+end
+
+function libc.faccessat(dirLo, dirHi, pathLo, pathHi)
+    local path = host.at(signed32(dirLo), guestString(address(pathLo, pathHi)))
+    if not path then setErrno(9); return result(-1) end
+    if host.exists(path) then return result(0) end
+    setErrno(2)
+    return result(-1)
+end
+
+-- Removes a file, or with `directory` an empty directory.
+function host.removePath(path: string, directory: boolean): (number, number)
+    if host.files[path] then
+        if directory then setErrno(20); return result(-1) end
+        host.files[path].links -= 1
+        host.files[path] = nil
+        host.names[path] = nil
+        return result(0)
+    end
+    if not host.isDirectory(path) then setErrno(2); return result(-1) end
+    if not directory then setErrno(if libc.darwin then 1 else 21); return result(-1) end
+    if #host.children(path) > 0 then setErrno(host.errno("ENOTEMPTY")); return result(-1) end
+    host.directories[path] = nil
     return result(0)
+end
+
+function libc.unlink(pathLo, pathHi)
+    return host.removePath(host.canonical(guestString(address(pathLo, pathHi))), false)
+end
+
+function libc.rmdir(pathLo, pathHi)
+    return host.removePath(host.canonical(guestString(address(pathLo, pathHi))), true)
+end
+
+function libc.remove(pathLo, pathHi)
+    local path = host.canonical(guestString(address(pathLo, pathHi)))
+    return host.removePath(path, host.files[path] == nil)
+end
+)luau", R"luau(
+function libc.unlinkat(dirLo, dirHi, pathLo, pathHi, flagsLo)
+    local path = host.at(signed32(dirLo), guestString(address(pathLo, pathHi)))
+    if not path then setErrno(9); return result(-1) end
+    return host.removePath(path, bit32.btest(flagsLo, if libc.darwin then 0x80 else 0x200))
+end
+)luau", R"luau(
+function host.makeDirectory(path: string): (number, number)
+    if path == "" then setErrno(2); return result(-1) end
+    if host.exists(path) then setErrno(17); return result(-1) end
+    if not host.isDirectory(host.parent(path)) then setErrno(host.missing(path)); return result(-1) end
+    host.directories[path] = true
+    return result(0)
+end
+
+function libc.mkdir(pathLo, pathHi)
+    return host.makeDirectory(host.canonical(guestString(address(pathLo, pathHi))))
+end
+
+function libc.mkdirat(dirLo, dirHi, pathLo, pathHi)
+    local path = host.at(signed32(dirLo), guestString(address(pathLo, pathHi)))
+    if not path then setErrno(9); return result(-1) end
+    return host.makeDirectory(path)
+end
+
+-- Moves a file, or a directory with everything below it.
+function host.renamePath(from: string, to: string): (number, number)
+    if from == "" or to == "" then setErrno(2); return result(-1) end
+    if from == to then
+        if host.exists(from) then return result(0) end
+        setErrno(2)
+        return result(-1)
+    end
+    if host.files[from] then
+        if host.isDirectory(to) then setErrno(21); return result(-1) end
+        if not host.isDirectory(host.parent(to)) then setErrno(2); return result(-1) end
+        local target = host.files[to]
+        if target == host.files[from] then return result(0) end
+        if target then target.links -= 1 end
+        host.files[to], host.files[from] = host.files[from], nil
+        host.names[from] = nil
+        return result(0)
+    end
+    if not host.isDirectory(from) then setErrno(2); return result(-1) end
+    if host.files[to] then setErrno(20); return result(-1) end
+    if string.sub(to, 1, #from + 1) == from .. "/" then setErrno(22); return result(-1) end
+    if host.isDirectory(to) and #host.children(to) > 0 then setErrno(host.errno("ENOTEMPTY")); return result(-1) end
+    if not host.isDirectory(host.parent(to)) then setErrno(host.missing(to)); return result(-1) end
+    local moved: {[string]: FileContents} = {}
+    for path, contents in host.files do
+        if string.sub(path, 1, #from + 1) == from .. "/" then moved[path] = contents end
+    end
+    for path, contents in moved do
+        host.files[path], host.names[path] = nil, nil
+        host.files[to .. string.sub(path, #from + 1)] = contents
+        host.directories[host.parent(to .. string.sub(path, #from + 1))] = true
+    end
+    local directories: {string} = {}
+    for path in host.directories do
+        if path == from or string.sub(path, 1, #from + 1) == from .. "/" then table.insert(directories, path) end
+    end
+    for _, path in directories do
+        host.directories[path] = nil
+        host.directories[to .. string.sub(path, #from + 1)] = true
+    end
+    host.directories[to] = true
+    return result(0)
+end
+
+function libc.rename(fromLo, fromHi, toLo, toHi)
+    return host.renamePath(host.canonical(guestString(address(fromLo, fromHi))), host.canonical(guestString(address(toLo, toHi))))
+end
+
+function libc.renameat(fromDirLo, fromDirHi, fromLo, fromHi, toDirLo, toDirHi, toLo, toHi)
+    local from = host.at(signed32(fromDirLo), guestString(address(fromLo, fromHi)))
+    local to = host.at(signed32(toDirLo), guestString(address(toLo, toHi)))
+    if not from or not to then setErrno(9); return result(-1) end
+    return host.renamePath(from, to)
+end
+
+)luau", R"luau(
+-- Copies `text` and its terminator into a caller's buffer of `size` bytes, or into new memory when the buffer
+-- is null, as getcwd and realpath do.
+function host.returnPath(text: string, bufLo: number, bufHi: number, size: number?): (number, number)
+    local at = address(bufLo, bufHi)
+    if at == 0 then return newGuestString(text), 0 end
+    if size and #text + 1 > size then setErrno(34); return 0, 0 end
+    writeString(at, text)
+    write(1, at + #text, 0, 0)
+    return at, 0
+end
+
+function libc.getcwd(bufLo, bufHi, sizeLo, sizeHi)
+    local size = address(sizeLo, sizeHi)
+    return host.returnPath(host.cwd, bufLo, bufHi, if address(bufLo, bufHi) ~= 0 or size ~= 0 then size else nil)
+end
+
+function libc.chdir(pathLo, pathHi)
+    local path = host.canonical(guestString(address(pathLo, pathHi)))
+    if not host.isDirectory(path) then setErrno(if host.files[path] then 20 else 2); return result(-1) end
+    host.cwd = path
+    return result(0)
+end
+
+function libc.fchdir(fdLo)
+    local file = host.descriptors[signed32(fdLo)]
+    if not file or not file.directory then setErrno(if file then 20 else 9); return result(-1) end
+    host.cwd = file.path
+    return result(0)
+end
+
+function libc.realpath(pathLo, pathHi, bufLo, bufHi)
+    local path = host.canonical(guestString(address(pathLo, pathHi)))
+    if not host.exists(path) then setErrno(2); return 0, 0 end
+    return host.returnPath(path, bufLo, bufHi, nil)
+end
+
+-- There are no symbolic links: readlink finds none, and making one is not permitted.
+function libc.readlink(pathLo, pathHi)
+    setErrno(if host.exists(host.canonical(guestString(address(pathLo, pathHi)))) then 22 else 2)
+    return result(-1)
+end
+
+function libc.readlinkat(dirLo, dirHi, pathLo, pathHi)
+    local path = host.at(signed32(dirLo), guestString(address(pathLo, pathHi)))
+    setErrno(if not path then 9 elseif host.exists(path) then 22 else 2)
+    return result(-1)
+end
+
+function libc.symlink()
+    setErrno(1)
+    return result(-1)
+end
+
+function libc.link(fromLo, fromHi, toLo, toHi)
+    local from = host.canonical(guestString(address(fromLo, fromHi)))
+    local to = host.canonical(guestString(address(toLo, toHi)))
+    if not host.files[from] then setErrno(if host.isDirectory(from) then 1 else 2); return result(-1) end
+    if to == "" then setErrno(2); return result(-1) end
+    if host.exists(to) then setErrno(17); return result(-1) end
+    if not host.isDirectory(host.parent(to)) then setErrno(2); return result(-1) end
+    host.files[from].links += 1
+    host.files[to] = host.files[from]
+    return result(0)
+end
+
+-- Permissions, owners, and times are not kept: these succeed for paths that exist.
+function libc.touchPath(pathLo, pathHi)
+    if host.exists(host.canonical(guestString(address(pathLo, pathHi)))) then return result(0) end
+    setErrno(2)
+    return result(-1)
+end
+
+function libc.touchPathAt(dirLo, dirHi, pathLo, pathHi)
+    local path = host.at(signed32(dirLo), guestString(address(pathLo, pathHi)))
+    if not path then setErrno(9); return result(-1) end
+    if host.exists(path) then return result(0) end
+    setErrno(2)
+    return result(-1)
+end
+
+function libc.touchDescriptor(fdLo)
+    local fd = signed32(fdLo)
+    if host.descriptors[fd] or (fd >= 0 and fd <= 2) then return result(0) end
+    setErrno(9)
+    return result(-1)
+end
+
+function host.truncateFile(file: FileContents, size: number)
+    if size > buffer.len(file.data) then
+        local grown = buffer.create(size)
+        buffer.copy(grown, 0, file.data, 0, file.size)
+        file.data = grown
+    elseif size < file.size then
+        buffer.fill(file.data, size, 0, file.size - size)
+    end
+    file.size = size
+end
+
+function libc.ftruncate(fdLo, fdHi, sizeLo, sizeHi)
+    local file = host.descriptors[signed32(fdLo)]
+    if not file or not file.writable then setErrno(if file then 22 else 9); return result(-1) end
+    local size = signed64(sizeLo, sizeHi)
+    if size < 0 then setErrno(22); return result(-1) end
+    host.truncateFile(file.contents, size)
+    return result(0)
+end
+
+function libc.truncate(pathLo, pathHi, sizeLo, sizeHi)
+    local fd, failure = hostOpen(guestString(address(pathLo, pathHi)), false, true, false, false, false)
+    if not fd then setErrno(failure); return result(-1) end
+    local lo, hi = libc.ftruncate(fd, 0, sizeLo, sizeHi)
+    hostClose(fd)
+    return lo, hi
+end
+
+-- DIR streams: a guest allocation holds the struct dirent that readdir fills, in Darwin's 64-bit inode layout
+-- (name at 21, its length at 18, type at 20) or glibc's (name at 19, type at 18).
+function host.openDirectory(path: string, fd: number?): number
+    local entries = {{name = ".", directory = true}, {name = "..", directory = true}}
+    for _, entry in host.children(path) do table.insert(entries, entry) end
+    local handle = resize(0, 0, 1088, 0)
+    if handle == 0 then error("guest heap exhausted", 0) end
+    host.directoryStreams[handle] = {path = path, entries = entries, at = 1, fd = fd}
+    return handle
+end
+
+function libc.opendir(pathLo, pathHi)
+    local path = host.canonical(guestString(address(pathLo, pathHi)))
+    if not host.isDirectory(path) then setErrno(if host.files[path] then 20 else 2); return 0, 0 end
+    return host.openDirectory(path, nil), 0
+end
+
+function libc.fdopendir(fdLo)
+    local fd = signed32(fdLo)
+    local file = host.descriptors[fd]
+    if not file or not file.directory then setErrno(if file then 20 else 9); return 0, 0 end
+    return host.openDirectory(file.path, fd), 0
+end
+
+function libc.readdir(dirLo, dirHi)
+    local handle = address(dirLo, dirHi)
+    local stream = host.directoryStreams[handle]
+    if not stream then setErrno(9); return 0, 0 end
+    local entry = stream.entries[stream.at]
+    if not entry then return 0, 0 end
+    stream.at += 1
+    local at = handle + 32
+    local name = entry.name
+    local inode = host.inode(host.canonical(stream.path .. "/" .. name))
+    local kind = if entry.directory then 4 else 8
+    if libc.darwin then
+        fillMemory(at, 0, 0, 24, 0)
+        write(8, at, inode, 0)
+        write(8, at + 8, stream.at - 1, 0)
+        write(2, at + 16, 24 + #name, 0)
+        write(2, at + 18, #name, 0)
+        write(1, at + 20, kind, 0)
+        writeString(at + 21, name)
+        write(1, at + 21 + #name, 0, 0)
+    else
+        fillMemory(at, 0, 0, 20, 0)
+        write(8, at, inode, 0)
+        write(8, at + 8, stream.at - 1, 0)
+        write(2, at + 16, 20 + #name, 0)
+        write(1, at + 18, kind, 0)
+        writeString(at + 19, name)
+        write(1, at + 19 + #name, 0, 0)
+    end
+    return at, 0
+end
+
+function libc.closedir(dirLo, dirHi)
+    local handle = address(dirLo, dirHi)
+    local stream = host.directoryStreams[handle]
+    if not stream then setErrno(9); return result(-1) end
+    if stream.fd then hostClose(stream.fd) end
+    host.directoryStreams[handle] = nil
+    resize(handle, 0, 0, 0)
+    return result(0)
+end
+
+function libc.rewinddir(dirLo, dirHi)
+    local stream = host.directoryStreams[address(dirLo, dirHi)]
+    if stream then
+        stream.entries = {{name = ".", directory = true}, {name = "..", directory = true}}
+        for _, entry in host.children(stream.path) do table.insert(stream.entries, entry) end
+        stream.at = 1
+    end
+    return 0, 0
+end
+
+function libc.dirfd(dirLo, dirHi)
+    local stream = host.directoryStreams[address(dirLo, dirHi)]
+    if not stream then setErrno(9); return result(-1) end
+    if not stream.fd then stream.fd = hostOpen(stream.path, true, false, false, false, false) end
+    return result(stream.fd :: number)
+end
+
+-- tmpnam names a file that does not exist yet, as msvcrt (\\s<n>. at the drive's root) or POSIX systems (in
+-- /tmp) do; tmpfile opens a new file that no path names, which goes away when it closes.
+function host.temporaryName(): string
+    for attempt = 1, 100000 do
+        host.nextTemporary = (host.nextTemporary or 0) + 1
+        local n = host.nextTemporary :: number
+        local name = if libc.windows then string.format("\\s%x.", n) else string.format("/tmp/file%06d", n)
+        if not host.exists(if libc.windows then host.windowsPath(name) else name) then return name end
+    end
+    error("guest temporary file names are exhausted", 0)
+end
+
+function libc.tmpnam(bufLo, bufHi)
+    local name = host.temporaryName()
+    if bufLo == 0 and bufHi == 0 then return cachedString(name), 0 end
+    local at = address(bufLo, bufHi)
+    writeString(at, name)
+    write(1, at + #name, 0, 0)
+    return at, 0
+end
+
+-- mkstemp and its relatives replace the template's trailing XXXXXX with characters that name a new file.
+function libc.mkstemp(templateLo, templateHi)
+    local at = address(templateLo, templateHi)
+    local template = guestString(at)
+    if string.sub(template, -6) ~= "XXXXXX" then setErrno(22); return result(-1) end
+    for attempt = 1, 1000 do
+        host.nextTemporary = (host.nextTemporary or 0) + 1
+        local suffix = string.format("%06d", host.nextTemporary :: number)
+        local path = string.sub(template, 1, -7) .. suffix
+        if not host.exists(host.canonical(path)) then
+            local fd, failure = hostOpen(path, true, true, true, false, false, true)
+            if not fd then setErrno(failure); return result(-1) end
+            writeString(at + #template - 6, suffix)
+            return result(fd)
+        end
+    end
+    setErrno(17)
+    return result(-1)
+end
+
+function libc.mkdtemp(templateLo, templateHi)
+    local at = address(templateLo, templateHi)
+    local template = guestString(at)
+    if string.sub(template, -6) ~= "XXXXXX" then setErrno(22); return 0, 0 end
+    for attempt = 1, 1000 do
+        host.nextTemporary = (host.nextTemporary or 0) + 1
+        local suffix = string.format("%06d", host.nextTemporary :: number)
+        local path = host.canonical(string.sub(template, 1, -7) .. suffix)
+        if not host.exists(path) and host.isDirectory(host.parent(path)) then
+            host.directories[path] = true
+            writeString(at + #template - 6, suffix)
+            return at, 0
+        end
+    end
+    setErrno(17)
+    return 0, 0
 end
 
 function libc.isatty()
@@ -2733,13 +3701,26 @@ local function newStream(fd: number): number
 end
 
 function libc.fopen(pathLo, pathHi, modeLo, modeHi)
-    local fd = hostOpen(guestString(address(pathLo, pathHi)), streamMode(guestString(address(modeLo, modeHi))))
-    if not fd then setErrno(2); return 0, 0 end
+    local readable, writable, create, truncate, append = streamMode(guestString(address(modeLo, modeHi)))
+    local exclusive = string.find(guestString(address(modeLo, modeHi)), "x", 1, true) ~= nil
+    local fd, failure = hostOpen(guestString(address(pathLo, pathHi)), readable, writable, create, truncate, append, exclusive)
+    if not fd then setErrno(failure); return 0, 0 end
     return newStream(fd), 0
 end
 
 function libc.fdopen(fdLo, fdHi)
     return newStream(signed32(fdLo)), 0
+end
+
+function libc.tmpfile()
+    local name = host.temporaryName()
+    local path = if libc.windows then host.windowsPath(name) else name
+    local fd, failure = hostOpen(path, true, true, true, true, false, true)
+    if not fd then setErrno(failure); return 0, 0 end
+    local contents = host.files[path]
+    if contents then contents.links -= 1 end
+    host.files[path], host.names[path] = nil, nil
+    return newStream(fd), 0
 end
 
 function libc.fclose(lo, hi)
@@ -2764,7 +3745,14 @@ function libc.fread(ptrLo, ptrHi, sizeLo, sizeHi, countLo, countHi, streamLo, st
     local size, count = address(sizeLo, sizeHi), address(countLo, countHi)
     if size == 0 or count == 0 then return 0, 0 end
     local fd = streamDescriptor(streamLo, streamHi)
-    local text = hostRead(fd, size * count) or ""
+    local text = hostRead(fd, size * count)
+    if not text then
+        local file = host.descriptors[fd]
+        setErrno(if file and file.directory then 21 else 9)
+        host.errors = host.errors or {}
+        ;(host.errors :: any)[fd] = true
+        return 0, 0
+    end
     if #text < size * count then host.eof[fd] = true end
     writeString(address(ptrLo, ptrHi), text)
     return result(#text // size)
@@ -2866,12 +3854,15 @@ function libc.feof(lo, hi)
     return result(if host.eof[streamDescriptor(lo, hi)] then 1 else 0)
 end
 
-function libc.ferror()
-    return 0, 0
+-- A stream's error indicator: set by a read or write that fails.
+function libc.ferror(lo, hi)
+    return if ((host.errors or {}) :: any)[streamDescriptor(lo, hi)] then 1 else 0, 0
 end
 
 function libc.clearerr(lo, hi)
-    host.eof[streamDescriptor(lo, hi)] = nil
+    local fd = streamDescriptor(lo, hi)
+    host.eof[fd] = nil
+    if host.errors then (host.errors :: any)[fd] = nil end
     return 0, 0
 end
 )luau", R"luau(
@@ -2904,8 +3895,9 @@ function libc.getenv(nameLo, nameHi)
     return 0, 0
 end
 
+-- strtol and strtoul for a 64-bit result, or a 32-bit one (`narrow`) for Windows, where long is 32 bits wide.
 local function parseInteger(textLo: number, textHi: number, endLo: number, endHi: number, base: number,
-    unsigned: boolean): (number, number)
+    unsigned: boolean, narrow: boolean?): (number, number)
     local start = address(textLo, textHi)
     local at = start
     local byte = read(1, at)
@@ -2938,6 +3930,16 @@ local function parseInteger(textLo: number, textHi: number, endLo: number, endHi
     if endLo ~= 0 or endHi ~= 0 then
         write(8, address(endLo, endHi), if any then at else start, 0)
     end
+    -- Darwin reports a string without digits as EINVAL.
+    if not any and libc.darwin then setErrno(22) end
+    if narrow then
+        local limit = if unsigned then 4294967295 elseif negative then 2147483648 else 2147483647
+        if overflow or hi ~= 0 or lo > limit then
+            setErrno(34)
+            return if unsigned then 4294967295 elseif negative then 2147483648 else 2147483647, 0
+        end
+        return if negative then (-lo) % 4294967296 else lo, 0
+    end
     if overflow then
         setErrno(34)
         if unsigned then return 4294967295, 4294967295 end
@@ -2960,6 +3962,14 @@ end
 
 function libc.strtoul(sLo, sHi, endLo, endHi, baseLo)
     return parseInteger(sLo, sHi, endLo, endHi, baseLo, true)
+end
+
+function libc.strtolNarrow(sLo, sHi, endLo, endHi, baseLo)
+    return parseInteger(sLo, sHi, endLo, endHi, baseLo, false, true)
+end
+
+function libc.strtoulNarrow(sLo, sHi, endLo, endHi, baseLo)
+    return parseInteger(sLo, sHi, endLo, endHi, baseLo, true, true)
 end
 
 function libc.atoi(sLo, sHi)
@@ -2985,20 +3995,38 @@ local function parseDouble(text: string): (number, number)
     end
     if string.sub(lowered, 1, 8) == "infinity" then return sign * math.huge, leading + signLength + 8 end
     if string.sub(lowered, 1, 3) == "inf" then return sign * math.huge, leading + signLength + 3 end
-    if string.sub(lowered, 1, 3) == "nan" then return 0 / 0, leading + signLength + 3 end
-    local hex = string.match(lowered, "^0x[%x]*%.?[%x]*p?[+-]?%d*")
-    if hex and #hex > 2 then
-        local mantissa, exponent = string.match(hex, "^0x([%x]*%.?[%x]*)p?([+-]?%d*)$")
-        local whole, fraction = string.match(mantissa :: string, "^(%x*)%.?(%x*)$")
-        local value = tonumber((whole :: string) .. (fraction :: string), 16) or 0
-        value = value * 2 ^ ((tonumber(exponent) or 0) - 4 * #(fraction :: string))
-        return sign * value, leading + signLength + #hex
+    if string.sub(lowered, 1, 3) == "nan" then
+        -- A quiet NaN with the sign given, as glibc returns, and an optional (n-char-sequence).
+        local payload = string.match(lowered, "^%([%w_]*%)", 4)
+        return decodeFloat(8, 0, if sign < 0 then 0xfff80000 else 0x7ff80000),
+            leading + signLength + 3 + (if payload then #payload else 0)
+    end
+    local hexMantissa = string.match(lowered, "^0x(%x*%.?%x*)")
+    if hexMantissa and string.find(hexMantissa, "%x") then
+        local whole, fraction = string.match(hexMantissa, "^(%x*)%.?(%x*)$")
+        local used = 2 + #hexMantissa
+        -- The binary exponent needs digits; a bare p is not part of the number.
+        local exponentText = string.match(lowered, "^p[+-]?%d+", used + 1)
+        local exponent = if exponentText then tonumber(string.sub(exponentText, 2)) :: number else 0
+        if exponentText then used += #exponentText end
+        local digits = string.gsub((whole :: string) .. (fraction :: string), "^0+", "")
+        local scale = exponent - 4 * #(fraction :: string)
+        -- tonumber converts at most 16 hex digits exactly; later digits only scale the value.
+        if #digits > 16 then
+            scale += 4 * (#digits - 16)
+            digits = string.sub(digits, 1, 16)
+        end
+        local value = if digits == "" then 0 else math.ldexp(tonumber(digits, 16) :: number, scale)
+        return sign * value, leading + signLength + used
     end
     local number = string.match(lowered, "^%d*%.?%d*")
     if not number or number == "" or number == "." then return 0, 0 end
     local exponent = string.match(lowered, "^e[+-]?%d+", #number + 1)
     local literal = number .. (exponent or "")
-    return sign * (tonumber(literal) or 0), leading + signLength + #literal
+    local value = tonumber(literal) or 0
+    -- Out of range: glibc returns infinity or zero and sets ERANGE.
+    if value == math.huge or (value == 0 and string.find(number, "[1-9]")) then setErrno(34) end
+    return sign * value, leading + signLength + #literal
 end
 
 function libc.strtod(sLo, sHi, endLo, endHi)
@@ -3042,6 +4070,291 @@ function libc.getpid()
     return 4096, 0
 end
 
+-- The process runs as an ordinary user: Darwin's first account (staff), or Linux's.
+function libc.getuid()
+    return if libc.darwin then 501 else 1000, 0
+end
+
+function libc.getgid()
+    return if libc.darwin then 20 else 1000, 0
+end
+
+-- No account database is available.
+function libc.getpwuid()
+    return 0, 0
+end
+
+-- Pseudo-random numbers as each C library makes them. random() is the BSD additive generator in glibc and on
+-- Darwin, and glibc's rand() is random(); Darwin's rand() is Park and Miller's minimal standard, msvcrt's an LCG.
+function host.parkMiller(x: number): number
+    if x == 0 then x = 123459876 end
+    local hi, lo = x // 127773, x % 127773
+    x = 16807 * lo - 2836 * hi
+    if x < 0 then x += 2147483647 end
+    return x
+end
+
+function host.seedRandom(seed: number)
+    seed %= 4294967296
+    if not libc.darwin and seed == 0 then seed = 1 end
+    local state = table.create(31, 0)
+    state[1] = seed
+    for i = 2, 31 do state[i] = host.parkMiller(state[i - 1]) end
+    host.randomState = {state = state, front = 4, rear = 1}
+    for _ = 1, 310 do host.nextRandom() end
+end
+
+function host.nextRandom(): number
+    if not host.randomState then host.seedRandom(1) end
+    local generator = host.randomState :: any
+    local state, front, rear = generator.state, generator.front, generator.rear
+    state[front] = (state[front] + state[rear]) % 4294967296
+    local value = bit32.rshift(state[front], 1)
+    generator.front, generator.rear = front % 31 + 1, rear % 31 + 1
+    return value
+end
+
+function libc.random()
+    return host.nextRandom(), 0
+end
+
+function libc.srandom(seedLo)
+    host.seedRandom(seedLo)
+    return 0, 0
+end
+
+function libc.srandomdev()
+    host.seedRandom(math.floor(os.time() + os.clock() * 1000000) % 4294967296)
+    return 0, 0
+end
+
+function libc.rand()
+    if libc.windows then
+        host.randSeed = ((host.randSeed or 1) * 214013 + 2531011) % 4294967296
+        return bit32.band(bit32.rshift(host.randSeed :: number, 16), 0x7fff), 0
+    elseif libc.darwin then
+        host.randSeed = host.parkMiller(host.randSeed or 1)
+        return host.randSeed :: number, 0
+    end
+    return host.nextRandom(), 0
+end
+
+function libc.srand(seedLo)
+    if libc.windows or libc.darwin then host.randSeed = seedLo else host.seedRandom(seedLo) end
+    return 0, 0
+end
+
+-- Resource usage: the user time is the run's processor time so far.
+function libc.getrusage(whoLo, whoHi, usageLo, usageHi)
+    local at = address(usageLo, usageHi)
+    for offset = 0, 136, 8 do write(8, at + offset, 0, 0) end
+    local seconds = os.clock()
+    write(8, at, math.floor(seconds), 0)
+    write(8, at + 8, math.floor(seconds % 1 * 1000000), 0)
+    return 0, 0
+end
+
+-- confstr's values: the standard utility path, and on Darwin the user's temporary and cache directories.
+function libc.confstr(nameLo, nameHi, bufLo, bufHi, lengthLo, lengthHi)
+    local name = signed32(nameLo)
+    local value = if name == (if libc.darwin then 1 else 0) then
+            (if libc.darwin then "/usr/bin:/bin:/usr/sbin:/sbin" else "/bin:/usr/bin")
+        elseif libc.darwin and (name == 65537 or name == 65538) then "/tmp/"
+        else nil
+    if not value then setErrno(22); return 0, 0 end
+    local length = address(lengthLo, lengthHi)
+    if length > 0 and (bufLo ~= 0 or bufHi ~= 0) then
+        local text = string.sub(value, 1, length - 1)
+        writeString(address(bufLo, bufHi), text .. "\0")
+    end
+    return result(#value + 1)
+end
+
+-- A signal raised with its default action: most end the process as the signal would; a few are ignored.
+function libc.raise(signalLo)
+    local signal = signed32(signalLo)
+    local ignored = if libc.darwin then {[16] = true, [19] = true, [20] = true, [23] = true, [28] = true, [29] = true}
+        else {[17] = true, [18] = true, [23] = true, [28] = true}
+    if signal == 0 or ignored[signal] then return 0, 0 end
+    exitProcess(128 + signal, false)
+    return 0, 0
+end
+
+-- No command processor is available: system(NULL) says so, and commands cannot start.
+function libc.system(commandLo, commandHi)
+    if commandLo == 0 and commandHi == 0 then return 0, 0 end
+    setErrno(host.errno("ENOSYS"))
+    return result(-1)
+end
+
+function libc.popen()
+    setErrno(host.errno("ENOSYS"))
+    return 0, 0
+end
+
+function libc.pclose()
+    setErrno(10)
+    return result(-1)
+end
+
+-- File control. Locks always succeed, and no other process holds one; descriptors keep no flags of their own.
+function libc.fcntl(fdLo, cmdLo, argLo, argHi)
+    local fd, cmd = signed32(fdLo), signed32(cmdLo)
+    local file = host.descriptors[fd]
+    if not file and not (fd >= 0 and fd <= 2) then setErrno(9); return result(-1) end
+    local darwin = libc.darwin
+    if cmd == 1 or cmd == 2 or cmd == 4 then return 0, 0 end
+    if cmd == 3 then
+        local mode = if not file then (if fd == 0 then 0 else 1)
+            elseif file.readable and file.writable then 2 elseif file.writable then 1 else 0
+        if file and file.append then mode += if darwin then 8 else 0x400 end
+        return mode, 0
+    end
+    if cmd == (if darwin then 7 else 5) or (not darwin and cmd == 36) then
+        write(2, address(argLo, argHi) + (if darwin then 20 else 0), 2, 0)
+        return 0, 0
+    end
+    if (darwin and (cmd == 8 or cmd == 9)) or (not darwin and (cmd == 6 or cmd == 7 or cmd == 37 or cmd == 38)) then
+        return 0, 0
+    end
+    if darwin and (cmd == 51 or cmd == 85 or cmd == 48 or cmd == 68) then return 0, 0 end
+    if darwin and cmd == 50 and file then
+        writeString(address(argLo, argHi), file.path .. "\0")
+        return 0, 0
+    end
+    setErrno(22)
+    return result(-1)
+end
+
+-- One local file system holds every file: struct statfs in Darwin's layout (2168 bytes, an APFS volume at /) or
+-- Linux's (120 bytes, ext4).
+function host.writeStatfs(at: number)
+    if libc.darwin then
+        for offset = 0, 2160, 8 do write(8, at + offset, 0, 0) end
+        write(4, at, 4096, 0)
+        write(4, at + 4, 1048576, 0)
+        write(8, at + 8, 262144, 0)
+        write(8, at + 16, 131072, 0)
+        write(8, at + 24, 131072, 0)
+        write(8, at + 32, 1048576, 0)
+        write(8, at + 40, 524288, 0)
+        write(4, at + 56, libc.getuid(), 0)
+        write(4, at + 60, 26, 0)
+        write(4, at + 64, 0x1000, 0)
+        writeString(at + 72, "apfs\0")
+        writeString(at + 88, "/\0")
+        writeString(at + 1112, "/dev/disk1s1\0")
+    else
+        for offset = 0, 112, 8 do write(8, at + offset, 0, 0) end
+        write(8, at, 0xef53, 0)
+        write(8, at + 8, 4096, 0)
+        write(8, at + 16, 262144, 0)
+        write(8, at + 24, 131072, 0)
+        write(8, at + 32, 131072, 0)
+        write(8, at + 40, 1048576, 0)
+        write(8, at + 48, 524288, 0)
+        write(8, at + 64, 255, 0)
+        write(8, at + 72, 4096, 0)
+        write(8, at + 80, 0x20, 0)
+    end
+end
+
+function libc.statfs(pathLo, pathHi, bufLo, bufHi)
+    local path = host.canonical(guestString(address(pathLo, pathHi)))
+    if not host.exists(path) then setErrno(host.missing(path)); return result(-1) end
+    host.writeStatfs(address(bufLo, bufHi))
+    return 0, 0
+end
+
+function libc.fstatfs(fdLo, fdHi, bufLo, bufHi)
+    local fd = signed32(fdLo)
+    if not host.descriptors[fd] and not (fd >= 0 and fd <= 2) then setErrno(9); return result(-1) end
+    host.writeStatfs(address(bufLo, bufHi))
+    return 0, 0
+end
+
+-- Reads and writes at an offset, leaving the descriptor's position where it was.
+function libc.pread(fdLo, fdHi, bufLo, bufHi, countLo, countHi, offsetLo, offsetHi)
+    local fd = signed32(fdLo)
+    local file = host.descriptors[fd]
+    if not file or not file.readable then setErrno(if file and file.directory then 21 else 9); return result(-1) end
+    local offset = signed64(offsetLo, offsetHi)
+    if offset < 0 then setErrno(22); return result(-1) end
+    local saved = file.at
+    file.at = offset
+    local text = hostRead(fd, address(countLo, countHi)) or ""
+    file.at = saved
+    writeString(address(bufLo, bufHi), text)
+    return result(#text)
+end
+)luau", R"luau(
+function libc.pwrite(fdLo, fdHi, bufLo, bufHi, countLo, countHi, offsetLo, offsetHi)
+    local fd = signed32(fdLo)
+    local file = host.descriptors[fd]
+    if not file or not file.writable then setErrno(9); return result(-1) end
+    local offset = signed64(offsetLo, offsetHi)
+    if offset < 0 then setErrno(22); return result(-1) end
+    local count = address(countLo, countHi)
+    local saved, append = file.at, file.append
+    file.at, file.append = offset, false
+    local written = hostWrite(fd, readString(address(bufLo, bufHi), count))
+    file.at, file.append = saved, append
+    if not written then setErrno(28); return result(-1) end
+    return result(count)
+end
+
+-- Darwin's memset_pattern4, 8, and 16 repeat a pattern of that many bytes.
+function host.fillPattern(at: number, pattern: string, length: number)
+    writeString(at, string.sub(string.rep(pattern, length // #pattern + 1), 1, length))
+end
+
+function libc.memset_pattern4(bLo, bHi, pLo, pHi, lengthLo, lengthHi)
+    host.fillPattern(address(bLo, bHi), readString(address(pLo, pHi), 4), address(lengthLo, lengthHi))
+    return 0, 0
+end
+
+function libc.memset_pattern8(bLo, bHi, pLo, pHi, lengthLo, lengthHi)
+    host.fillPattern(address(bLo, bHi), readString(address(pLo, pHi), 8), address(lengthLo, lengthHi))
+    return 0, 0
+end
+
+function libc.memset_pattern16(bLo, bHi, pLo, pHi, lengthLo, lengthHi)
+    host.fillPattern(address(bLo, bHi), readString(address(pLo, pHi), 16), address(lengthLo, lengthHi))
+    return 0, 0
+end
+)luau", R"luau(
+-- abs and its wider forms, which compilers call when code takes their address; Windows' long is 32 bits.
+function libc.abs(lo)
+    local value = signed32(lo)
+    return if value < 0 then (-value) % 4294967296 else value, 0
+end
+
+function libc.llabs(lo, hi)
+    if hi < 2147483648 then return lo, hi end
+    return (4294967296 - lo) % 4294967296, (4294967295 - hi + (if lo == 0 then 1 else 0)) % 4294967296
+end
+
+function libc.labs(lo, hi)
+    if libc.windows then return libc.abs(lo) end
+    return libc.llabs(lo, hi)
+end
+
+-- strlcpy and strlcat bound the whole destination and return the length they tried to make.
+function libc.strlcpy(dstLo, dstHi, srcLo, srcHi, sizeLo, sizeHi)
+    local text, size = guestString(address(srcLo, srcHi)), address(sizeLo, sizeHi)
+    if size > 0 then writeString(address(dstLo, dstHi), string.sub(text, 1, size - 1) .. "\0") end
+    return result(#text)
+end
+
+function libc.strlcat(dstLo, dstHi, srcLo, srcHi, sizeLo, sizeHi)
+    local dst, size = address(dstLo, dstHi), address(sizeLo, sizeHi)
+    local existing = guestString(dst, size)
+    local text = guestString(address(srcLo, srcHi))
+    if #existing >= size then return result(size + #text) end
+    writeString(dst + #existing, string.sub(text, 1, size - #existing - 1) .. "\0")
+    return result(#existing + #text)
+end
+
 function libc.sysconf(nameLo)
     -- _SC_PAGESIZE and _SC_NPROCESSORS_ONLN are the common queries.
     if nameLo == 30 or nameLo == 29 then return 4096, 0 end
@@ -3056,9 +4369,8 @@ function libc.success()
     return 0, 0
 end
 
--- The guest runs on a single thread.
 function libc.pthread_self()
-    return 0x1000, 0
+    return host.current.id, 0
 end
 
 function libc.pthread_mach_thread_np()
@@ -3079,19 +4391,16 @@ function libc.pthread_key_create(keyLo, keyHi)
     return 0, 0
 end
 
+-- Keys hold a value for each guest thread; the main thread's live in threadKeys.
 function libc.pthread_getspecific(key)
-    local slot = threadKeys[key]
+    local slot = if host.current.main then threadKeys[key] else host.current.keys[key]
     if not slot then return 0, 0 end
     return slot.lo, slot.hi
 end
 
 function libc.pthread_setspecific(key, keyHi, lo, hi)
-    threadKeys[key] = {lo = lo, hi = hi}
+    if host.current.main then threadKeys[key] = {lo = lo, hi = hi} else host.current.keys[key] = {lo = lo, hi = hi} end
     return 0, 0
-end
-
-function libc.pthread_cond_wait()
-    error("guest waits on a condition variable that no other thread can signal", 0)
 end
 )luau", R"luau(
 -- C locale character classes in Darwin's rune type bits.
@@ -3269,6 +4578,111 @@ function libc.strpbrk(sLo, sHi, setLo, setHi)
     return if read(1, at) == 0 then 0 else at, 0
 end
 
+-- glibc's ctype tables for the C locale, which its ctype.h macros index from -128 to 255 (EOF is -1) through
+-- __ctype_b_loc and the like: the class bits of each character, and its upper and lower case.
+function libc.ctypeTable(kind: number): (number, number)
+    local tables = libc.ctypeTables or {}
+    libc.ctypeTables = tables
+    if tables[kind] then return tables[kind], 0 end
+    local width = if kind == 0 then 2 else 4
+    local first = resize(0, 0, 384 * width, 0)
+    for i = -128, 255 do
+        local value = i
+        if kind == 0 then
+            value = 0
+            if i >= 0 and i < 128 then
+                local upper, lower, digit = i >= 65 and i <= 90, i >= 97 and i <= 122, i >= 48 and i <= 57
+                local graph = i >= 33 and i <= 126
+                local alnum = upper or lower or digit
+                local bits = {upper, lower, upper or lower, digit,
+                    digit or (i >= 65 and i <= 70) or (i >= 97 and i <= 102), (i >= 9 and i <= 13) or i == 32,
+                    i >= 32 and i <= 126, graph, i == 9 or i == 32, i < 32 or i == 127, graph and not alnum, alnum}
+                -- Bits 0 to 7 sit in the high byte of each little-endian entry, 8 to 11 in the low byte.
+                for bit, set in bits do
+                    if set then value += if bit <= 8 then 2 ^ (bit + 7) else 2 ^ (bit - 9) end
+                end
+            end
+        elseif i >= 0 then
+            if kind == 1 and i >= 97 and i <= 122 then value -= 32 end
+            if kind == 2 and i >= 65 and i <= 90 then value += 32 end
+        elseif i < -1 then
+            -- A negative signed char maps to its unsigned value; EOF stays -1.
+            value = i + 256
+        end
+        write(width, first + (i + 128) * width, value % 4294967296, 0)
+    end
+    local cell = resize(0, 0, 8, 0)
+    write(8, cell, first + 128 * width, 0)
+    tables[kind] = cell
+    return cell, 0
+end
+
+function libc.ctype_b_loc() return libc.ctypeTable(0) end
+function libc.ctype_toupper_loc() return libc.ctypeTable(1) end
+function libc.ctype_tolower_loc() return libc.ctypeTable(2) end
+
+function libc.strstr(hayLo, hayHi, needleLo, needleHi)
+    local haystack = address(hayLo, hayHi)
+    local found = string.find(guestString(haystack), guestString(address(needleLo, needleHi)), 1, true)
+    return if found then haystack + found - 1 else 0, 0
+end
+
+-- strtok_r and strtok_s keep the position in the caller's pointer, strtok in a slot of its own.
+function libc.strtok_r(sLo, sHi, setLo, setHi, saveLo, saveHi)
+    local save = address(saveLo, saveHi)
+    local at = if sLo ~= 0 or sHi ~= 0 then address(sLo, sHi) else address(read(8, save))
+    if at == 0 then return 0, 0 end
+    at += span(at, 0, setLo, setHi, true)
+    if read(1, at) == 0 then
+        write(8, save, at, 0)
+        return 0, 0
+    end
+    local token = at
+    at += span(at, 0, setLo, setHi, false)
+    if read(1, at) ~= 0 then
+        write(1, at, 0, 0)
+        at += 1
+    end
+    write(8, save, at, 0)
+    return token, 0
+end
+
+function libc.strtok(sLo, sHi, setLo, setHi)
+    if not libc.strtokSlot then
+        libc.strtokSlot = resize(0, 0, 8, 0)
+        write(8, libc.strtokSlot, 0, 0)
+    end
+    return libc.strtok_r(sLo, sHi, setLo, setHi, libc.strtokSlot, 0)
+end
+
+function libc.strnlen(sLo, sHi, limitLo, limitHi)
+    local at, limit = address(sLo, sHi), if limitHi ~= 0 then math.huge else limitLo
+    local length = 0
+    while length < limit and read(1, at + length) ~= 0 do
+        length += 1
+    end
+    return length, 0
+end
+
+-- Compares at most `limit` bytes with ASCII letters folded to lower case.
+function libc.strncasecmp(aLo, aHi, bLo, bHi, limitLo, limitHi)
+    local a, b = address(aLo, aHi), address(bLo, bHi)
+    local limit = if limitHi ~= 0 then math.huge else limitLo
+    local i = 0
+    while i < limit do
+        local x, y = read(1, a + i), read(1, b + i)
+        if x >= 65 and x <= 90 then x += 32 end
+        if y >= 65 and y <= 90 then y += 32 end
+        if x ~= y or x == 0 then return result(x - y) end
+        i += 1
+    end
+    return 0, 0
+end
+
+function libc.strcasecmp(aLo, aHi, bLo, bHi)
+    return libc.strncasecmp(aLo, aHi, bLo, bHi, 0, 1)
+end
+
 function libc.strncpy(dstLo, dstHi, srcLo, srcHi, countLo, countHi)
     local count = address(countLo, countHi)
     local text = guestString(address(srcLo, srcHi), count)
@@ -3290,21 +4704,112 @@ function libc.strdup(sLo, sHi)
     return newGuestString(guestString(address(sLo, sHi))), 0
 end
 
-function libc.strerror(code)
-    return cachedString("guest error " .. signed32(code)), 0
+-- The C library's message for an errno value: glibc's, Darwin's, or msvcrt's.
+function host.errorMessage(code: number): string
+    local glibc = {"Operation not permitted", "No such file or directory", "No such process", "Interrupted system call",
+        "Input/output error", "No such device or address", "Argument list too long", "Exec format error",
+        "Bad file descriptor", "No child processes", "Resource temporarily unavailable", "Cannot allocate memory",
+        "Permission denied", "Bad address", "Block device required", "Device or resource busy", "File exists",
+        "Invalid cross-device link", "No such device", "Not a directory", "Is a directory", "Invalid argument",
+        "Too many open files in system", "Too many open files", "Inappropriate ioctl for device", "Text file busy",
+        "File too large", "No space left on device", "Illegal seek", "Read-only file system", "Too many links",
+        "Broken pipe", "Numerical argument out of domain", "Numerical result out of range", "Resource deadlock avoided",
+        "File name too long", "No locks available", "Function not implemented", "Directory not empty",
+        "Too many levels of symbolic links", [75] = "Value too large for defined data type",
+        [84] = "Invalid or incomplete multibyte or wide character", [95] = "Operation not supported",
+        [110] = "Connection timed out"}
+    local darwin = {"Operation not permitted", "No such file or directory", "No such process", "Interrupted system call",
+        "Input/output error", "Device not configured", "Argument list too long", "Exec format error",
+        "Bad file descriptor", "No child processes", "Resource deadlock avoided", "Cannot allocate memory",
+        "Permission denied", "Bad address", "Block device required", "Resource busy", "File exists",
+        "Cross-device link", "Operation not supported by device", "Not a directory", "Is a directory",
+        "Invalid argument", "Too many open files in system", "Too many open files", "Inappropriate ioctl for device",
+        "Text file busy", "File too large", "No space left on device", "Illegal seek", "Read-only file system",
+        "Too many links", "Broken pipe", "Numerical argument out of domain", "Result too large",
+        "Resource temporarily unavailable", [45] = "Operation not supported", [60] = "Operation timed out",
+        [62] = "Too many levels of symbolic links", [63] = "File name too long", [66] = "Directory not empty",
+        [78] = "Function not implemented", [84] = "Value too large to be stored in data type",
+        [92] = "Illegal byte sequence"}
+    local windows = {"Operation not permitted", "No such file or directory", "No such process", "Interrupted function call",
+        "Input/output error", "No such device or address", "Arg list too long", "Exec format error",
+        "Bad file descriptor", "No child processes", "Resource temporarily unavailable", "Not enough space",
+        "Permission denied", "Bad address", "Unknown error", "Resource device", "File exists", "Improper link",
+        "No such device", "Not a directory", "Is a directory", "Invalid argument", "Too many open files in system",
+        "Too many open files", "Inappropriate I/O control operation", "Unknown error", "File too large",
+        "No space left on device", "Invalid seek", "Read-only file system", "Too many links", "Broken pipe",
+        "Domain error", "Result too large", "Unknown error", "Resource deadlock avoided", "Unknown error",
+        "Filename too long", "No locks available", "Function not implemented", "Directory not empty",
+        "Illegal byte sequence"}
+    if code == 0 then
+        return if libc.windows then "No error" elseif libc.darwin then "Undefined error: 0" else "Success"
+    end
+    local message = (if libc.windows then windows elseif libc.darwin then darwin else glibc)[code]
+    if message then return message end
+    return if libc.windows then "Unknown error" elseif libc.darwin then "Unknown error: " .. code
+        else "Unknown error " .. code
 end
 
+function libc.strerror(code)
+    return cachedString(host.errorMessage(signed32(code))), 0
+end
+
+-- XSI strerror_r (Darwin's, and glibc's __xpg_strerror_r) returns 0; glibc's GNU strerror_r, which C++ programs
+-- get, returns the message.
 function libc.strerror_r(code, codeHi, bufLo, bufHi, sizeLo, sizeHi)
-    local text = string.sub("guest error " .. signed32(code), 1, math.max(address(sizeLo, sizeHi) - 1, 0))
+    local text = string.sub(host.errorMessage(signed32(code)), 1, math.max(address(sizeLo, sizeHi) - 1, 0))
     writeString(address(bufLo, bufHi), text)
     write(1, address(bufLo, bufHi) + #text, 0, 0)
     return 0, 0
+end
+
+function libc.strerror_gnu(code, codeHi, bufLo, bufHi, sizeLo, sizeHi)
+    libc.strerror_r(code, codeHi, bufLo, bufHi, sizeLo, sizeHi)
+    return bufLo, bufHi
 end
 
 function libc.aligned_alloc(alignLo, alignHi, sizeLo, sizeHi)
     -- Heap allocations are 16-byte aligned; larger alignments are not available.
     if address(alignLo, alignHi) > 16 then return 0, 0 end
     return resize(0, 0, math.max(address(sizeLo, sizeHi), 1), 0), 0
+end
+)luau", R"luau(
+-- Darwin's malloc zones all share the one heap: a zone's functions take the zone first and ignore it.
+function libc.allocationSize(ptrLo, ptrHi)
+    return (process.heapLength :: any)(address(ptrLo, ptrHi)) or 0, 0
+end
+
+function libc.zoneSize(zoneLo, zoneHi, ptrLo, ptrHi)
+    return libc.allocationSize(ptrLo, ptrHi)
+end
+
+function libc.zoneMalloc(zoneLo, zoneHi, sizeLo, sizeHi)
+    return resize(0, 0, math.max(address(sizeLo, sizeHi), 1), 0), 0
+end
+
+function libc.zoneCalloc(zoneLo, zoneHi, countLo, countHi, sizeLo, sizeHi)
+    return resize(0, 0, math.max(address(countLo, countHi) * address(sizeLo, sizeHi), 1), 0), 0
+end
+
+function libc.zoneFree(zoneLo, zoneHi, ptrLo, ptrHi)
+    resize(ptrLo, ptrHi, 0, 0)
+    return 0, 0
+end
+
+function libc.zoneRealloc(zoneLo, zoneHi, ptrLo, ptrHi, sizeLo, sizeHi)
+    return resize(ptrLo, ptrHi, sizeLo, sizeHi)
+end
+
+function libc.zoneMemalign(zoneLo, zoneHi, alignLo, alignHi, sizeLo, sizeHi)
+    return libc.aligned_alloc(alignLo, alignHi, sizeLo, sizeHi)
+end
+
+-- Page-aligned allocations are not available, as aligned_alloc reports for alignments past 16.
+function libc.zoneValloc(zoneLo, zoneHi, sizeLo, sizeHi)
+    return 0, 0
+end
+
+function libc.zoneGoodSize(sizeLo, sizeHi)
+    return result(math.max(math.ceil(address(sizeLo, sizeHi) / 16) * 16, 16))
 end
 
 function libc.posix_memalign(pointerLo, pointerHi, alignLo, alignHi, sizeLo, sizeHi)
@@ -3425,8 +4930,16 @@ function win32.WriteConsoleW(hLo, hHi, bufLo, bufHi, countLo, countHi, writtenLo
     return 1, 0
 end
 
+-- A Windows path in the guest's POSIX file system: separators become slashes, and a drive is the root.
+function host.windowsPath(path: string): string
+    path = string.gsub(path, "\\", "/")
+    path = string.gsub(path, "^//%?/", "")
+    path = string.gsub(path, "^%a:/", "/")
+    return host.canonical(path)
+end
+
 function win32.CreateFileW(nameLo, nameHi, accessLo, accessHi, shareLo, shareHi, securityLo, securityHi, sp)
-    local path = string.gsub(readWide(address(nameLo, nameHi)), "\\", "/")
+    local path = host.windowsPath(readWide(address(nameLo, nameHi)))
     local disposition = stackArgument(sp, 4)
     local readable = bit32.btest(accessLo, 0x80000000) or bit32.btest(accessLo, 0x10000000)
     local writable = bit32.btest(accessLo, 0x40000000) or bit32.btest(accessLo, 0x10000000)
@@ -3458,7 +4971,7 @@ function win32.GetFileSizeEx(hLo, hHi, sizeLo, sizeHi)
     local fd = handleDescriptor(hLo, hHi)
     local file = if fd then host.descriptors[fd] else nil
     if not file then process.lastError = 6; return 0, 0 end
-    write(8, address(sizeLo, sizeHi), result(file.size))
+    write(8, address(sizeLo, sizeHi), result(file.contents.size))
     return 1, 0
 end
 
@@ -3473,7 +4986,8 @@ end
 function win32.SetEndOfFile(hLo, hHi)
     local fd = handleDescriptor(hLo, hHi)
     local file = if fd then host.descriptors[fd] else nil
-    if file then file.size = file.at end
+    if not file or not file.writable then process.lastError = if file then 5 else 6; return 0, 0 end
+    host.truncateFile(file.contents, file.at)
     return 1, 0
 end
 
@@ -3486,15 +5000,24 @@ function win32.GetCommandLineA()
     return cachedString(commandLine()), 0
 end
 
-function win32.GetModuleFileNameW(moduleLo, moduleHi, bufLo, bufHi, sizeLo)
+-- The executable's full path, as Windows names it: the program's name resolved against the working directory,
+-- with the drive that every absolute path is on.
+function host.modulePath(): string
     local name = host.args[1] or "program.exe"
-    name = string.sub(name, 1, math.max(sizeLo - 1, 0))
+    if string.find(name, "^%a:[\\/]") or string.find(name, "^[\\/][\\/]") then
+        return (string.gsub(name, "/", "\\"))
+    end
+    return "C:" .. string.gsub(host.windowsPath(name), "/", "\\")
+end
+
+function win32.GetModuleFileNameW(moduleLo, moduleHi, bufLo, bufHi, sizeLo)
+    local name = string.sub(host.modulePath(), 1, math.max(sizeLo - 1, 0))
     writeWide(address(bufLo, bufHi), name, true)
     return #name, 0
 end
 
 function win32.GetModuleFileNameA(moduleLo, moduleHi, bufLo, bufHi, sizeLo)
-    local name = string.sub(host.args[1] or "program.exe", 1, math.max(sizeLo - 1, 0))
+    local name = string.sub(host.modulePath(), 1, math.max(sizeLo - 1, 0))
     writeString(address(bufLo, bufHi), name)
     write(1, address(bufLo, bufHi) + #name, 0, 0)
     return #name, 0
@@ -3741,8 +5264,942 @@ function libc.isspace(c)
     return if c == 32 or (c >= 9 and c <= 13) then 1 else 0, 0
 end
 
+-- The other ctype.h classes in the C locale, where only ASCII characters belong to any.
+for name, member in {
+    isdigit = function(c: number) return c >= 48 and c <= 57 end,
+    isupper = function(c: number) return c >= 65 and c <= 90 end,
+    islower = function(c: number) return c >= 97 and c <= 122 end,
+    isalpha = function(c: number) return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) end,
+    isalnum = function(c: number) return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) end,
+    isxdigit = function(c: number) return (c >= 48 and c <= 57) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102) end,
+    isblank = function(c: number) return c == 32 or c == 9 end,
+    iscntrl = function(c: number) return c < 32 or c == 127 end,
+    isprint = function(c: number) return c >= 32 and c <= 126 end,
+    isgraph = function(c: number) return c >= 33 and c <= 126 end,
+    ispunct = function(c: number)
+        return (c >= 33 and c <= 47) or (c >= 58 and c <= 64) or (c >= 91 and c <= 96) or (c >= 123 and c <= 126)
+    end,
+} :: {[string]: (number) -> boolean} do
+    (libc :: any)[name] = function(c: number): (number, number)
+        return if c < 128 and member(c) then 1 else 0, 0
+    end
+end
+)luau", R"luau(
 function libc.sigaction()
     return 0, 0
+end
+)luau", R"luau(
+-- Signal sets: glibc's sigset_t holds 1024 bits, Darwin's 32; signal n is bit n - 1. No signal ever arrives, so
+-- masks have nothing to block, and a mask's previous value is empty.
+function host.signalBit(setLo, setHi, signalLo): (number?, number)
+    local signal = signed32(signalLo)
+    if signal < 1 or signal > (if libc.darwin then 32 else 64) then setErrno(22); return nil, 0 end
+    return address(setLo, setHi) + (signal - 1) // 8, 2 ^ ((signal - 1) % 8)
+end
+
+function host.fillSignals(setLo, setHi, word: number)
+    local at = address(setLo, setHi)
+    for offset = 0, (if libc.darwin then 4 else 128) - 4, 4 do write(4, at + offset, word, 0) end
+end
+
+function libc.sigemptyset(setLo, setHi)
+    host.fillSignals(setLo, setHi, 0)
+    return 0, 0
+end
+
+function libc.sigfillset(setLo, setHi)
+    host.fillSignals(setLo, setHi, 4294967295)
+    return 0, 0
+end
+
+function libc.sigaddset(setLo, setHi, signalLo)
+    local at, bit = host.signalBit(setLo, setHi, signalLo)
+    if not at then return result(-1) end
+    write(1, at, bit32.bor(read(1, at), bit), 0)
+    return 0, 0
+end
+
+function libc.sigdelset(setLo, setHi, signalLo)
+    local at, bit = host.signalBit(setLo, setHi, signalLo)
+    if not at then return result(-1) end
+    write(1, at, bit32.band(read(1, at), 255 - bit), 0)
+    return 0, 0
+end
+
+function libc.sigismember(setLo, setHi, signalLo)
+    local at, bit = host.signalBit(setLo, setHi, signalLo)
+    if not at then return result(-1) end
+    return if bit32.btest(read(1, at), bit) then 1 else 0, 0
+end
+
+function libc.sigprocmask(howLo, howHi, setLo, setHi, oldLo, oldHi)
+    if oldLo ~= 0 or oldHi ~= 0 then host.fillSignals(oldLo, oldHi, 0) end
+    return 0, 0
+end
+)luau", R"luau(
+-- Calendar time. struct tm is nine ints; Linux and Darwin add tm_gmtoff and tm_zone after them, Windows does not.
+-- Local time is the host's, as os.date reports it.
+function host.writeCalendar(at: number, t: number, utc: boolean): boolean
+    local ok, fields = pcall(os.date, if utc then "!*t" else "*t", t)
+    if not ok or type(fields) ~= "table" then return false end
+    local values = {fields.sec, fields.min, fields.hour, fields.day, fields.month - 1, fields.year - 1900,
+        fields.wday - 1, fields.yday - 1, if fields.isdst then 1 else 0}
+    for index, value in values do
+        write(4, at + (index - 1) * 4, value % 4294967296, 0)
+    end
+    if not libc.windows then
+        local offset = 0
+        if not utc then
+            local universal = os.date("!*t", t) :: any
+            universal.isdst = fields.isdst
+            offset = t - os.time(universal)
+        end
+        write(8, at + 40, result(offset))
+        write(8, at + 48, cachedString(if utc then "UTC" else (os.date("%Z", t) :: string)), 0)
+    end
+    return true
+end
+
+function host.readCalendar(at: number): {[string]: number}
+    local function field(index: number): number return signed32((read(4, at + index * 4))) end
+    return {sec = field(0), min = field(1), hour = field(2), day = field(3), month = field(4) + 1,
+        year = field(5) + 1900, isdst = field(8)}
+end
+
+-- Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's days_from_civil).
+function host.civilDays(year: number, month: number, day: number): number
+    year -= if month <= 2 then 1 else 0
+    local era = (if year >= 0 then year else year - 399) // 400
+    local yoe = year - era * 400
+    local doy = (153 * (month + (if month > 2 then -3 else 9)) + 2) // 5 + day - 1
+    local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+end
+
+function host.calendarResult(timeLo: number, timeHi: number, at: number, utc: boolean): (number, number)
+    local t = signed64(read(8, address(timeLo, timeHi)))
+    if not host.writeCalendar(at, t, utc) then setErrno(75); return 0, 0 end
+    return at, 0
+end
+
+function libc.gmtime_r(timeLo, timeHi, tmLo, tmHi)
+    return host.calendarResult(timeLo, timeHi, address(tmLo, tmHi), true)
+end
+
+function libc.localtime_r(timeLo, timeHi, tmLo, tmHi)
+    return host.calendarResult(timeLo, timeHi, address(tmLo, tmHi), false)
+end
+
+-- gmtime and localtime return one static struct tm.
+function libc.gmtime(timeLo, timeHi)
+    host.calendar = host.calendar or resize(0, 0, 64, 0)
+    return host.calendarResult(timeLo, timeHi, host.calendar :: number, true)
+end
+
+function libc.localtime(timeLo, timeHi)
+    host.calendar = host.calendar or resize(0, 0, 64, 0)
+    return host.calendarResult(timeLo, timeHi, host.calendar :: number, false)
+end
+
+-- Windows' _gmtime64_s and _localtime64_s take the struct first and return an errno value.
+function libc.gmtime_s(tmLo, tmHi, timeLo, timeHi)
+    local at = host.calendarResult(timeLo, timeHi, address(tmLo, tmHi), true)
+    return if at == 0 then 22 else 0, 0
+end
+
+function libc.localtime_s(tmLo, tmHi, timeLo, timeHi)
+    local at = host.calendarResult(timeLo, timeHi, address(tmLo, tmHi), false)
+    return if at == 0 then 22 else 0, 0
+end
+
+function libc.mktime(tmLo, tmHi)
+    local at = address(tmLo, tmHi)
+    local fields = host.readCalendar(at) :: any
+    if fields.isdst < 0 then fields.isdst = nil else fields.isdst = fields.isdst > 0 end
+    local ok, t = pcall(os.time, fields)
+    if not ok or type(t) ~= "number" or not host.writeCalendar(at, t, false) then setErrno(75); return result(-1) end
+    return result(t)
+end
+
+function libc.timegm(tmLo, tmHi)
+    local at = address(tmLo, tmHi)
+    local f = host.readCalendar(at)
+    local months = f.month - 1
+    local year = f.year + months // 12
+    local t = ((host.civilDays(year, months % 12 + 1, 1) + f.day - 1) * 24 + f.hour) * 3600 + f.min * 60 + f.sec
+    host.writeCalendar(at, t, true)
+    return result(t)
+end
+
+host.monthNames = {"January", "February", "March", "April", "May", "June", "July", "August", "September",
+    "October", "November", "December"}
+host.dayNames = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
+
+-- strftime in the C locale.
+function host.formatCalendar(format: string, at: number): string
+    local function field(index: number): number return signed32((read(4, at + index * 4))) end
+    local sec, min, hour, day, month, year = field(0), field(1), field(2), field(3), field(4), field(5) + 1900
+    local wday, yday = field(6), field(7)
+    local zone = if libc.windows then "" else guestString(address(read(8, at + 48)))
+    local offset = if libc.windows then 0 else signed64(read(8, at + 40))
+    local function weekNumber(first: number): number return (yday + 7 - ((wday - first) % 7)) // 7 end
+    local function isoWeek(): (number, number)
+        local weekday = (wday + 6) % 7
+        local week = (yday - weekday + 10) // 7
+        local isoYear = year
+        local function weeksIn(y: number): number
+            local jan1 = (host.civilDays(y, 1, 1) + 4) % 7
+            local leap = (y % 4 == 0 and y % 100 ~= 0) or y % 400 == 0
+            return if jan1 == 4 or (leap and jan1 == 3) then 53 else 52
+        end
+        if week < 1 then
+            isoYear -= 1
+            week = weeksIn(isoYear)
+        elseif week > weeksIn(year) then
+            isoYear += 1
+            week = 1
+        end
+        return isoYear, week
+    end
+    local out = {}
+    local i = 1
+    while i <= #format do
+        local c = string.sub(format, i, i)
+        if c ~= "%" or i == #format then
+            table.insert(out, c)
+            i += 1
+        else
+            local spec = string.sub(format, i + 1, i + 1)
+            i += 2
+            if spec == "E" or spec == "O" then
+                spec = string.sub(format, i, i)
+                i += 1
+            end
+            local text
+            if spec == "a" then text = string.sub(host.dayNames[wday % 7 + 1], 1, 3)
+            elseif spec == "A" then text = host.dayNames[wday % 7 + 1]
+            elseif spec == "b" or spec == "h" then text = string.sub(host.monthNames[month % 12 + 1], 1, 3)
+            elseif spec == "B" then text = host.monthNames[month % 12 + 1]
+            elseif spec == "c" then text = host.formatCalendar("%a %b %e %H:%M:%S %Y", at)
+            elseif spec == "C" then text = string.format("%02d", year // 100)
+            elseif spec == "d" then text = string.format("%02d", day)
+            elseif spec == "D" then text = host.formatCalendar("%m/%d/%y", at)
+            elseif spec == "e" then text = string.format("%2d", day)
+            elseif spec == "F" then text = host.formatCalendar("%Y-%m-%d", at)
+            elseif spec == "g" then text = string.format("%02d", (isoWeek()) % 100)
+            elseif spec == "G" then text = tostring((isoWeek()))
+            elseif spec == "H" then text = string.format("%02d", hour)
+            elseif spec == "I" then text = string.format("%02d", (hour + 11) % 12 + 1)
+            elseif spec == "j" then text = string.format("%03d", yday + 1)
+            elseif spec == "k" then text = string.format("%2d", hour)
+            elseif spec == "l" then text = string.format("%2d", (hour + 11) % 12 + 1)
+            elseif spec == "m" then text = string.format("%02d", month + 1)
+            elseif spec == "M" then text = string.format("%02d", min)
+            elseif spec == "n" then text = "\n"
+            elseif spec == "p" then text = if hour < 12 then "AM" else "PM"
+            elseif spec == "P" then text = if hour < 12 then "am" else "pm"
+            elseif spec == "r" then text = host.formatCalendar("%I:%M:%S %p", at)
+            elseif spec == "R" then text = host.formatCalendar("%H:%M", at)
+            elseif spec == "s" then
+                text = tostring(((host.civilDays(year, month + 1, day) * 24 + hour) * 3600 + min * 60 + sec) - offset)
+            elseif spec == "S" then text = string.format("%02d", sec)
+            elseif spec == "t" then text = "\t"
+            elseif spec == "T" then text = host.formatCalendar("%H:%M:%S", at)
+            elseif spec == "u" then text = tostring((wday + 6) % 7 + 1)
+            elseif spec == "U" then text = string.format("%02d", weekNumber(0))
+            elseif spec == "V" then text = string.format("%02d", select(2, isoWeek()))
+            elseif spec == "w" then text = tostring(wday)
+            elseif spec == "W" then text = string.format("%02d", weekNumber(1))
+            elseif spec == "x" then text = host.formatCalendar("%m/%d/%y", at)
+            elseif spec == "X" then text = host.formatCalendar("%H:%M:%S", at)
+            elseif spec == "y" then text = string.format("%02d", year % 100)
+            elseif spec == "Y" then text = tostring(year)
+            elseif spec == "z" then
+                local magnitude = math.abs(offset) // 60
+                text = string.format("%s%02d%02d", if offset < 0 then "-" else "+", magnitude // 60, magnitude % 60)
+            elseif spec == "Z" then text = zone
+            elseif spec == "%" then text = "%"
+            else text = "%" .. spec end
+            table.insert(out, text)
+        end
+    end
+    return table.concat(out)
+end
+
+function libc.strftime(bufLo, bufHi, maxLo, maxHi, formatLo, formatHi, tmLo, tmHi)
+    local text = host.formatCalendar(guestString(address(formatLo, formatHi)), address(tmLo, tmHi))
+    local limit = address(maxLo, maxHi)
+    if #text + 1 > limit then return 0, 0 end
+    writeString(address(bufLo, bufHi), text)
+    write(1, address(bufLo, bufHi) + #text, 0, 0)
+    return result(#text)
+end
+
+-- Sleeping takes no time beyond giving the other guest threads a turn.
+function libc.nanosleep(requestLo, requestHi, remainLo, remainHi)
+    if remainLo ~= 0 or remainHi ~= 0 then fillMemory(address(remainLo, remainHi), 0, 0, 16, 0) end
+    return libc.yieldThread()
+end
+
+-- Guest threads take turns: each runs as a coroutine with its own registers, stack, errno, keys, and Darwin
+-- thread-local variables until it blocks (joining, waiting on a condition variable or a mutex another thread
+-- holds, or yielding), and the main thread runs the others while it waits. Threads therefore switch only where
+-- they block, at routine boundaries.
+-- Runs one other thread that can make progress for a turn, and says whether there was one.
+function host.runOther(): boolean
+    local count = #host.threads
+    for step = 1, count do
+        host.nextTurn = (host.nextTurn or 0) % count + 1
+        local thread = host.threads[host.nextTurn :: number]
+        if host.runnable(thread) then
+            thread.ready = nil
+            local main = host.mainThread
+            main.context = (process.saveRegisters :: any)()
+            if thread.context then (process.restoreRegisters :: any)(thread.context) end
+            -- ELF thread-local blocks sit at fixed addresses: each thread's contents take their place in turn.
+            main.blocks = main.blocks or {}
+            thread.blocks = thread.blocks or {}
+            for start, initial in process.threadBlocks do
+                main.blocks[start] = readString(start, #initial)
+                writeString(start, thread.blocks[start] or initial)
+            end
+            host.current = thread
+            process.threadErrno = thread.errno
+            local ok, first, second = coroutine.resume(thread.co)
+            for start, initial in process.threadBlocks do
+                thread.blocks[start] = readString(start, #initial)
+                writeString(start, main.blocks[start])
+            end
+            if coroutine.status(thread.co) == "dead" then
+                thread.finished = true
+                if ok then
+                    thread.resultLo, thread.resultHi = first, second
+                elseif type(first) == "table" and (first :: any).luftThreadExit then
+                    ok = true
+                    thread.resultLo, thread.resultHi = (first :: any).lo, (first :: any).hi
+                end
+                resize(thread.stack, 0, 0, 0)
+            else
+                thread.context = (process.saveRegisters :: any)()
+            end
+            ;(process.restoreRegisters :: any)(main.context)
+            host.current = main
+            process.threadErrno = nil
+            if not ok then error(first, 0) end
+            if host.hostYield and os.clock() - process.yieldAt >= process.yieldInterval then
+                host.hostYield()
+                process.yieldAt = os.clock()
+            end
+            return true
+        end
+    end
+    return false
+end
+
+-- Whether a thread can take a turn. Evaluating a wait can ask about the other threads, whose waits may ask about
+-- it in turn: a thread being asked about already counts as unable.
+function host.runnable(thread: any): boolean
+    if thread.finished or thread.evaluating then return false end
+    if thread.ready == nil then return true end
+    thread.evaluating = true
+    local ok, ready = pcall(thread.ready)
+    thread.evaluating = nil
+    if not ok then error(ready, 0) end
+    return ready
+end
+
+-- Whether a thread other than `me` (and the main thread, which runs them) can take a turn.
+function host.othersRunnable(me: any): boolean
+    for _, thread in host.threads do
+        if thread ~= me and host.runnable(thread) then return true end
+    end
+    return false
+end
+
+-- Waits until `ready` holds: another thread's turn ends where it blocks, and the main thread runs the others
+-- meanwhile. Nothing being able to run then is a deadlock.
+function host.block(ready: () -> boolean)
+    if ready() then return end
+    if not host.current.main then
+        host.current.ready = ready
+        coroutine.yield()
+        return
+    end
+    while not ready() do
+        if not host.runOther() then error("guest threads deadlocked", 0) end
+    end
+end
+
+-- sched_yield and sleeping give the other threads a turn.
+function libc.yieldThread()
+    if #host.threads == 0 then return 0, 0 end
+    if host.current.main then
+        host.runOther()
+    else
+        host.current.ready = nil
+        coroutine.yield()
+    end
+    return 0, 0
+end
+
+-- A thread for `body`, which receives the top of its stack and returns the thread's result, or nil when there is
+-- no memory for its stack.
+function host.createThread(body: (number) -> (number, number)): any
+    local stackSize = 1048576
+    local stack = resize(0, 0, stackSize, 0)
+    if stack == 0 then return nil end
+    if #host.threads == 0 then
+        process.blockUntil = host.block
+        process.threadLocal = host.threadLocal
+        -- A guest thread's periodic yield returns its turn to the main thread, which yields to the host.
+        host.hostYield = process.yield
+        if process.yield then
+            process.yield = function()
+                if host.current.main then (host.hostYield :: any)() else coroutine.yield() end
+            end
+        end
+    end
+    host.nextThreadId = (host.nextThreadId or 0x1000) + 16
+    local errno = resize(0, 0, 8, 0)
+    write(8, errno, 0, 0)
+    local thread = {id = host.nextThreadId, keys = {}, finished = false, stack = stack, errno = errno, locals = {}}
+    local top = stack + stackSize - 16
+    thread.co = coroutine.create(function() return body(top) end)
+    table.insert(host.threads, thread)
+    return thread
+end
+
+function host.findThread(id: number): any
+    for _, thread in host.threads do
+        if thread.id == id then return thread end
+    end
+    return nil
+end
+
+function libc.pthread_join(idLo, idHi, resultLo, resultHi)
+    local thread = host.findThread(idLo)
+    if not thread then return 3, 0 end
+    if thread == host.current then return if libc.darwin then 11 else 35, 0 end
+    host.block(function() return thread.finished end)
+    if resultLo ~= 0 or resultHi ~= 0 then write(8, address(resultLo, resultHi), thread.resultLo or 0, thread.resultHi or 0) end
+    return 0, 0
+end
+)luau", R"luau(
+function libc.pthread_detach(idLo)
+    return if host.findThread(idLo) then 0 else 3, 0
+end
+
+-- pthread_exit ends a guest thread with its result; the main thread's ends the process once the others have.
+function libc.pthread_exit(lo, hi)
+    if not host.current.main then error({luftThreadExit = true, lo = lo, hi = hi}, 0) end
+    host.block(function()
+        for _, thread in host.threads do
+            if not thread.finished then return false end
+        end
+        return true
+    end)
+    exitProcess(0, true)
+end
+)luau", R"luau(
+-- Condition variables keep their waiters; a signal wakes the first, a broadcast every one. A timed wait times
+-- out when no other thread can run.
+function host.waitCondition(condLo: number, condHi: number, mutexLo: number, mutexHi: number, timed: boolean): number
+    local cond = address(condLo, condHi)
+    host.conditions = host.conditions or {}
+    local conditions = host.conditions :: any
+    conditions[cond] = conditions[cond] or {}
+    local waiter = {signaled = false}
+    table.insert(conditions[cond], waiter)
+    if pthreadMutex("pthread_mutex_unlock", mutexLo, mutexHi) ~= 0 then return 1 end
+    local timedOut = false
+    local me = host.current
+    host.block(function()
+        if waiter.signaled then return true end
+        if timed and not host.othersRunnable(me) then
+            timedOut = true
+            return true
+        end
+        return false
+    end)
+    if not waiter.signaled then
+        local list = conditions[cond]
+        for index, entry in list do
+            if entry == waiter then table.remove(list, index); break end
+        end
+    end
+    pthreadMutex("pthread_mutex_lock", mutexLo, mutexHi)
+    return if timedOut and not waiter.signaled then host.errno("ETIMEDOUT") else 0
+end
+
+function libc.pthread_cond_wait(condLo, condHi, mutexLo, mutexHi)
+    if #host.threads == 0 then error("guest waits on a condition variable that no other thread can signal", 0) end
+    return host.waitCondition(condLo, condHi, mutexLo, mutexHi, false), 0
+end
+
+function libc.pthread_cond_timedwait(condLo, condHi, mutexLo, mutexHi)
+    if #host.threads == 0 then return host.errno("ETIMEDOUT"), 0 end
+    return host.waitCondition(condLo, condHi, mutexLo, mutexHi, true), 0
+end
+
+function libc.pthread_cond_signal(condLo, condHi, all: boolean?)
+    local list = ((host.conditions or {}) :: any)[address(condLo, condHi)]
+    while list and #list > 0 do
+        table.remove(list, 1).signaled = true
+        if not all then break end
+    end
+    return 0, 0
+end
+
+function libc.pthread_cond_broadcast(condLo, condHi)
+    return libc.pthread_cond_signal(condLo, condHi, true)
+end
+
+-- A Darwin thread-local variable's block for the current thread: the main thread uses the template itself, and
+-- each other thread a copy made from the template's initial bytes.
+function host.threadLocal(base: number): number
+    local thread = host.current
+    if thread.main then return base end
+    local copy = thread.locals[base]
+    if not copy then
+        local initial = process.threadTemplates[base] or ""
+        copy = resize(0, 0, math.max(#initial, 16), 0)
+        fillMemory(copy, 0, 0, math.max(#initial, 16), 0)
+        writeString(copy, initial)
+        thread.locals[base] = copy
+    end
+    return copy
+end
+
+-- Darwin's pthread_get_stackaddr_np reports the top of the main thread's stack.
+function libc.pthread_get_stackaddr_np()
+    return stackTop, 0
+end
+
+-- The size of the program's stack (MappedStackSize).
+function libc.pthread_get_stacksize_np()
+    return 8388608, 0
+end
+
+-- Anonymous memory maps come from the heap, file maps are private copies; neither has page protection.
+function libc.mmap(addrLo, addrHi, lengthLo, lengthHi, protLo, protHi, flagsLo, flagsHi, fdLo, fdHi, offsetLo, offsetHi)
+    local length = address(lengthLo, lengthHi)
+    local anonymous = bit32.btest(flagsLo, if libc.darwin then 0x1000 else 0x20)
+    local fixed = bit32.btest(flagsLo, 0x10)
+    if length == 0 or fixed then setErrno(22); return 4294967295, 4294967295 end
+    local at = resize(0, 0, length, 0)
+    if at == 0 then setErrno(12); return 4294967295, 4294967295 end
+    fillMemory(at, 0, 0, length, 0)
+    if not anonymous then
+        local file = host.descriptors[signed32(fdLo)]
+        if not file then resize(at, 0, 0, 0); setErrno(9); return 4294967295, 4294967295 end
+        local offset = signed64(offsetLo, offsetHi)
+        if file.directory or offset < 0 then resize(at, 0, 0, 0); setErrno(22); return 4294967295, 4294967295 end
+        local available = math.max(0, math.min(length, file.contents.size - offset))
+        if available > 0 then writeString(at, buffer.readstring(file.contents.data, offset, available)) end
+    end
+    host.maps = host.maps or {}
+    ;(host.maps :: any)[at] = length
+    return at, 0
+end
+
+function libc.munmap(addrLo, addrHi)
+    local at = address(addrLo, addrHi)
+    local maps = (host.maps or {}) :: any
+    if maps[at] then
+        maps[at] = nil
+        resize(at, 0, 0, 0)
+    end
+    return 0, 0
+end
+
+function libc.one()
+    return 1, 0
+end
+
+-- No thread but the main one exists to join or detach (ESRCH).
+function libc.noThread()
+    return 3, 0
+end
+
+function libc.notSupported()
+    setErrno(host.errno("ENOSYS"))
+    return result(-1)
+end
+
+function libc.notTerminal()
+    setErrno(25)
+    return result(-1)
+end
+
+function libc.notFound()
+    setErrno(2)
+    return result(-1)
+end
+
+-- assert(): Darwin's __assert_rtn(function, file, line, expression) and glibc's __assert_fail(expression, file,
+-- line, function) print as their C libraries do, then abort.
+function libc.assertDarwin(functionLo, functionHi, fileLo, fileHi, lineLo, lineHi, expressionLo, expressionHi)
+    local name = if functionLo ~= 0 or functionHi ~= 0 then guestString(address(functionLo, functionHi)) else nil
+    local file = guestString(address(fileLo, fileHi))
+    local expression = guestString(address(expressionLo, expressionHi))
+    if name then
+        hostWrite(2, string.format("Assertion failed: (%s), function %s, file %s, line %d.\n", expression, name, file,
+            signed32(lineLo)))
+    else
+        hostWrite(2, string.format("Assertion failed: (%s), file %s, line %d.\n", expression, file, signed32(lineLo)))
+    end
+    exitProcess(134, false)
+end
+
+function libc.assertGlibc(expressionLo, expressionHi, fileLo, fileHi, lineLo, lineHi, functionLo, functionHi)
+    local program = host.args[1] or "program"
+    hostWrite(2, string.format("%s: %s:%d: %s: Assertion `%s' failed.\n", program, guestString(address(fileLo, fileHi)),
+        signed32(lineLo), guestString(address(functionLo, functionHi)), guestString(address(expressionLo, expressionHi))))
+    exitProcess(134, false)
+end
+
+-- Message catalogs hold no messages, so catgets returns its default.
+function libc.catgets(catLo, catHi, setLo, setHi, numberLo, numberHi, defaultLo, defaultHi)
+    return defaultLo, defaultHi
+end
+
+-- In the C locale, collation compares bytes and transforms copy.
+function libc.strxfrm(dstLo, dstHi, srcLo, srcHi, sizeLo, sizeHi)
+    local text = guestString(address(srcLo, srcHi))
+    local size = address(sizeLo, sizeHi)
+    if #text < size then
+        writeString(address(dstLo, dstHi), text)
+        write(1, address(dstLo, dstHi) + #text, 0, 0)
+    end
+    return result(#text)
+end
+
+-- Darwin's copyfile_state_t is an opaque handle; fcopyfile copies a descriptor's contents into another.
+function libc.copyfile_state_alloc()
+    return resize(0, 0, 16, 0), 0
+end
+
+function libc.fcopyfile(fromLo, fromHi, toLo, toHi)
+    local from, to = host.descriptors[signed32(fromLo)], host.descriptors[signed32(toLo)]
+    if not from or not to or not to.writable then setErrno(9); return result(-1) end
+    if from.directory or to.directory then setErrno(21); return result(-1) end
+    local src, dst = from.contents, to.contents
+    if src ~= dst then
+        local data = buffer.create(src.size)
+        buffer.copy(data, 0, src.data, 0, src.size)
+        dst.data, dst.size = data, src.size
+    end
+    to.at = dst.size
+    return result(0)
+end
+)luau", R"luau(
+-- long double as stored by scanf's %Lf: a double on Darwin's ARM64 and Windows, IEEE quad precision on ARM64
+-- Linux, and the x87 80-bit format on x86-64.
+function host.writeLongDouble(at: number, value: number, platform: number)
+    if platform ~= 0 then
+        write(8, at, encodeFloat(8, value))
+        return
+    end
+    local lo, hi = encodeFloat(8, value)
+    local sign = if hi >= 2147483648 then 32768 else 0
+    local exponent = bit32.extract(hi, 20, 11)
+    -- The fraction without the implicit bit, and the unbiased exponent; subnormal doubles are normal in both
+    -- wider formats.
+    local fraction = bit32.band(hi, 0xfffff) * 4294967296 + lo
+    fillMemory(at, 0, 0, 16, 0)
+    if exponent == 0 and fraction == 0 then
+        write(2, at + (if libc.arm then 14 else 8), sign, 0)
+        return
+    end
+    local biased
+    if exponent == 2047 then
+        biased = 32767
+    else
+        local unbiased = exponent - 1023
+        if exponent == 0 then
+            unbiased = -1022
+            while fraction < 2 ^ 52 do
+                fraction *= 2
+                unbiased -= 1
+            end
+            fraction -= 2 ^ 52
+        end
+        biased = unbiased + 16383
+    end
+    local fractionHi, fractionLo = fraction // 4294967296, fraction % 4294967296
+    if libc.arm then
+        -- IEEE quad precision: 112 fraction bits, the double's 52 at their top.
+        write(4, at + 4, bit32.lshift(bit32.band(fractionLo, 15), 28), 0)
+        write(4, at + 8, bit32.bor(bit32.rshift(fractionLo, 4), bit32.lshift(bit32.band(fractionHi, 15), 28)), 0)
+        write(2, at + 12, bit32.rshift(fractionHi, 4), 0)
+        write(2, at + 14, sign + biased, 0)
+    else
+        -- x87 extended precision: an explicit integer bit, then 63 fraction bits.
+        write(4, at, bit32.lshift(fractionLo, 11), 0)
+        write(4, at + 4, bit32.bor(2147483648, bit32.lshift(fractionHi, 11), bit32.rshift(fractionLo, 21)), 0)
+        write(2, at + 8, sign + biased, 0)
+    end
+end
+
+-- scanf's conversions over characters from `get` (nil at the end of the input), which `unget` puts back. The
+-- result is the number of assignments, or -1 when the input ends before the first conversion.
+function host.scanGuest(format: string, get: () -> number?, unget: (number) -> (), arguments: Arguments,
+    platform: number): number
+    local assigned, conversions, count = 0, 0, 0
+    local function nextChar(): number?
+        local c = get()
+        if c then count += 1 end
+        return c
+    end
+    local function back(c: number?)
+        if c then
+            unget(c)
+            count -= 1
+        end
+    end
+    local function isSpace(c: number?): boolean
+        return c ~= nil and (c == 32 or (c >= 9 and c <= 13))
+    end
+    local function skipSpace(): boolean
+        while true do
+            local c = nextChar()
+            if c == nil then return false end
+            if not isSpace(c) then
+                back(c)
+                return true
+            end
+        end
+    end
+    local function failed(atEnd: boolean): number
+        return if atEnd and conversions == 0 then -1 else assigned
+    end
+    local i, n = 1, #format
+    while i <= n do
+        local f = string.byte(format, i)
+        if isSpace(f) then
+            skipSpace()
+            i += 1
+        elseif f ~= 37 or string.sub(format, i + 1, i + 1) == "%" then
+            if f == 37 then
+                skipSpace()
+                i += 1
+            end
+            local c = nextChar()
+            if c ~= f then
+                back(c)
+                return failed(c == nil)
+            end
+            i += 1
+        else
+            i += 1
+            local suppress = string.sub(format, i, i) == "*"
+            if suppress then i += 1 end
+            local digits = string.match(format, "^%d+", i)
+            local width = if digits then tonumber(digits) :: number else nil
+            if digits then i += #digits end
+            local modifier = string.match(format, "^hh", i) or string.match(format, "^ll", i) or
+                string.match(format, "^[hljztLq]", i) or ""
+            i += #modifier
+            local conversion = string.sub(format, i, i)
+            i += 1
+            local limit = width or math.huge
+            if conversion == "n" then
+                if not suppress then
+                    local lo = arguments.nextInt()
+                    local size = if modifier == "hh" then 1 elseif modifier == "h" then 2
+                        elseif modifier == "" or (modifier == "l" and platform == 1) then 4 else 8
+                    write(size, address(lo, 0), result(count))
+                end
+            elseif conversion == "c" or conversion == "s" or conversion == "[" then
+                local accept: (number) -> boolean
+                if conversion == "c" then
+                    if not width then limit = 1 end
+                    accept = function() return true end
+                elseif conversion == "s" then
+                    if not skipSpace() then return failed(true) end
+                    accept = function(c) return not isSpace(c) end
+                else
+                    local negate = string.sub(format, i, i) == "^"
+                    if negate then i += 1 end
+                    local set: {[number]: boolean} = {}
+                    local first = true
+                    while i <= n and (first or string.sub(format, i, i) ~= "]") do
+                        local c = string.byte(format, i)
+                        if string.sub(format, i + 1, i + 1) == "-" and i + 2 <= n and string.sub(format, i + 2, i + 2) ~= "]" then
+                            for code = c, string.byte(format, i + 2) do set[code] = true end
+                            i += 3
+                        else
+                            set[c] = true
+                            i += 1
+                        end
+                        first = false
+                    end
+                    i += 1
+                    accept = function(c) return (set[c] == true) ~= negate end
+                end
+                local bytes = {}
+                while #bytes < limit do
+                    local c = nextChar()
+                    if c == nil then break end
+                    if not accept(c) then
+                        back(c)
+                        break
+                    end
+                    table.insert(bytes, c)
+                end
+                if #bytes == 0 or (conversion == "c" and #bytes < limit) then
+                    return failed(#bytes == 0 and get() == nil)
+                end
+                conversions += 1
+                if not suppress then
+                    local lo, hi = arguments.nextInt()
+                    local at = address(lo, hi)
+                    for index, c in bytes do write(1, at + index - 1, c, 0) end
+                    if conversion ~= "c" then write(1, at + #bytes, 0, 0) end
+                    assigned += 1
+                end
+            elseif string.find("diouxXp", conversion, 1, true) then
+                if not skipSpace() then return failed(true) end
+                local base = if conversion == "o" then 8 elseif conversion == "x" or conversion == "X" or
+                    conversion == "p" then 16 elseif conversion == "i" then 0 else 10
+                local negative, used, lo, hi = false, 0, 0, 0
+                local c = nextChar()
+                if (c == 43 or c == 45) and used < limit then
+                    negative = c == 45
+                    used += 1
+                    c = nextChar()
+                end
+                local digitsRead = 0
+                if (base == 0 or base == 16) and c == 48 and used < limit then
+                    used += 1
+                    digitsRead = 1
+                    local x = nextChar()
+                    if (x == 120 or x == 88) and used < limit then
+                        used += 1
+                        base = 16
+                        digitsRead = 0
+                        c = nextChar()
+                    else
+                        if base == 0 then base = 8 end
+                        c = x
+                    end
+                end
+                if base == 0 then base = 10 end
+                while c ~= nil and used < limit do
+                    local value = if c >= 48 and c <= 57 then c - 48 elseif c >= 97 and c <= 122 then c - 87
+                        elseif c >= 65 and c <= 90 then c - 55 else 99
+                    if value >= base then break end
+                    local low = lo * base + value
+                    lo = low % 4294967296
+                    hi = (hi * base + math.floor(low / 4294967296)) % 4294967296
+                    digitsRead += 1
+                    used += 1
+                    c = nextChar()
+                end
+                back(c)
+                if digitsRead == 0 then return failed(c == nil) end
+                conversions += 1
+                if negative then
+                    lo, hi = (4294967296 - lo) % 4294967296, (4294967295 - hi + (if lo == 0 then 1 else 0)) % 4294967296
+                end
+                if not suppress then
+                    local size = if conversion == "p" then 8 elseif modifier == "hh" then 1 elseif modifier == "h" then 2
+                        elseif modifier == "" or (modifier == "l" and platform == 1) then 4 else 8
+                    local pointerLo, pointerHi = arguments.nextInt()
+                    write(size, address(pointerLo, pointerHi), lo, hi)
+                    assigned += 1
+                end
+            elseif string.find("aAeEfFgG", conversion, 1, true) then
+                if not skipSpace() then return failed(true) end
+                -- The longest prefix that can begin a number; strtod's parser then decides how much is one.
+                local token = {}
+                local function take(c: number?): number?
+                    table.insert(token, string.char(c :: number))
+                    return nextChar()
+                end
+                local c = nextChar()
+                if (c == 43 or c == 45) and #token < limit then c = take(c) end
+                local lowered = function(code: number?): string
+                    return if code then string.lower(string.char(code)) else ""
+                end
+                if lowered(c) == "i" or lowered(c) == "n" then
+                    while c and #token < limit and string.find("infinityan()_0123456789", lowered(c), 1, true) do
+                        c = take(c)
+                    end
+                else
+                    local hex = false
+                    if c == 48 and #token < limit then
+                        c = take(c)
+                        if lowered(c) == "x" and #token < limit then
+                            hex = true
+                            c = take(c)
+                        end
+                    end
+                    local seenPoint, seenExponent = false, false
+                    while c and #token < limit do
+                        local l = lowered(c)
+                        local digit = string.find(if hex then "0123456789abcdef" else "0123456789", l, 1, true)
+                        if digit then
+                            c = take(c)
+                        elseif l == "." and not seenPoint and not seenExponent then
+                            seenPoint = true
+                            c = take(c)
+                        elseif (l == (if hex then "p" else "e")) and not seenExponent then
+                            seenExponent = true
+                            c = take(c)
+                            if (c == 43 or c == 45) and #token < limit then c = take(c) end
+                        else
+                            break
+                        end
+                    end
+                end
+                back(c)
+                local text = table.concat(token)
+                local value, used = parseDouble(text)
+                if used == 0 then return failed(c == nil and #token == 0) end
+                conversions += 1
+                if not suppress then
+                    local lo, hi = arguments.nextInt()
+                    local at = address(lo, hi)
+                    if modifier == "L" then
+                        host.writeLongDouble(at, value, platform)
+                    elseif modifier == "l" then
+                        write(8, at, encodeFloat(8, value))
+                    else
+                        write(4, at, (encodeFloat(4, value)), 0)
+                    end
+                    assigned += 1
+                end
+            else
+                return assigned
+            end
+        end
+    end
+    return assigned
+end
+
+function libc.scanString(textLo, textHi, formatLo, formatHi, arguments: Arguments, platform: number): number
+    local text = guestString(address(textLo, textHi))
+    local at = 1
+    local function get(): number?
+        local c = string.byte(text, at)
+        if c then at += 1 end
+        return c
+    end
+    local function unget() at -= 1 end
+    return host.scanGuest(guestString(address(formatLo, formatHi)), get, unget, arguments, platform)
+end
+
+function libc.scanStream(fd: number, formatLo, formatHi, arguments: Arguments, platform: number): number
+    local function get(): number?
+        local c = getByte(fd)
+        return if c >= 0 then c else nil
+    end
+    local function unget(c: number)
+        host.pushback[fd] = c
+        host.eof[fd] = nil
+    end
+    return host.scanGuest(guestString(address(formatLo, formatHi)), get, unget, arguments, platform)
 end
 )luau"};
 
@@ -3980,7 +6437,8 @@ std::string Data::source() const {
     for (const auto& region : regions)
         cuts.insert(cuts.end(), {region.start, region.end});
     std::ranges::sort(cuts);
-    std::string result = "local data: {DataRange} = {\n";
+    // Ranges in address order: the runtime takes the first as the lowest guest data.
+    std::map<std::size_t, std::string> ranges;
     for (const auto& [start, end] : emitted) {
         for (auto first = start; first < end;) {
             auto last = end;
@@ -3989,12 +6447,26 @@ std::string Data::source() const {
             auto used = last;
             while (used > first && image[used - 1] == 0)
                 --used;
-            result += std::format("    {{first = {}, last = {}, mode = {}, bytes = ", first, last, modeAt(first));
-            appendQuoted(result, image.subspan(first, used - first));
-            result += "},\n";
+            auto& range = ranges[first];
+            range = std::format("    {{first = {}, last = {}, mode = {}, bytes = ", first, last, modeAt(first));
+            appendQuoted(range, image.subspan(first, used - first));
+            range += "},\n";
             first = last;
         }
     }
+    for (const auto& [slot, import] : tokenSlots) {
+        const auto token = ImportTokenBase + slot;
+        std::array<std::uint8_t, 8> bytes{};
+        for (unsigned i = 0; i < 8; ++i)
+            bytes[i] = std::uint8_t(token >> (8 * i));
+        auto& range = ranges[slot];
+        range = std::format("    {{first = {}, last = {}, mode = {}, bytes = ", slot, slot + 8, modeAt(slot));
+        appendQuoted(range, bytes);
+        range += "},\n";
+    }
+    std::string result = "local data: {DataRange} = {\n";
+    for (const auto& [first, range] : ranges)
+        result += range;
     return result + "}\n";
 }
 
@@ -4025,7 +6497,12 @@ void appendRuntime(std::string& source, const RuntimeFeatures& features, const D
         "fiberNext = 0, lastError = 0, exceptionFilterLo = 0, exceptionFilterHi = 0, "
         "yield = nil :: (() -> ())?, yieldInterval = 0.05, yieldAt = 0, yieldSteps = 0, "
         "watchMemory = nil :: (((buffer) -> ()) -> (number, number))?, "
-        "wrappedAddress = nil :: ((number, number, number) -> number)?}\n";
+        "wrappedAddress = nil :: ((number, number, number) -> number)?, "
+        "heapLength = nil :: ((number) -> number?)?, "
+        "threadId = nil :: (() -> number)?, blockUntil = nil :: (((() -> boolean)) -> ())?, threadErrno = nil :: number?, "
+        "threadLocal = nil :: ((number) -> number)?, saveRegisters = nil :: (() -> {any})?, "
+        "restoreRegisters = nil :: (({any}) -> ())?, threadTemplates = {} :: {[number]: string}, "
+        "threadBlocks = {} :: {[number]: string}}\n";
     if (features.structured)
         appendChunks(source, RoutineOperators);
     if (features.stackGuard)

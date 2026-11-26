@@ -3,7 +3,8 @@
 ## Differential tests (`run.py`)
 
 `programs/*.c` export `uint64_t f(uint64_t, uint64_t)` functions; `apps/*.c` are whole programs whose first
-line may carry a `// LUFT: {...}` spec (`args`, `stdin`, `files`, `env`, `outputs`). Each is built for
+line may carry a `// LUFT: {...}` spec (`args`, `stdin`, `files`, `env`, `outputs`, and `skip`, targets the app
+does not build for). Each is built for
 arm64/x86-64 Mach-O (host clang; x86-64 runs under Rosetta), arm64/x86-64 ELF, and x86-64 PE (MinGW), run
 natively, translated with Luft (`--module` or `--program`), run with the `luau` CLI, and compared.
 
@@ -12,7 +13,20 @@ docker build -t luft-toolchain tests      # Linux and MinGW toolchains, qemu-use
 python3 tests/run.py --luft path/to/Luft --luau path/to/luau [--levels O0,O2] [--targets arm64-elf,...]
 ```
 
-Windows programs have no native runner; they reuse the x86-64 ELF results.
+Windows programs have no native runner; they reuse the x86-64 ELF results, so apps whose output msvcrt formats
+differently from glibc (`posix_formats.c`) skip `x86_64-pe`, and apps print 64-bit values portably (Windows has a
+32-bit `long`). `workloads.c` runs compute-bound code that compilers vectorize at `-O2` and above (structured
+loads, table lookups, widening multiplies, fused multiply-adds), so it covers SIMD lifting on every target.
+`atomics.c` covers `__atomic` builtins (ARM64 LSE and CAS, x86 `lock` forms) and rounding and by-element vector
+code.
+
+Apps that use the POSIX services real programs depend on skip `x86_64-pe`. `files.c` covers the emulated file
+system: directories, `stat`, `rename`, `chdir`, `strerror`, calendar time, and `scanf`. A run starts in `/work`
+(or the runner's `cwd`), where its files are; `/tmp` always exists. `threads.c` and `threads_cpp.cpp` run guest
+threads (pthreads, `std::thread`, condition variables, thread-local variables), which the translation schedules
+cooperatively; they print the same lines in any order the threads run. `system.c` covers pseudo-random
+sequences, `realloc` and `malloc_size`, `pread`/`pwrite`, `fcntl` locks, temporary files, `fstatfs`, signal
+sets, tables of pointers to C library functions, and switches that need no bounds check.
 
 C++ apps (`apps/*.cpp`, built as C++17) cover exceptions and the standard library. ELF builds link the C++
 runtime statically; arm64 Mach-O builds map standalone libc++, libc++abi, and libunwind from `$LLVM_PREFIX`

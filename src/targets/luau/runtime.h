@@ -25,7 +25,14 @@ struct RuntimeFeatures {
     bool seh = false;
     // Indirect jumps that resume landing pads.
     bool landingPads = false;
+    // The guest's architecture, which C library structures such as struct stat lay out differently.
+    bool arm = false;
+    // A Windows guest, whose C library (msvcrt) lays out structures such as struct tm its own way.
+    bool windows = false;
 };
+
+// Calls through a pointer to an import reach it through this value plus the import slot's address.
+inline constexpr std::uint64_t ImportTokenBase = 0xf0000000ull;
 
 struct Data {
     std::span<const std::uint8_t> image;
@@ -38,6 +45,8 @@ struct Data {
     // Code that exception unwinders transfer control to.
     std::set<std::size_t> landingPads = {};
     std::span<const UnwindObject> unwindObjects = {};
+    // Import slots whose memory holds the import's token, for code that reads them at run time.
+    std::map<std::size_t, const GuestImport*> tokenSlots = {};
 
     const GuestImport* unresolved(std::uint64_t at, unsigned size) const;
     bool writable(std::uint64_t at, unsigned size) const;
