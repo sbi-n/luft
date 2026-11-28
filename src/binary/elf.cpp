@@ -1,4 +1,4 @@
-#include "recompiler.h"
+#include "binary/formats.h"
 #include "binary/unwind.h"
 
 #include <algorithm>
@@ -70,6 +70,29 @@ struct Sections {
         return data(section);
     }
 };
+
+binary::LibraryDependencies dynamicLibraries(const Sections& sections) {
+    binary::LibraryDependencies libraries;
+    for (std::size_t i = 1; i < sections.headers.size() / 64; ++i) {
+        const auto section = sections.header(i);
+        if (read(section, 4, 4) != 6) // SHT_DYNAMIC
+            continue;
+        const auto entries = sections.data(section);
+        if (read(section, 56, 8) != 16 || entries.size() % 16 != 0)
+            throw std::runtime_error("invalid ELF dynamic table");
+        const auto strings = sections.strings(section);
+        for (std::size_t at = 0; at < entries.size(); at += 16) {
+            const auto tag = read(entries, at, 8);
+            if (tag == 0) // DT_NULL
+                break;
+            if (tag == 1) // DT_NEEDED
+                libraries.needed.push_back(symbolName(strings, read(entries, at + 8, 8)));
+            else if (tag == 14) // DT_SONAME
+                libraries.name = symbolName(strings, read(entries, at + 8, 8));
+        }
+    }
+    return libraries;
+}
 
 struct SymbolVersions {
     Bytes indices;
@@ -554,13 +577,27 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
     std::vector<std::uint8_t> image;
     const auto main = mapElf(architecture, file, LoadBase, image, regions);
     std::vector<Unit> units{{main, LoadBase, symbolVersions(main)}};
-    for (const auto library : libraries) {
+    const auto loadLibrary = [&](Bytes library) {
         const auto base = (image.size() + LoadBase - 1) & ~(LoadBase - 1);
         if (base >= MaxExecutableSize)
             throw std::runtime_error("ELF libraries exceed guest address space");
         auto sections = mapElf(architecture, library, base, image, regions);
         units.push_back({sections, base, symbolVersions(sections)});
+        return sections;
+    };
+    for (const auto library : libraries)
+        loadLibrary(library);
+    std::vector<binary::LibraryDependencies> dependencies(units.size());
+    if (options.readLibrary) {
+        for (std::size_t i = 0; i < units.size(); ++i)
+            dependencies[i] = dynamicLibraries(units[i].sections);
+        for (std::size_t i = 0; i < std::min(libraries.size(), options.libraryNames.size()); ++i)
+            if (dependencies[i + 1].name.empty())
+                dependencies[i + 1].name = options.libraryNames[i];
     }
+    std::vector<std::vector<std::uint8_t>> dependencyFiles;
+    const auto libraryInitializers = binary::loadDependencies(std::move(dependencies), options.readLibrary,
+        dependencyFiles, [&](Bytes library) { return dynamicLibraries(loadLibrary(library)); });
 
     if (std::getenv("LUFT_DEBUG"))
         for (std::size_t i = 0; i < units.size(); ++i)
@@ -603,7 +640,7 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
     }
     Definitions definitions, libraryDefinitions;
     for (const auto& unit : units) {
-        if (!libraries.empty() || unit.tls)
+        if (units.size() > 1 || unit.tls)
             addDefinitions(unit.sections, unit.versions, unit.base, definitions, unit.tls);
         if (unit.base != LoadBase)
             addDefinitions(unit.sections, unit.versions, unit.base, libraryDefinitions, unit.tls);
@@ -721,8 +758,8 @@ std::string recompileElf(Architecture architecture, Bytes file, std::span<const 
     std::vector<std::size_t> initializers;
     if (initialize) {
         // Programs initialize their libraries before the executable itself.
-        if (program.startup != Startup::Library)
-            for (std::size_t i = 1; i < units.size(); ++i) {
+        if (program.startup != Startup::Library || options.readLibrary)
+            for (const auto i : libraryInitializers) {
                 const auto unitInitializers = initArray(units[i].sections, image, regions, units[i].base);
                 initializers.insert(initializers.end(), unitInitializers.begin(), unitInitializers.end());
             }

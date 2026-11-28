@@ -3,7 +3,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -45,6 +47,8 @@ struct UnwindObject {
     std::size_t compactSize = 0;
 };
 
+using LibraryReader = std::function<std::optional<std::vector<std::uint8_t>>(std::string_view)>;
+
 struct ProgramOptions {
     Startup startup = Startup::Library;
     // Guest basic blocks to execute per export call before failing; zero removes the checks.
@@ -69,6 +73,12 @@ struct ProgramOptions {
     std::vector<std::pair<std::size_t, std::string>> threadTemplates = {};
     // ELF thread-local blocks by address, with their initial bytes: switching guest threads swaps their contents.
     std::vector<std::pair<std::size_t, std::string>> threadBlocks = {};
+    // Reports translation failures retained in the generated code as runtime traps.
+    std::set<std::string>* diagnostics = nullptr;
+    // Supplies guest libraries by name while mapping ELF and Mach-O dependencies.
+    LibraryReader readLibrary = {};
+    // File names of explicitly supplied ELF libraries, used when their images have no SONAME.
+    std::span<const std::string_view> libraryNames = {};
 };
 
 // The guest stack sits right after the image. Executables get a larger one than raw code: eight megabytes, the
@@ -123,7 +133,7 @@ struct GuestBinding {
 };
 
 std::string recompile(Architecture architecture, std::span<const std::uint8_t> image,
-    std::span<const GuestExport> exports = {});
+    std::span<const GuestExport> exports = {}, const ProgramOptions& program = {});
 std::string recompileMapped(Architecture architecture, std::span<const std::uint8_t> image,
     std::span<const GuestExport> exports, std::span<const GuestRegion> regions,
     std::span<const GuestImport> imports, std::span<const GuestObject> objects = {},

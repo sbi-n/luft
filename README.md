@@ -4,7 +4,16 @@ Luft recompiles x86-64 and arm64 machine code (raw, ELF, Mach-O, PE) into Luau.
 
 ```sh
 Luft <x86_64|arm64> <binary> [--emit | --module]
+Luft <x86_64|arm64> <executable> --program <format>
 ```
+
+Use `--elf`, `--macho`, or `--pe` for `<format>`. With ELF or Mach-O, pass `--library-dir PATH` to include
+dependencies from their actual guest libraries. Luft follows the executable's and each library's dependency
+list and looks up file names in the specified directories. Repeat the option to search more than one directory.
+Use `--elf-library PATH` or `--macho-library PATH` to supply a particular library file explicitly.
+Libraries are needed during translation. The generated Luau contains the code it uses.
+When Luft emits source, it reports known translation gaps on standard error. If a program reaches one of
+those paths, the generated Luau reports the error at runtime.
 
 Run `Luft --help` for the full usage.
 

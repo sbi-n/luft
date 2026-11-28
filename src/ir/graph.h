@@ -308,7 +308,7 @@ struct Jump { Value target; std::vector<Address> destinations = {}; };
 struct Branch { Condition condition; Address taken; Address other; };
 struct Call { Value target; Address resume; };
 struct Return { Value target; unsigned stackAdjust = 0; };
-struct Trap { std::string message; };
+struct Trap { std::string message; bool translationFailure = false; };
 using Terminator = std::variant<Jump, Branch, Call, Return, Trap>;
 
 struct Block {

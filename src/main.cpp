@@ -5,11 +5,14 @@
 #include "lua.h"
 #include "lualib.h"
 
+#include <algorithm>
 #include <charconv>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
@@ -40,18 +43,35 @@ GuestExport parseExport(std::string_view spec) {
     return {std::string(name), offset};
 }
 
-std::vector<std::uint8_t> readImage(const char* path, std::size_t limit) {
+std::vector<std::uint8_t> readImage(const std::filesystem::path& path, std::size_t limit) {
     std::ifstream file(path, std::ios::binary);
     if (!file)
-        throw std::runtime_error("could not open " + std::string(path));
+        throw std::runtime_error("could not open " + path.string());
     std::vector<std::uint8_t> image(limit + 1);
     file.read(reinterpret_cast<char*>(image.data()), image.size());
     if (file.bad() || (file.fail() && !file.eof()))
-        throw std::runtime_error("could not read " + std::string(path));
+        throw std::runtime_error("could not read " + path.string());
     image.resize(file.gcount());
     if (image.size() > limit)
-        throw std::runtime_error("input exceeds the size limit: " + std::string(path));
+        throw std::runtime_error("input exceeds the size limit: " + path.string());
     return image;
+}
+
+std::optional<std::vector<std::uint8_t>> readLibrary(std::span<const std::filesystem::path> directories,
+    std::string_view name) {
+    if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\:") != std::string_view::npos ||
+        std::ranges::any_of(name, [](unsigned char ch) { return ch < 0x20 || ch == 0x7f; }))
+        return std::nullopt;
+    for (const auto& directory : directories) {
+        const auto path = directory / name;
+        if (!std::filesystem::is_regular_file(path))
+            continue;
+        const auto size = std::filesystem::file_size(path);
+        if (size > MaxExecutableSize)
+            throw std::runtime_error("input exceeds the size limit: " + path.string());
+        return readImage(path, std::size_t(size));
+    }
+    return std::nullopt;
 }
 
 binary::PeInitRange parsePeRange(std::string_view text) {
@@ -80,8 +100,10 @@ int main(int argc, char** argv) {
         "Mach-O and PE accept symbol names, virtual addresses, or image-relative addresses.\n"
         "Pass --program with an executable format to translate the whole program: the module exports\n"
         "run({args = {...}, stdin = text, files = {[path] = bytes}}) returning {exitCode, stdout, stderr, files}.\n"
+        "Pass --library-dir PATH with ELF or Mach-O to find and translate guest dependencies in PATH.\n"
         "Pass --instruction-limit N to bound guest basic blocks per call (0 disables the check).\n"
-        "Pass --trace to report the most recently executed guest blocks with runtime errors.\n";
+        "Pass --trace to report the most recently executed guest blocks with runtime errors.\n"
+        "Source generation reports known translation gaps on standard error.\n";
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << usage;
         return 0;
@@ -110,6 +132,7 @@ int main(int argc, char** argv) {
         std::vector<binary::PeInitRange> peInitRanges;
         std::vector<const char*> elfLibraries;
         std::vector<const char*> machoLibraries;
+        std::vector<std::filesystem::path> libraryDirectories;
         for (int i = 3; i < argc; ++i) {
             const std::string_view option = argv[i];
             if (option == "--emit" && !emit)
@@ -134,6 +157,8 @@ int main(int argc, char** argv) {
                 elfLibraries.push_back(argv[++i]);
             else if (option == "--macho-library" && i + 1 < argc)
                 machoLibraries.push_back(argv[++i]);
+            else if (option == "--library-dir" && i + 1 < argc)
+                libraryDirectories.emplace_back(argv[++i]);
             else if (option == "--export" && i + 1 < argc)
                 exports.push_back(parseExport(argv[++i]));
             else if (option == "--program" && !program)
@@ -180,6 +205,8 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--macho-init requires --macho");
         if (!machoLibraries.empty() && format != Format::MachO)
             throw std::runtime_error("--macho-library requires --macho");
+        if (!libraryDirectories.empty() && format != Format::Elf && format != Format::MachO)
+            throw std::runtime_error("--library-dir requires --elf or --macho");
         if ((!peInitializers.empty() || !peInitRanges.empty()) && format != Format::Pe)
             throw std::runtime_error("PE initializers require --pe");
         for (const auto& entry : exports)
@@ -193,13 +220,24 @@ int main(int argc, char** argv) {
         const auto maxSize = format == Format::Raw ? MaxImageSize : MaxExecutableSize;
         const auto image = readImage(argv[2], maxSize);
         std::vector<std::vector<std::uint8_t>> libraryImages;
-        for (const auto library : format == Format::MachO ? machoLibraries : elfLibraries)
+        std::vector<std::string_view> libraryNames;
+        for (const std::string_view library : format == Format::MachO ? machoLibraries : elfLibraries) {
             libraryImages.push_back(readImage(library, MaxExecutableSize));
+            libraryNames.push_back(library.substr(library.find_last_of("/\\") + 1));
+        }
         std::vector<std::span<const std::uint8_t>> libraries(libraryImages.begin(), libraryImages.end());
 
+        std::set<std::string> diagnostics;
+        if (emit || module)
+            options.diagnostics = &diagnostics;
+        if (!libraryDirectories.empty())
+            options.readLibrary = [&](std::string_view name) { return readLibrary(libraryDirectories, name); };
+        options.libraryNames = libraryNames;
         std::string source;
         switch (format) {
-            case Format::Raw: source = recompile(architecture, image, exports); break;
+            case Format::Raw:
+                source = recompile(architecture, image, exports, {.diagnostics = options.diagnostics});
+                break;
             case Format::Elf: source = recompileElf(architecture, image, exports, elfInit, libraries, options); break;
             case Format::MachO:
                 source = binary::recompileMachO(architecture, image, exports, machoInit, libraries, options);
@@ -209,6 +247,10 @@ int main(int argc, char** argv) {
                 break;
         }
         if (emit || module) {
+            for (auto message : diagnostics) {
+                std::ranges::replace_if(message, [](unsigned char ch) { return ch < 0x20 || ch >= 0x7f; }, '?');
+                std::cerr << "Luft: warning: " << message << '\n';
+            }
             std::cout << source;
         } else {
             const auto bytecode = Luau::compile(source);

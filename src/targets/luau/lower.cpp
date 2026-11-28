@@ -129,6 +129,22 @@ public:
             reg(arm ? 31 : 4);
         if (arm && features.calls)
             reg(30);
+        // Record the startup code's register uses before declaring the register locals.
+        std::string startup;
+        if (isProgram()) {
+            needsProcess = true;
+            startup = "    local argc, argv, envp = processArguments()\n";
+            if (program.startup == Startup::ElfStack) {
+                // _start finds argc, argv, and envp on the initial stack and never returns.
+                const auto sp = reg(arm ? 31 : 4);
+                startup += std::format("    {} = processStack(stackTop, argc, argv, envp), 0\n", sp.pair());
+                startup += std::format("    {} = 0, 0\n", reg(arm ? 0 : 2).pair());
+            } else if (program.startup == Startup::MainArguments) {
+                startup += std::format("    {} = argc, 0\n    {} = argv, 0\n    {} = envp, 0\n    {} = envp, 0\n",
+                    reg(argumentRegs[0]).pair(), reg(argumentRegs[1]).pair(),
+                    reg(argumentRegs[2]).pair(), reg(argumentRegs[3]).pair());
+            }
+        }
         std::string source = std::format("    local args = readArguments({}, ...)\n", argCount);
         if (needsMemory || features.stack || !initializers.empty())
             source += std::format("    resetMemory({})\n", features.stack || !initializers.empty());
@@ -232,20 +248,7 @@ public:
                 source += "    direction = 1\n";
             source += "    end\n";
         }
-        if (isProgram()) {
-            needsProcess = true;
-            source += "    local argc, argv, envp = processArguments()\n";
-            const auto args = argumentRegs;
-            if (program.startup == Startup::ElfStack) {
-                // _start finds argc, argv, and envp on the initial stack and never returns.
-                const auto sp = reg(arm ? 31 : 4);
-                source += std::format("    {} = processStack(stackTop, argc, argv, envp), 0\n", sp.pair());
-                source += std::format("    {} = 0, 0\n", reg(arm ? 0 : 2).pair());
-            } else if (program.startup == Startup::MainArguments) {
-                source += std::format("    {} = argc, 0\n    {} = argv, 0\n    {} = envp, 0\n    {} = envp, 0\n",
-                    reg(args[0]).pair(), reg(args[1]).pair(), reg(args[2]).pair(), reg(args[3]).pair());
-            }
-        }
+        source += startup;
         if (features.stack && !arm && program.startup != Startup::ElfStack) {
             const auto sp = reg(4);
             const unsigned frameSize = 8 + shadowSpace;
@@ -721,6 +724,12 @@ private:
 
     void trap(unsigned depth, std::string_view message) {
         line(depth, "error(" + quoted(message) + ", 0)");
+    }
+
+    void translationTrap(unsigned depth, std::string_view message) {
+        if (program.diagnostics)
+            program.diagnostics->emplace(message);
+        trap(depth, message);
     }
 
     std::string addressPair(const EffectiveAddress& addr, const Constants& constants) {
@@ -3358,7 +3367,7 @@ private:
                 callResume.reset();
                 region(call->resume, depth, {});
             } else if (const auto* direct = findImport(call->target, constants)) {
-                trap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
+                translationTrap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
             } else if (!imported && (!addressTaken.empty() || !data.tokenSlots.empty()) &&
                 (std::holds_alternative<Register>(call->target) || std::holds_alternative<Memory>(call->target))) {
                 emitFunctionPointer(depth, call->target, call->resume, constants);
@@ -3385,7 +3394,7 @@ private:
             else if (tailImport(depth, jump->target, constants))
                 returnFromFunction(depth, arm ? Return{Register{30}} : Return{StackTop{}});
             else if (const auto* direct = findImport(jump->target, constants))
-                trap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
+                translationTrap(depth, std::format("unsupported guest import {} called at {:#x}", importName(*direct), pc));
             else if ((!addressTaken.empty() || !data.tokenSlots.empty()) && (std::holds_alternative<Register>(jump->target) ||
                 (std::holds_alternative<Memory>(jump->target) && !findImport(jump->target, constants, true)))) {
                 includeFunctionPointers();
@@ -3406,7 +3415,11 @@ private:
         } else if (const auto* ret = std::get_if<Return>(&block.end)) {
             returnFromFunction(depth, *ret);
         } else {
-            trap(depth, std::get<Trap>(block.end).message);
+            const auto& failure = std::get<Trap>(block.end);
+            if (failure.translationFailure)
+                translationTrap(depth, failure.message);
+            else
+                trap(depth, failure.message);
         }
         active.erase(pc);
     }
@@ -5255,10 +5268,10 @@ private:
     void indirect(unsigned depth, Address pc, const Value& target, const Constants& constants) {
         if (const auto* mem = std::get_if<Memory>(&target))
             if (auto at = knownAddress(mem->address, constants); at && data.unresolved(*at, 8)) {
-                trap(depth, memoryError(*at, 8));
+                translationTrap(depth, memoryError(*at, 8));
                 return;
             }
-        trap(depth, std::format("indirect control flow was not resolved during translation at {:#x}", pc));
+        translationTrap(depth, std::format("indirect control flow was not resolved during translation at {:#x}", pc));
     }
 };
 

@@ -1780,7 +1780,7 @@ Graph lift(Architecture architecture, std::span<const std::uint8_t> image,
                                 *value >= 0 && std::size_t(*value) < executableEnd(*value, image.size(), regions))
                                 instruction.end = Jump{immediate(*value)};
             } catch (const std::runtime_error& error) {
-                instruction.end = Trap{std::format("{} at guest offset {}", error.what(), pc)};
+                instruction.end = Trap{std::format("{} at guest offset {}", error.what(), pc), true};
             }
             if (code && pc >= 0 && std::size_t(pc) < end)
                 code->push_back({std::size_t(pc), std::size_t(reader.pc > pc ? reader.pc : pc + 1)});

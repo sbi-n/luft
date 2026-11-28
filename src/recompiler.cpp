@@ -1,8 +1,11 @@
 #include "recompiler.h"
+#include "binary/formats.h"
 #include "targets/luau/lower.h"
 
 #include <algorithm>
 #include <array>
+#include <map>
+#include <numeric>
 #include <stdexcept>
 #include <string_view>
 
@@ -16,11 +19,73 @@ bool validExportName(std::string_view name) {
 
 }
 
+std::string_view binary::libraryName(std::string_view path) {
+    return path.substr(path.find_last_of('/') + 1);
+}
+
+std::vector<std::size_t> binary::loadDependencies(std::vector<LibraryDependencies> dependencies,
+    const LibraryReader& read, std::vector<std::vector<std::uint8_t>>& files,
+    const std::function<LibraryDependencies(std::span<const std::uint8_t>)>& load) {
+    if (!read) {
+        std::vector<std::size_t> order(dependencies.size() - 1);
+        std::iota(order.begin(), order.end(), std::size_t(1));
+        return order;
+    }
+
+    std::map<std::string_view, std::size_t> loaded;
+    for (std::size_t i = 0; i < dependencies.size(); ++i)
+        if (const auto name = libraryName(dependencies[i].name); !name.empty())
+            loaded.try_emplace(name, i);
+
+    std::set<std::string_view> missing;
+    std::vector<std::vector<std::size_t>> edges;
+    // Read in dependency order so existing symbol resolution sees direct dependencies first.
+    for (std::size_t i = 0; i < dependencies.size(); ++i) {
+        edges.emplace_back();
+        const auto needed = std::move(dependencies[i].needed);
+        for (const auto path : needed) {
+            const auto name = libraryName(path);
+            if (name.empty() || missing.contains(name))
+                continue;
+            auto found = loaded.find(name);
+            if (found == loaded.end()) {
+                auto library = read(name);
+                if (!library) {
+                    missing.insert(name);
+                    continue;
+                }
+                files.push_back(std::move(*library));
+                auto unit = load(files.back());
+                if (!unit.name.empty() && libraryName(unit.name) != name)
+                    throw std::runtime_error("guest library name does not match the requested dependency: " + std::string(name));
+                found = loaded.emplace(name, dependencies.size()).first;
+                dependencies.push_back(std::move(unit));
+            }
+            edges.back().push_back(found->second);
+        }
+    }
+
+    std::vector<std::size_t> order;
+    std::vector<bool> visited(edges.size());
+    const auto visit = [&](const auto& self, std::size_t index) -> void {
+        if (visited[index])
+            return;
+        visited[index] = true;
+        for (const auto dependency : edges[index])
+            self(self, dependency);
+        if (index != 0)
+            order.push_back(index);
+    };
+    for (std::size_t i = 0; i < edges.size(); ++i)
+        visit(visit, i);
+    return order;
+}
+
 std::string recompile(Architecture architecture, std::span<const std::uint8_t> image,
-    std::span<const GuestExport> exports) {
+    std::span<const GuestExport> exports, const ProgramOptions& program) {
     if (image.empty() || image.size() > MaxImageSize)
         throw std::runtime_error("guest image must contain 1 to 65536 bytes");
-    return recompileMapped(architecture, image, exports, {}, {});
+    return recompileMapped(architecture, image, exports, {}, {}, {}, {}, CallingConvention::Native, {}, {}, {}, program);
 }
 
 std::string recompileMapped(Architecture architecture, std::span<const std::uint8_t> image,

@@ -3,6 +3,16 @@
 #include "recompiler.h"
 
 namespace binary {
+struct LibraryDependencies {
+    std::string_view name;
+    std::vector<std::string_view> needed;
+};
+
+std::string_view libraryName(std::string_view path);
+std::vector<std::size_t> loadDependencies(std::vector<LibraryDependencies> dependencies, const LibraryReader& read,
+    std::vector<std::vector<std::uint8_t>>& files,
+    const std::function<LibraryDependencies(std::span<const std::uint8_t>)>& load);
+
 struct PeInitRange {
     std::size_t start;
     std::size_t end;

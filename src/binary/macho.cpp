@@ -72,10 +72,6 @@ std::vector<GuestObject> dataObjects(const Image& image, const MachUnit& unit) {
     return objects;
 }
 
-std::string_view leafName(std::string_view path) {
-    return path.substr(path.find_last_of('/') + 1);
-}
-
 std::optional<std::uint64_t> findBinding(std::span<const MachUnit> units, const MachUnit& unit,
     unsigned ordinal, std::string_view name) {
     if (ordinal == 0 || ordinal == 0xfd) {
@@ -83,10 +79,10 @@ std::optional<std::uint64_t> findBinding(std::span<const MachUnit> units, const 
             return unit.offset + local->second - unit.base;
     }
     const auto library = ordinal > 0 && ordinal <= unit.dependencies.size() ?
-        leafName(unit.dependencies[ordinal - 1]) : std::string_view{};
+        libraryName(unit.dependencies[ordinal - 1]) : std::string_view{};
     if (!library.empty() || ordinal == 0xfd)
-        for (const auto& candidate : units.subspan(1)) {
-            if (ordinal != 0xfd && leafName(candidate.name) != library)
+        for (const auto& candidate : library.empty() ? units.subspan(1) : units) {
+            if (ordinal != 0xfd && libraryName(candidate.name) != library)
                 continue;
             const auto symbol = candidate.exports.find(name);
             if (symbol != candidate.exports.end() && symbol->second >= candidate.base)
@@ -411,15 +407,28 @@ std::string binary::recompileMachO(Architecture architecture, Bytes file,
     std::optional<std::size_t> streams;
     Image image;
     std::vector<MachUnit> units{mapMachO(image, architecture, file, 0)};
-    for (const auto library : libraries) {
+    const auto loadLibrary = [&](Bytes library) -> const MachUnit& {
         const auto offset = (image.bytes.size() + 16383) & ~std::size_t(16383);
         auto unit = mapMachO(image, architecture, library, offset);
         if (unit.name.empty())
             throw std::runtime_error("Mach-O dependency has no dylib install name");
-        if (std::ranges::any_of(units, [&](const MachUnit& other) { return leafName(other.name) == leafName(unit.name); }))
+        if (std::ranges::any_of(units, [&](const MachUnit& other) { return libraryName(other.name) == libraryName(unit.name); }))
             throw std::runtime_error("duplicate Mach-O dependency install name");
         units.push_back(std::move(unit));
-    }
+        return units.back();
+    };
+    for (const auto library : libraries)
+        loadLibrary(library);
+    std::vector<LibraryDependencies> dependencies(units.size());
+    if (options.readLibrary)
+        for (std::size_t i = 0; i < units.size(); ++i)
+            dependencies[i] = {units[i].name, units[i].dependencies};
+    std::vector<std::vector<std::uint8_t>> dependencyFiles;
+    const auto libraryInitializers = loadDependencies(std::move(dependencies), options.readLibrary, dependencyFiles,
+        [&](Bytes library) -> LibraryDependencies {
+            const auto& unit = loadLibrary(library);
+            return {unit.name, unit.dependencies};
+        });
     if (std::getenv("LUFT_DEBUG"))
         for (const auto& unit : units)
             std::fprintf(stderr, "Luft: Mach-O %s at guest %#zx (vm base %#llx)\n",
@@ -454,8 +463,8 @@ std::string binary::recompileMachO(Architecture architecture, Bytes file,
         objects.push_back({*runeLocale, RuneLocaleSize});
     if (initialize) {
         // Programs initialize their libraries before the executable itself.
-        if (program.startup != Startup::Library)
-            for (std::size_t i = 1; i < units.size(); ++i)
+        if (program.startup != Startup::Library || options.readLibrary)
+            for (const auto i : libraryInitializers)
                 appendInitializers(image, units[i], initializers);
         appendInitializers(image, units.front(), initializers);
     }
